@@ -37,6 +37,8 @@ def parse_args():
     p.add_argument('--n_iters',      type=int,   default=600)
     p.add_argument('--anneal_iter',  type=int,   default=300)
     p.add_argument('--num_workers',  type=int,   default=4)
+    p.add_argument('--modalities',   nargs='+', default=['V', 'T', 'FT', 'GF', 'G'],
+                   help='Space-separated: V (vision), T (tactile), FT (force-torque), GF (gripper force), G (gripper state). e.g. --modalities V T FT GF G')
     return p.parse_args()
 
 
@@ -86,6 +88,7 @@ def main():
     args   = parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
+    print(f"Modalities: {args.modalities}")
 
     # dataset
     ds = PoseItDataset(root_dir=args.root_dir)
@@ -111,6 +114,7 @@ def main():
         model_emb_size=args.model_emb,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
+        modalities=args.modalities,
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()

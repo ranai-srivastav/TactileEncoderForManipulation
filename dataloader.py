@@ -1,27 +1,24 @@
 """
 PoseIt Dataloader
 
-Folder name format: <object>_<timestamp>_F<force>_pose<idx>
-  e.g. bangle_1612630172_F80_pose8
-
 stages.csv  : phase_name, unix_timestamp  (integer seconds)
 label.csv   : phase_name, result  (pass / slip / drop)
-f_t.csv     : time, Fx, Fy, Fz, Tx, Ty, Tz       @ 70 Hz  (integer second timestamps)
-gripper.csv : timestamp, left, right             @ 10 Hz  (integer second timestamps)
+f_t.csv     : time, Fx, Fy, Fz, Tx, Ty, Tz       @ 70 Hz
+gripper.csv : timestamp, left, right             @ 10 Hz
 gelsight/   : .JPG frames                        @ 22-26 Hz
 rgb/        : .JPG frames                        @ <10 Hz
 
 Sampling strategy:
-  - 20 consecutive integer seconds starting from t_grasp
-  - For each second, collect all rows/frames with that timestamp
-  - Uniformly sample exactly F items from that bucket
-  - Concatenate across 20 seconds
+  - T consecutive integer seconds from t_grasp to t_stability-1
+    (variable length per sample, e.g. 6s, 8s, 10s depending on experiment)
+  - For each second, uniformly sample F1 image frames and F2 sensor readings
+  - Output shapes are (T, ...) where T varies per sample
 
-Output shapes:
-  ft      : (20, F*6)         — F/T readings per second, flattened
-  gripper : (20, F*2)         — gripper readings per second, flattened
-  tactile : (20, F, 3, H, W)  — F GelSight frames per second
-  rgb     : (20, F, 3, H, W)  — F RGB frames per second
+Output shapes (T = duration of grasp+pose in seconds):
+  ft      : (T, F2*6)          — F2 F/T readings per second, flattened
+  gripper : (T, F2*2)          — F2 gripper readings per second, flattened
+  tactile : (T, F1, 3, H, W)   — F1 GelSight frames per second
+  rgb     : (T, F1, 3, H, W)   — F1 RGB frames per second
 
 If a bucket has fewer than F items, the last item is forward-filled.
 If a bucket is completely empty, zeros / black frames are used.
@@ -183,12 +180,13 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
     if pose_str == 'drop':
         return None
 
-    t_grasp = stages.get('grasping', stages.get('grasp'))
-    if t_grasp is None:
+    t_grasp     = stages.get('grasping', stages.get('grasp'))
+    t_stability = stages.get('stability')
+    if t_grasp is None or t_stability is None:
         return None
 
-    # 20 consecutive integer seconds starting from t_grasp
-    seconds = [t_grasp + i for i in range(N_TIMESTEPS)]  # [t, t+1, ..., t+19]
+    # T consecutive seconds: [t_grasp, t_grasp+1, ..., t_stability-1]
+    seconds = list(range(t_grasp, t_stability))
 
     ft_ts, ft_val = _read_csv_timeseries(sample_dir / 'f_t.csv',     time_col=0)
     gr_ts, gr_val = _read_csv_timeseries(sample_dir / 'gripper.csv', time_col=0)
@@ -236,10 +234,10 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
         rgb_seq.append(rgb_frames)                                     # (F, 3, H, W)
 
     return {
-        'tactile':       torch.stack(tactile_seq),                          # (20, F1, 3, H, W)
-        'rgb':           torch.stack(rgb_seq),                              # (20, F1, 3, H, W)
-        'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),   # (20, F2*6)
-        'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),   # (20, F2*2)
+        'tactile':       torch.stack(tactile_seq),                          # (T, F1, 3, H, W)
+        'rgb':           torch.stack(rgb_seq),                              # (T, F1, 3, H, W)
+        'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),   # (T, F2*6)
+        'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),   # (T, F2*2)
         'gripper_force': torch.tensor([meta['force']], dtype=torch.float32),    # (1,)
         'label':         torch.tensor(LABEL_MAP[shake_str], dtype=torch.long),
         'pose_label':    torch.tensor(LABEL_MAP[pose_str],  dtype=torch.long),
@@ -281,10 +279,10 @@ class PoseItDataset(Dataset):
     def __getitem__(self, idx):
         s = self.samples[idx]
         return (
-            s['tactile'],        # (20, F1, 3, H, W)
-            s['rgb'],            # (20, F1, 3, H, W)
-            s['ft'],             # (20, F2*6)
-            s['gripper'],        # (20, F2*2)
+            s['tactile'],        # (T, F1, 3, H, W)
+            s['rgb'],            # (T, F1, 3, H, W)
+            s['ft'],             # (T, F2*6)
+            s['gripper'],        # (T, F2*2)
             s['gripper_force'],  # (1,)
             s['label'],          # scalar
             s['pose_label'],     # scalar
@@ -325,6 +323,57 @@ def uniform_random_split(dataset, train_ratio: float = 0.6875, val_ratio: float 
         torch.utils.data.Subset(dataset, idx[n_train:n_train + n_val].tolist()),
         torch.utils.data.Subset(dataset, idx[n_train + n_val:].tolist()),
     )
+    
+def collate_variable_length(batch):
+    """
+    Custom collate function for variable-length sequences.
+    
+    Input: list of tuples from PoseItDataset.__getitem__
+    Output: padded batch + sequence lengths
+    """
+    tactile_list, rgb_list, ft_list, gripper_list = [], [], [], []
+    gf_list, label_list, pose_label_list, lengths = [], [], [], []
+    
+    for tac, rgb, ft, grip, gf, label, pose_label in batch:
+        T = tac.shape[0]
+        lengths.append(T)
+        
+        tactile_list.append(tac)
+        rgb_list.append(rgb)
+        ft_list.append(ft)
+        gripper_list.append(grip)
+        gf_list.append(gf)
+        label_list.append(label)
+        pose_label_list.append(pose_label)
+    
+    max_T = max(lengths)
+    
+    def pad_to_max(tensor_list, max_len):
+        padded = []
+        for t in tensor_list:
+            T = t.shape[0]
+            if T < max_len:
+                pad_shape = (max_len - T, *t.shape[1:])
+                pad = torch.zeros(pad_shape, dtype=t.dtype)
+                t = torch.cat([t, pad], dim=0)
+            padded.append(t)
+        return torch.stack(padded)
+    
+    tactile_batch = pad_to_max(tactile_list, max_T)
+    rgb_batch     = pad_to_max(rgb_list, max_T)
+    ft_batch      = pad_to_max(ft_list, max_T)
+    gripper_batch = pad_to_max(gripper_list, max_T)
+    
+    gf_batch    = torch.stack(gf_list)
+    labels      = torch.stack(label_list)
+    pose_labels = torch.stack(pose_label_list)
+    lengths     = torch.tensor(lengths, dtype=torch.long)
+    
+    return (
+        tactile_batch, rgb_batch, ft_batch, gripper_batch, 
+        gf_batch, labels, pose_labels, lengths
+    )
+
 
 
 if __name__ == '__main__':
@@ -336,18 +385,24 @@ if __name__ == '__main__':
         print("No samples found — check your root_dir path.")
     else:
         tac, rgb, ft, grip, gf, label, pose_label = ds[0]
-        print(f"tactile      : {tac.shape}")   # (20, F1, 3, 224, 224)
-        print(f"rgb          : {rgb.shape}")   # (20, F1, 3, 224, 224)
-        print(f"ft           : {ft.shape}")    # (20, F2*6)
-        print(f"gripper      : {grip.shape}")  # (20, F2*2)
+        print(f"tactile      : {tac.shape}")   # (T, F1, 3, 224, 224)
+        print(f"rgb          : {rgb.shape}")   # (T, F1, 3, 224, 224)
+        print(f"ft           : {ft.shape}")    # (T, F2*6)
+        print(f"gripper      : {grip.shape}")  # (T, F2*2)
         print(f"gripper_force: {gf.shape}")    # (1,)
         print(f"label        : {label}")
         print(f"pose_label   : {pose_label}")
-        print(f"\nF2={F2}  ->  FT_DIM={FT_DIM}, GR_DIM={GR_DIM}")
+        print(f"\nF1={F1}, F2={F2}  ->  FT_DIM={FT_DIM}, GR_DIM={GR_DIM}")
 
-        loader = DataLoader(ds, batch_size=2, shuffle=True, num_workers=0)
-        tac_b, rgb_b, ft_b, grip_b, gf_b, lbl_b, pl_b = next(iter(loader))
-        print(f"\nBatch shapes:")
-        print(f"  tactile : {tac_b.shape}")   # (2, 20, F1, 3, 224, 224)
-        print(f"  ft      : {ft_b.shape}")    # (2, 20, F2*6)
-        print(f"  gripper : {grip_b.shape}")  # (2, 20, F2*2)
+        print("\n=== Batch with custom collate (padded) ===")
+        loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=collate_variable_length)
+        batch = next(iter(loader))
+        tac_b, rgb_b, ft_b, grip_b, gf_b, lbl_b, pl_b, lengths_b = batch
+        
+        print(f"tactile : {tac_b.shape}")
+        print(f"rgb     : {rgb_b.shape}")
+        print(f"ft      : {ft_b.shape}")
+        print(f"gripper : {grip_b.shape}")
+        print(f"lengths : {lengths_b}")
+        print(f"\nmax_T in batch: {tac_b.shape[1]}")
+        print(f"actual sequence lengths: {lengths_b.tolist()}")
