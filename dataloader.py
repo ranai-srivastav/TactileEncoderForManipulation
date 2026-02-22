@@ -154,9 +154,10 @@ def _list_image_files(folder: Path) -> List[Tuple[int, Path]]:
     pairs = []
     for p in sorted(folder.iterdir()):
         if p.suffix.lower() in ('.jpg', '.jpeg', '.png', '.tif', '.tiff'):
-            m = re.search(r'(\d+)', p.stem)
-            if m:
-                pairs.append((int(m.group(1)), p))
+            parts = re.findall(r'\d+', p.stem)
+            if parts:
+                ts = int(parts[-1])  # last number = timestamp
+                pairs.append((ts, p))
     pairs.sort(key=lambda x: x[0])
     return pairs
 
