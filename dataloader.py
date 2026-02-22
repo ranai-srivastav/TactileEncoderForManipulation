@@ -53,7 +53,7 @@ IMG_TRANSFORM = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# TODO @bayapilla: If the only consumer of the image is the encoder, then replace with 
+# TODO @bayapilla: If the only consumer of the image is the encoder, then replace with
 '''
 self.resnet_transforms = self.resnet_weights.transforms()
 
@@ -323,21 +323,21 @@ def uniform_random_split(dataset, train_ratio: float = 0.6875, val_ratio: float 
         torch.utils.data.Subset(dataset, idx[n_train:n_train + n_val].tolist()),
         torch.utils.data.Subset(dataset, idx[n_train + n_val:].tolist()),
     )
-    
+
 def collate_variable_length(batch):
     """
     Custom collate function for variable-length sequences.
-    
+
     Input: list of tuples from PoseItDataset.__getitem__
     Output: padded batch + sequence lengths
     """
     tactile_list, rgb_list, ft_list, gripper_list = [], [], [], []
     gf_list, label_list, pose_label_list, lengths = [], [], [], []
-    
+
     for tac, rgb, ft, grip, gf, label, pose_label in batch:
         T = tac.shape[0]
         lengths.append(T)
-        
+
         tactile_list.append(tac)
         rgb_list.append(rgb)
         ft_list.append(ft)
@@ -345,9 +345,9 @@ def collate_variable_length(batch):
         gf_list.append(gf)
         label_list.append(label)
         pose_label_list.append(pose_label)
-    
+
     max_T = max(lengths)
-    
+
     def pad_to_max(tensor_list, max_len):
         padded = []
         for t in tensor_list:
@@ -358,19 +358,19 @@ def collate_variable_length(batch):
                 t = torch.cat([t, pad], dim=0)
             padded.append(t)
         return torch.stack(padded)
-    
+
     tactile_batch = pad_to_max(tactile_list, max_T)
     rgb_batch     = pad_to_max(rgb_list, max_T)
     ft_batch      = pad_to_max(ft_list, max_T)
     gripper_batch = pad_to_max(gripper_list, max_T)
-    
+
     gf_batch    = torch.stack(gf_list)
     labels      = torch.stack(label_list)
     pose_labels = torch.stack(pose_label_list)
     lengths     = torch.tensor(lengths, dtype=torch.long)
-    
+
     return (
-        tactile_batch, rgb_batch, ft_batch, gripper_batch, 
+        tactile_batch, rgb_batch, ft_batch, gripper_batch,
         gf_batch, labels, pose_labels, lengths
     )
 
@@ -398,7 +398,7 @@ if __name__ == '__main__':
         loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=collate_variable_length)
         batch = next(iter(loader))
         tac_b, rgb_b, ft_b, grip_b, gf_b, lbl_b, pl_b, lengths_b = batch
-        
+
         print(f"tactile : {tac_b.shape}")
         print(f"rgb     : {rgb_b.shape}")
         print(f"ft      : {ft_b.shape}")
