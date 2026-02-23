@@ -16,7 +16,7 @@ import argparse
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 try:
     import wandb
@@ -107,12 +107,14 @@ def parse_args():
                    help='Max seconds per episode (clips longer sequences)')
     p.add_argument('--subsample',    type=float, default=1.0,
                    help='Fraction of dataset to use (e.g. 0.01 for 1%%)')
-    p.add_argument('--wandb_project', type=str, default=None,
-                   help='W&B project name. Omit to disable W&B logging.')
+    p.add_argument('--wandb_project', type=str, default="TEMU",
+                   help='W&B project name. Default is `TEMU`. Set to None to disable W&B logging.')
     p.add_argument('--wandb_run',     type=str, default=None,
                    help='W&B run name (optional).')
-    p.add_argument('--wandb_entity',  type=str, default=None,
-                   help='W&B entity/team (optional).')
+    p.add_argument('--wandb_entity',  type=str, default="mrsd-smores",
+                   help='W&B entity/team. Default is "mrsd-smores". Set to None to disable W&B logging.')
+    p.add_argument('--overfit', action='store_true',
+                   help='Use a single sample for train/val/test to sanity-check the model.')
     return p.parse_args()
 
 
@@ -200,9 +202,16 @@ def main():
         k = max(4, int(len(ds.samples) * args.subsample))
         ds.samples = random.sample(ds.samples, k)
         print(f"Subsampled to {len(ds.samples)} samples ({args.subsample*100:.1f}% of dataset)")
-    train_set, val_set, test_set = make_split(ds, args)
-    print(f"Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
-    print_dataset_stats(ds, train_set, val_set, test_set)
+    if args.overfit:
+        ds.samples = ds.samples[:1]
+        overfit_set = Subset(ds, [0])
+        train_set = val_set = test_set = overfit_set
+        args.anneal_iter = args.n_iters + 1   # disable DRS (S≠ may be empty with 1 sample)
+        print("Overfit mode: using 1 sample for train/val/test, DRS disabled")
+    else:
+        train_set, val_set, test_set = make_split(ds, args)
+        print(f"Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
+        print_dataset_stats(ds, train_set, val_set, test_set)
 
     # deferred sampling
     sampler = DRSSampler(
@@ -285,6 +294,7 @@ def main():
                     best_val_acc = val_acc
                     torch.save(model.state_dict(), 'best_model.pt')
 
+            model.train()   # restore training mode after evaluate()
             iteration += 1
 
     # test
