@@ -1,77 +1,81 @@
+from itertools import chain
+
 import torch
 import torch.nn as nn
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet50, ResNet50_Weights
 
 
 class GraspStabilityLSTM(nn.Module):
     """
     Predicts P(grasp success) from multimodal sensor data.
 
-    Each sub-second frame is encoded independently, then the full
-    temporal sequence is processed by a bidirectional LSTM.
+    Each second of data is encoded independently (F1 image frames flattened,
+    FT/gripper readings concatenated flat), then the full temporal sequence of
+    L seconds is processed by a 2-layer bidirectional LSTM.
 
-    LSTM sequence length = T * frames_per_sec, where T is the number
-    of integer-second buckets passed at runtime (not fixed here).
+    Modalities can be selectively disabled at construction time via the
+    `modalities` argument.  Disabled modalities are zeroed out before any
+    computation, so gradient flow and model shape are unaffected.
 
-    Expected input shapes from dataloader (per batch element):
-        tactile:       (T, F, 3, H, W)
-        rgb:           (T, F, 3, H, W)
-        ft:            (T, F * 6)          — F/T readings flattened per second
-        gripper:       (T, F * 2)          — gripper readings flattened per second
-        gripper_force: (1,)                — static force command
+    Modality keys:
+        'V'  — RGB camera frames
+        'T'  — GelSight tactile frames
+        'FT' — Force-torque readings
+        'G'  — Gripper state readings
+        'GF' — Gripper force command (scalar metadata)
+
+    Expected input shapes (per batch):
+        tactile:       (B, T, F1, 3, H, W)
+        rgb:           (B, T, F1, 3, H, W)
+        ft:            (B, T, FT_DIM)   — F2*6 readings flattened per second
+        gripper:       (B, T, GR_DIM)   — F2*2 readings flattened per second
+        gripper_force: (B, 1)           — static force command
+
+    Returns:
+        (B, 1) raw logits.  Use BCEWithLogitsLoss for training or
+        call .sigmoid() at inference for P(success).
     """
 
-    RESNET18_EMB = 512
+    RESNET_EMB = 2048  # ResNet50 penultimate-layer width
 
     def __init__(
         self,
-        frames_per_sec: int = 2,
-        ft_channels: int = 6,
-        gripper_channels: int = 2,
+        frames_per_sec: int = 2,   # F1 — image frames sampled per second
+        ft_dim: int = 12,          # FT_DIM = F2 * 6
+        gripper_dim: int = 4,      # GR_DIM = F2 * 2
         hidden_dim: int = 256,
         lstm_layers: int = 2,
         dropout: float = 0.1,
         freeze_resnet: bool = True,
+        modalities=None,           # collection of {'V','T','FT','G','GF'}; None = all
     ):
         super().__init__()
         self.frames_per_sec = frames_per_sec
-        self.ft_channels = ft_channels
-        self.gripper_channels = gripper_channels
+        self.ft_dim         = ft_dim
+        self.gripper_dim    = gripper_dim
+        self.modalities     = set(modalities or ['V', 'T', 'FT', 'G', 'GF'])
 
-        # --- vision encoders (ResNet18, FC stripped → 512-d) ---
-        self.rgb_encoder = resnet18(weights=ResNet18_Weights.DEFAULT)
-        self.rgb_encoder.fc = nn.Identity()
-
-        self.tactile_encoder = resnet18(weights=ResNet18_Weights.DEFAULT)
+        # --- vision encoders (ResNet50, FC stripped → 2048-d) ---
+        self.rgb_encoder        = resnet50(weights=ResNet50_Weights.DEFAULT)
+        self.rgb_encoder.fc     = nn.Identity()
+        self.tactile_encoder    = resnet50(weights=ResNet50_Weights.DEFAULT)
         self.tactile_encoder.fc = nn.Identity()
 
         if freeze_resnet:
-            for p in self.rgb_encoder.parameters():
-                p.requires_grad = False
-            for p in self.tactile_encoder.parameters():
+            for p in chain(self.rgb_encoder.parameters(),
+                           self.tactile_encoder.parameters()):
                 p.requires_grad = False
 
-        # --- small encoders for low-dim modalities ---
-        self.ft_encoder = nn.Sequential(
-            nn.Linear(ft_channels, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-        )
-        self.gripper_encoder = nn.Sequential(
-            nn.Linear(gripper_channels, 32),
-            nn.ReLU(),
-            nn.Linear(32, 32),
-        )
-
-        # --- per-timestep fusion: 512 + 512 + 64 + 32 + 1 = 1121 ---
-        fusion_dim = self.RESNET18_EMB + self.RESNET18_EMB + 64 + 32 + 1
+        # --- per-second fusion projection ---
+        # concat: [tac_emb (F1*2048), rgb_emb (F1*2048), ft (FT_DIM), grip (GR_DIM), gf (1)]
+        pre_lstm_dim = frames_per_sec * self.RESNET_EMB * 2 + ft_dim + gripper_dim + 1
         self.projection = nn.Sequential(
-            nn.Linear(fusion_dim, hidden_dim),
+            nn.Linear(pre_lstm_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
 
-        # --- LSTM ---
+        # --- 2-layer bidirectional LSTM ---
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
@@ -89,58 +93,44 @@ class GraspStabilityLSTM(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def _encode_frames(self, tactile, rgb, ft, gripper, gripper_force):
-        """Encode all modalities and fuse into per-frame embeddings.
-
-        Returns:
-            projected: (B, S, hidden_dim)  where S = T * frames_per_sec
-        """
-        B, T, F = tactile.shape[:3]
-        S = T * F
-
-        # --- encode every frame through ResNet ---
-        rgb_emb = self.rgb_encoder(
-            rgb.reshape(B * S, *rgb.shape[3:])
-        ).reshape(B, S, self.RESNET18_EMB)
-
-        tac_emb = self.tactile_encoder(
-            tactile.reshape(B * S, *tactile.shape[3:])
-        ).reshape(B, S, self.RESNET18_EMB)
-
-        # --- un-flatten per-second readings to per-frame ---
-        ft_per_frame = ft.reshape(B, T, self.frames_per_sec, self.ft_channels)
-        ft_emb = self.ft_encoder(
-            ft_per_frame.reshape(B, S, self.ft_channels)
-        )
-
-        gr_per_frame = gripper.reshape(B, T, self.frames_per_sec, self.gripper_channels)
-        gr_emb = self.gripper_encoder(
-            gr_per_frame.reshape(B, S, self.gripper_channels)
-        )
-
-        # --- broadcast static force to every frame ---
-        force = gripper_force.unsqueeze(1).expand(B, S, 1)
-
-        # --- fuse + project ---
-        fused = torch.cat([rgb_emb, tac_emb, ft_emb, gr_emb, force], dim=-1)
-        return self.projection(fused)
-
     def forward(self, tactile, rgb, ft, gripper, gripper_force):
         """
         Args:
-            tactile:       (B, T, F, 3, H, W)
-            rgb:           (B, T, F, 3, H, W)
-            ft:            (B, T, F*6)
-            gripper:       (B, T, F*2)
+            tactile:       (B, T, F1, 3, H, W)
+            rgb:           (B, T, F1, 3, H, W)
+            ft:            (B, T, FT_DIM)
+            gripper:       (B, T, GR_DIM)
             gripper_force: (B, 1)
 
         Returns:
-            (B, 1) raw logits.  Use BCEWithLogitsLoss for training or
-            call .sigmoid() at inference for P(success).
+            (B, 1) raw logits.
         """
-        projected = self._encode_frames(
-            tactile, rgb, ft, gripper, gripper_force
-        )  # (B, S, hidden_dim)
+        # --- modality masking (zero-out disabled inputs) ---
+        if 'T'  not in self.modalities: tactile       = tactile       * 0.0
+        if 'V'  not in self.modalities: rgb           = rgb           * 0.0
+        if 'FT' not in self.modalities: ft            = ft            * 0.0
+        if 'G'  not in self.modalities: gripper       = gripper       * 0.0
+        if 'GF' not in self.modalities: gripper_force = gripper_force * 0.0
 
-        lstm_out, _ = self.lstm(projected)  # (B, S, hidden_dim*2)
-        return self.classifier(lstm_out[:, -1, :])  # (B, 1)
+        B, T, F1 = tactile.shape[:3]
+        S = T * F1  # total image frames across all seconds
+
+        # --- encode all image frames through ResNet50, then flatten per second ---
+        tac_emb = self.tactile_encoder(
+            tactile.reshape(B * S, *tactile.shape[3:])
+        ).reshape(B, T, F1 * self.RESNET_EMB)   # (B, T, F1*2048)
+
+        rgb_emb = self.rgb_encoder(
+            rgb.reshape(B * S, *rgb.shape[3:])
+        ).reshape(B, T, F1 * self.RESNET_EMB)   # (B, T, F1*2048)
+
+        # --- ft / gripper already flat per second; broadcast static force ---
+        gf = gripper_force.unsqueeze(1).expand(B, T, 1)   # (B, T, 1)
+
+        # --- fuse all modalities per second, project to hidden_dim ---
+        fused     = torch.cat([tac_emb, rgb_emb, ft, gripper, gf], dim=-1)  # (B, T, pre_lstm_dim)
+        projected = self.projection(fused)                                    # (B, T, hidden_dim)
+
+        # --- LSTM over T seconds, classify from last hidden state ---
+        lstm_out, _ = self.lstm(projected)           # (B, T, hidden_dim*2)
+        return self.classifier(lstm_out[:, -1, :])   # (B, 1)

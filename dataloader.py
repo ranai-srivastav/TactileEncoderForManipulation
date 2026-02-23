@@ -22,18 +22,8 @@ Output shapes (T = duration of grasp+pose in seconds):
   gripper : (T, F2*2)          — F2 gripper readings per second, flattened
   tactile : (T, F1, 3, H, W)   — F1 GelSight frames per second
   rgb     : (T, F1, 3, H, W)   — F1 RGB frames per second
-  - T consecutive integer seconds from t_grasp to t_stability-1
-    (variable length per sample, e.g. 6s, 8s, 10s depending on experiment)
-  - For each second, uniformly sample F1 image frames and F2 sensor readings
-  - Output shapes are (T, ...) where T varies per sample
 
-Output shapes (T = duration of grasp+pose in seconds):
-  ft      : (T, F2*6)          — F2 F/T readings per second, flattened
-  gripper : (T, F2*2)          — F2 gripper readings per second, flattened
-  tactile : (T, F1, 3, H, W)   — F1 GelSight frames per second
-  rgb     : (T, F1, 3, H, W)   — F1 RGB frames per second
-
-If a bucket has fewer than F items, the last item is forward-filled.
+If a bucket has fewer than F items (but > 0), the sample is skipped with a warning.
 If a bucket is completely empty, zeros / black frames are used.
 
 GelSight frames are baseline-subtracted: each frame minus the first
@@ -51,9 +41,18 @@ from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
+# Experiment means one object with one pose for one force level, e.g. "flashlight_1612558475_F80_pose8".
 
 LABEL_MAP = {'pass': 0, 'slip': 1, 'drop': 1}
 IMAGE_SIZE = (224, 224)
+
+F1     = 2        # image frames sampled per second
+F2     = 2        # sensor readings sampled per second
+FT_DIM = F2 * 6  # flattened F/T dim per timestep
+GR_DIM = F2 * 2  # flattened gripper dim per timestep
+L      = None     # optional max-seconds cap (None = no limit)
+phase  = 'grasp+pose'  # window used: grasping → stability
+
 
 IMG_TRANSFORM = transforms.Compose([
     transforms.Resize(IMAGE_SIZE),
@@ -63,19 +62,11 @@ IMG_TRANSFORM = transforms.Compose([
 ])
 
 # Maps phase name → (phase_start_stage_key, phase_end_stage_key).
-# The window is the last L seconds of the named phase.
 _PHASE_BOUNDS = {
     'grasp':     ('grasping',  'pose'),
     'pose':      ('pose',      'stability'),
     'stability': ('stability', 'retract'),
 }
-
-# TODO @bayapilla: If the only consumer of the image is the encoder, then replace with
-# TODO @bayapilla: If the only consumer of the image is the encoder, then replace with
-'''
-self.resnet_transforms = self.resnet_weights.transforms()
-
-'''
 
 
 def _parse_folder_name(name: str) -> dict:
@@ -134,32 +125,31 @@ def _read_csv_timeseries(path: Path, time_col: int = 0) -> Tuple[np.ndarray, np.
 # Deterministic sampling helpers
 # ---------------------------------------------------------------------------
 
-def _sample_bucket(items: np.ndarray, n_cols: int, f: int) -> np.ndarray:
+def _sample_bucket(items: np.ndarray, n_cols: int, f: int) -> Optional[np.ndarray]:
     """
     Uniformly sample exactly f rows from items (shape: k x n_cols).
-    Returns flat array (f * n_cols,).
+    Returns flat array (f * n_cols,), or None if 0 < k < f.
       k >= f : linspace index picks  (deterministic)
-      0 < k < f : forward-fill last row
       k == 0 : zeros
+      0 < k < f : returns None (caller should skip this sample)
     """
     k = len(items)
     if k == 0:
         return np.zeros(f * n_cols, dtype=np.float32)
     if k >= f:
         idx    = np.round(np.linspace(0, k - 1, f)).astype(int)
-        picked = items[idx]
-    else:
-        pad    = np.tile(items[-1:], (f - k, 1))
-        picked = np.vstack([items, pad])
-    return picked.flatten().astype(np.float32)
+        return items[idx].flatten().astype(np.float32)
+    # 0 < k < f — not enough data for the requested sampling rate
+    return None
 
 
-def _sample_image_bucket(paths: List[Path], f: int) -> List[Optional[Path]]:
+def _sample_image_bucket(paths: List[Path], f: int) -> Optional[List[Optional[Path]]]:
     """
     Uniformly sample exactly f paths from a bucket.
+    Returns list of f paths, or None if 0 < len < f.
       len >= f : linspace index picks  (deterministic)
-      0 < len < f : forward-fill last path
       len == 0 : [None] * f
+      0 < len < f : returns None (caller should skip this sample)
     """
     k = len(paths)
     if k == 0:
@@ -167,8 +157,8 @@ def _sample_image_bucket(paths: List[Path], f: int) -> List[Optional[Path]]:
     if k >= f:
         idx = np.round(np.linspace(0, k - 1, f)).astype(int)
         return [paths[i] for i in idx]
-    else:
-        return paths + [paths[-1]] * (f - k)
+    # 0 < k < f — not enough frames for the requested sampling rate
+    return None
 
 
 def _list_image_files(folder: Path) -> List[Tuple[int, int, Path]]:
@@ -207,6 +197,7 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
 
     shake_str = labels.get('stability', 'drop')
     pose_str  = labels.get('pose',      'drop')
+    grasp_str = labels.get('grasp',     '')
     if shake_str not in LABEL_MAP or pose_str not in LABEL_MAP:
         return None
     if pose_str == 'drop':
@@ -215,15 +206,14 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
     t_grasp     = stages.get('grasping', stages.get('grasp'))
     t_stability = stages.get('stability')
     if t_grasp is None or t_stability is None:
-    t_grasp     = stages.get('grasping', stages.get('grasp'))
-    t_stability = stages.get('stability')
-    if t_grasp is None or t_stability is None:
         return None
 
     # T consecutive seconds: [t_grasp, t_grasp+1, ..., t_stability-1]
     seconds = list(range(t_grasp, t_stability))
-    # T consecutive seconds: [t_grasp, t_grasp+1, ..., t_stability-1]
-    seconds = list(range(t_grasp, t_stability))
+    if L is not None:
+        seconds = seconds[:L]
+    if not seconds:
+        return None
 
     ft_ts, ft_val = _read_csv_timeseries(sample_dir / 'f_t.csv',     time_col=0)
     gr_ts, gr_val = _read_csv_timeseries(sample_dir / 'gripper.csv', time_col=0)
@@ -233,11 +223,11 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
 
     # Group image paths by integer second
     gel_by_sec = {}
-    for ts, p in gel_files:
+    for ts, _, p in gel_files:
         gel_by_sec.setdefault(ts, []).append(p)
 
     rgb_by_sec = {}
-    for ts, p in rgb_files:
+    for ts, _, p in rgb_files:
         rgb_by_sec.setdefault(ts, []).append(p)
 
     # GelSight baseline: first frame of the first second
@@ -251,37 +241,52 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
 
     for sec in seconds:
         # F/T: all rows with this integer timestamp
-        ft_mask  = ft_ts == sec
-        ft_bucket = ft_val[ft_mask]                                    # (k, 6)
-        ft_seq.append(_sample_bucket(ft_bucket, n_cols=6, f=F2))       # (F2*6,)
+        ft_mask   = ft_ts == sec
+        ft_bucket = ft_val[ft_mask]                             # (k, 6)
+        ft_row    = _sample_bucket(ft_bucket, n_cols=6, f=F2)  # (F2*6,) or None
+        if ft_row is None:
+            print(f"[WARN] {sample_dir.name}: only {len(ft_bucket)} F/T rows "
+                  f"in second {sec}, need F2={F2}. Skipping sample.")
+            return None
+        ft_seq.append(ft_row)
 
         # Gripper
         gr_mask   = gr_ts == sec
-        gr_bucket = gr_val[gr_mask]                                    # (k, 2)
-        gr_seq.append(_sample_bucket(gr_bucket, n_cols=2, f=F2))       # (F2*2,)
+        gr_bucket = gr_val[gr_mask]                             # (k, 2)
+        gr_row    = _sample_bucket(gr_bucket, n_cols=2, f=F2)  # (F2*2,) or None
+        if gr_row is None:
+            print(f"[WARN] {sample_dir.name}: only {len(gr_bucket)} gripper rows "
+                  f"in second {sec}, need F2={F2}. Skipping sample.")
+            return None
+        gr_seq.append(gr_row)
 
-        # GelSight: F frames from this second, subtract baseline
-        gel_paths  = _sample_image_bucket(gel_by_sec.get(sec, []), f=F1) # [F paths]
+        # GelSight: F1 frames from this second, subtract baseline
+        gel_paths = _sample_image_bucket(gel_by_sec.get(sec, []), f=F1)
+        if gel_paths is None:
+            print(f"[WARN] {sample_dir.name}: only {len(gel_by_sec.get(sec, []))} GelSight frames "
+                  f"in second {sec}, need F1={F1}. Skipping sample.")
+            return None
         gel_frames = torch.stack([_load_image(p) - baseline for p in gel_paths])
-        tactile_seq.append(gel_frames)                                 # (F, 3, H, W)
+        tactile_seq.append(gel_frames)                          # (F1, 3, H, W)
 
-        # RGB: F frames from this second
-        rgb_paths  = _sample_image_bucket(rgb_by_sec.get(sec, []), f=F1) # [F paths]
+        # RGB: F1 frames from this second
+        rgb_paths = _sample_image_bucket(rgb_by_sec.get(sec, []), f=F1)
+        if rgb_paths is None:
+            print(f"[WARN] {sample_dir.name}: only {len(rgb_by_sec.get(sec, []))} RGB frames "
+                  f"in second {sec}, need F1={F1}. Skipping sample.")
+            return None
         rgb_frames = torch.stack([_load_image(p) for p in rgb_paths])
-        rgb_seq.append(rgb_frames)                                     # (F, 3, H, W)
+        rgb_seq.append(rgb_frames)                              # (F1, 3, H, W)
 
     return {
-        'tactile':       torch.stack(tactile_seq),                          # (T, F1, 3, H, W)
-        'rgb':           torch.stack(rgb_seq),                              # (T, F1, 3, H, W)
-        'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),   # (T, F2*6)
-        'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),   # (T, F2*2)
-        'tactile':       torch.stack(tactile_seq),                          # (T, F1, 3, H, W)
-        'rgb':           torch.stack(rgb_seq),                              # (T, F1, 3, H, W)
-        'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),   # (T, F2*6)
-        'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),   # (T, F2*2)
-        'gripper_force': torch.tensor([meta['force']], dtype=torch.float32),    # (1,)
-        'label':         torch.tensor(LABEL_MAP[shake_str], dtype=torch.long),
-        'pose_label':    torch.tensor(LABEL_MAP[pose_str],  dtype=torch.long),
+        'tactile':       torch.stack(tactile_seq),                               # (T, F1, 3, H, W)
+        'rgb':           torch.stack(rgb_seq),                                   # (T, F1, 3, H, W)
+        'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),    # (T, F2*6)
+        'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),    # (T, F2*2)
+        'gripper_force': torch.tensor([meta['force']], dtype=torch.float32),     # (1,)
+        'label':         torch.tensor(LABEL_MAP[shake_str],            dtype=torch.long),
+        'pose_label':    torch.tensor(LABEL_MAP[pose_str],             dtype=torch.long),
+        'grasp_label':   LABEL_MAP.get(grasp_str, -1),   # -1 = unknown; not in __getitem__
         'object':        meta['object'],
         'pose_idx':      meta['pose_idx'],
         'force':         meta['force'],
@@ -303,7 +308,7 @@ class PoseItDataset(Dataset):
 
         self.samples = []
         skipped = 0
-        for d in sorted(Path(root_dir).iterdir()):
+        for d in dirs:
             if not d.is_dir():
                 continue
             try:
@@ -325,10 +330,6 @@ class PoseItDataset(Dataset):
     def __getitem__(self, idx):
         s = self.samples[idx]
         return (
-            s['tactile'],        # (T, F1, 3, H, W)
-            s['rgb'],            # (T, F1, 3, H, W)
-            s['ft'],             # (T, F2*6)
-            s['gripper'],        # (T, F2*2)
             s['tactile'],        # (T, F1, 3, H, W)
             s['rgb'],            # (T, F1, 3, H, W)
             s['ft'],             # (T, F2*6)
@@ -366,64 +367,15 @@ def split_by_pose(dataset: PoseItDataset, test_pose_indices: List[int], val_rati
 def uniform_random_split(dataset: PoseItDataset, train_ratio: float = 0.6875, val_ratio: float = 0.15625):
     n   = len(dataset)
     idx = np.random.permutation(n)
-    n_train = int(n * train_ratio)
-    n_val   = int(n * val_ratio)
+    # Guard against empty val/test sets when n is very small (e.g. --subsample).
+    n_val   = max(1, int(n * val_ratio))
+    n_train = max(1, min(int(n * train_ratio), n - n_val - 1))
     return (
         torch.utils.data.Subset(dataset, idx[:n_train].tolist()),
         torch.utils.data.Subset(dataset, idx[n_train:n_train + n_val].tolist()),
         torch.utils.data.Subset(dataset, idx[n_train + n_val:].tolist()),
     )
 
-def collate_variable_length(batch):
-    """
-    Custom collate function for variable-length sequences.
-
-    Input: list of tuples from PoseItDataset.__getitem__
-    Output: padded batch + sequence lengths
-    """
-    tactile_list, rgb_list, ft_list, gripper_list = [], [], [], []
-    gf_list, label_list, pose_label_list, lengths = [], [], [], []
-
-    for tac, rgb, ft, grip, gf, label, pose_label in batch:
-        T = tac.shape[0]
-        lengths.append(T)
-
-        tactile_list.append(tac)
-        rgb_list.append(rgb)
-        ft_list.append(ft)
-        gripper_list.append(grip)
-        gf_list.append(gf)
-        label_list.append(label)
-        pose_label_list.append(pose_label)
-
-    max_T = max(lengths)
-
-    def pad_to_max(tensor_list, max_len):
-        padded = []
-        for t in tensor_list:
-            T = t.shape[0]
-            if T < max_len:
-                pad_shape = (max_len - T, *t.shape[1:])
-                pad = torch.zeros(pad_shape, dtype=t.dtype)
-                t = torch.cat([t, pad], dim=0)
-            padded.append(t)
-        return torch.stack(padded)
-
-    tactile_batch = pad_to_max(tactile_list, max_T)
-    rgb_batch     = pad_to_max(rgb_list, max_T)
-    ft_batch      = pad_to_max(ft_list, max_T)
-    gripper_batch = pad_to_max(gripper_list, max_T)
-
-    gf_batch    = torch.stack(gf_list)
-    labels      = torch.stack(label_list)
-    pose_labels = torch.stack(pose_label_list)
-    lengths     = torch.tensor(lengths, dtype=torch.long)
-
-    return (
-        tactile_batch, rgb_batch, ft_batch, gripper_batch,
-        gf_batch, labels, pose_labels, lengths
-    )
-
 
 def collate_variable_length(batch):
     """
@@ -474,7 +426,6 @@ def collate_variable_length(batch):
         tactile_batch, rgb_batch, ft_batch, gripper_batch,
         gf_batch, labels, pose_labels, lengths
     )
-
 
 
 if __name__ == '__main__':
@@ -490,28 +441,10 @@ if __name__ == '__main__':
         print(f"rgb          : {rgb.shape}")   # (T, F1, 3, 224, 224)
         print(f"ft           : {ft.shape}")    # (T, F2*6)
         print(f"gripper      : {grip.shape}")  # (T, F2*2)
-        print(f"tactile      : {tac.shape}")   # (T, F1, 3, 224, 224)
-        print(f"rgb          : {rgb.shape}")   # (T, F1, 3, 224, 224)
-        print(f"ft           : {ft.shape}")    # (T, F2*6)
-        print(f"gripper      : {grip.shape}")  # (T, F2*2)
         print(f"gripper_force: {gf.shape}")    # (1,)
         print(f"label        : {label}")
         print(f"pose_label   : {pose_label}")
         print(f"\nF1={F1}, F2={F2}  ->  FT_DIM={FT_DIM}, GR_DIM={GR_DIM}")
-        print(f"\nF1={F1}, F2={F2}  ->  FT_DIM={FT_DIM}, GR_DIM={GR_DIM}")
-
-        print("\n=== Batch with custom collate (padded) ===")
-        loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=collate_variable_length)
-        batch = next(iter(loader))
-        tac_b, rgb_b, ft_b, grip_b, gf_b, lbl_b, pl_b, lengths_b = batch
-
-        print(f"tactile : {tac_b.shape}")
-        print(f"rgb     : {rgb_b.shape}")
-        print(f"ft      : {ft_b.shape}")
-        print(f"gripper : {grip_b.shape}")
-        print(f"lengths : {lengths_b}")
-        print(f"\nmax_T in batch: {tac_b.shape[1]}")
-        print(f"actual sequence lengths: {lengths_b.tolist()}")
 
         print("\n=== Batch with custom collate (padded) ===")
         loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=collate_variable_length)

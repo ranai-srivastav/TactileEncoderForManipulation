@@ -13,13 +13,78 @@ python train.py --split random --anneal_iter 300 --n_iters 600
 """
 
 import argparse
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataloader import PoseItDataset, split_by_object, split_by_pose, uniform_random_split
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
+import dataloader as _dl
+from dataloader import (PoseItDataset, split_by_object, split_by_pose,
+                        uniform_random_split, collate_variable_length, F2,
+                        FT_DIM, GR_DIM)
 from sampler import DRSSampler
-from model import BaselineTactileEncoder
+from model import GraspStabilityLSTM
+
+
+def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
+    """Print per-phase label distribution for the loaded dataset and each split.
+
+    Phases:
+      Grasp     — label for the grasping phase (stored as grasp_label; -1 = unknown)
+      Pose      — label for the pose phase (pose_label)
+      Stability — label for the stability/retract phase (label, used for training)
+    """
+
+    def _count(samples):
+        c = {
+            'grasp':     [0, 0, 0],   # [pass, fail, unknown]
+            'pose':      [0, 0, 0],
+            'stability': [0, 0, 0],
+        }
+        for s in samples:
+            g = s.get('grasp_label', -1)
+            c['grasp'][0 if g == 0 else (1 if g == 1 else 2)] += 1
+
+            p = s['pose_label'].item()
+            c['pose'][0 if p == 0 else 1] += 1
+
+            l = s['label'].item()
+            c['stability'][0 if l == 0 else 1] += 1
+        return c
+
+    def _print_split(name, samples):
+        c = _count(samples)
+        print(f'  {name} — {len(samples)} samples')
+        print(f'    {"Phase":<18} {"Pass":>5} {"Fail":>5} {"Unknown":>8}')
+        print(f'    {"-"*38}')
+        labels = [('grasp', 'Grasp'), ('pose', 'Pose'), ('stability', 'Stability/Retract')]
+        for key, display in labels:
+            p, f, u = c[key]
+            print(f'    {display:<18} {p:>5} {f:>5} {u:>8}')
+
+    train_s = [dataset.samples[i] for i in train_set.indices]
+    val_s   = [dataset.samples[i] for i in val_set.indices]
+    test_s  = [dataset.samples[i] for i in test_set.indices]
+
+    print()
+    print('=' * 54)
+    print(f'Dataset stats — {len(dataset)} total samples loaded')
+    _print_split('All', dataset.samples)
+    print()
+    _print_split('Train', train_s)
+    print()
+    _print_split('Val',   val_s)
+    print()
+    _print_split('Test',  test_s)
+    print('=' * 54)
+    print()
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -32,13 +97,22 @@ def parse_args():
     p.add_argument('--lr',           type=float, default=0.01)
     p.add_argument('--weight_decay', type=float, default=0.01)
     p.add_argument('--dropout',      type=float, default=0.1)
-    p.add_argument('--hidden_dim',   type=int,   default=500)
-    p.add_argument('--model_emb',    type=int,   default=512)
+    p.add_argument('--hidden_dim',   type=int,   default=256)
     p.add_argument('--n_iters',      type=int,   default=600)
     p.add_argument('--anneal_iter',  type=int,   default=300)
     p.add_argument('--num_workers',  type=int,   default=4)
-    p.add_argument('--modalities',   nargs='+', default=['V', 'T', 'FT', 'GF', 'G'],
-                   help='Space-separated: V (vision), T (tactile), FT (force-torque), GF (gripper force), G (gripper state). e.g. --modalities V T FT GF G')
+    p.add_argument('--modalities',   nargs='+',  default=['V', 'T', 'FT', 'G', 'GF'],
+                   help='Active modalities: V T FT G GF')
+    p.add_argument('--L',            type=int,   default=20,
+                   help='Max seconds per episode (clips longer sequences)')
+    p.add_argument('--subsample',    type=float, default=1.0,
+                   help='Fraction of dataset to use (e.g. 0.01 for 1%%)')
+    p.add_argument('--wandb_project', type=str, default=None,
+                   help='W&B project name. Omit to disable W&B logging.')
+    p.add_argument('--wandb_run',     type=str, default=None,
+                   help='W&B run name (optional).')
+    p.add_argument('--wandb_entity',  type=str, default=None,
+                   help='W&B entity/team (optional).')
     return p.parse_args()
 
 
@@ -51,15 +125,17 @@ def make_split(dataset, args):
         return uniform_random_split(dataset)
 
 
-def make_loader(dataset, subset, sampler=None, batch_size=32, num_workers=4, shuffle=False):
+def make_loader(subset, sampler=None, batch_size=32, num_workers=4, shuffle=False):
     if sampler is not None:
         # batch_sampler controls both batching and shuffling — don't pass batch_size/shuffle
-        return DataLoader(dataset, batch_sampler=sampler, num_workers=num_workers)
-    return DataLoader(subset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+        return DataLoader(subset.dataset, batch_sampler=sampler,
+                          num_workers=num_workers, collate_fn=collate_variable_length)
+    return DataLoader(subset, batch_size=batch_size, shuffle=shuffle,
+                      num_workers=num_workers, collate_fn=collate_variable_length)
 
 
 def batch_to_device(batch, device):
-    tac, rgb, ft, grip, gf, label, pose_label = batch
+    tac, rgb, ft, grip, gf, label, pose_label, lengths = batch
     return (
         tac.to(device),
         rgb.to(device),
@@ -68,32 +144,65 @@ def batch_to_device(batch, device):
         gf.to(device),
         label.to(device),
         pose_label.to(device),
+        lengths,
     )
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
-    total_loss, correct, n = 0.0, 0, 0
+    total_loss = 0.0
+    tp, fp, fn, n = 0, 0, 0, 0
     for batch in loader:
-        tac, rgb, ft, grip, gf, label, _ = batch_to_device(batch, device)
-        logits = model(tac, rgb, ft, grip, gf)
-        total_loss += criterion(logits, label).item() * len(label)
-        correct    += (logits.argmax(1) == label).sum().item()
-        n          += len(label)
-    return total_loss / n, correct / n
+        tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
+        logits = model(tac, rgb, ft, grip, gf).squeeze(1)   # (B,)
+        total_loss += criterion(logits, label.float()).item() * len(label)
+        preds  = logits > 0
+        actual = label.bool()
+        tp += (preds &  actual).sum().item()
+        fp += (preds & ~actual).sum().item()
+        fn += (~preds & actual).sum().item()
+        n  += len(label)
+    if n == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+    acc       = (tp + (n - tp - fp - fn)) / n
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1        = (2 * precision * recall / (precision + recall)
+                 if (precision + recall) > 0 else 0.0)
+    return total_loss / n, acc, precision, recall, f1
 
 
 def main():
     args   = parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-    print(f"Modalities: {args.modalities}")
+
+    # W&B initialisation
+    use_wandb = _WANDB_AVAILABLE and args.wandb_project is not None
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run,
+            entity=args.wandb_entity,
+            config=vars(args),
+        )
+    elif args.wandb_project is not None:
+        print("[WARN] wandb not installed — W&B logging disabled.")
+
+    # set episode length cap before dataset construction
+    _dl.L = args.L
 
     # dataset
     ds = PoseItDataset(root_dir=args.root_dir)
+    if args.subsample < 1.0:
+        import random
+        k = max(4, int(len(ds.samples) * args.subsample))
+        ds.samples = random.sample(ds.samples, k)
+        print(f"Subsampled to {len(ds.samples)} samples ({args.subsample*100:.1f}% of dataset)")
     train_set, val_set, test_set = make_split(ds, args)
     print(f"Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
+    print_dataset_stats(ds, train_set, val_set, test_set)
 
     # deferred sampling
     sampler = DRSSampler(
@@ -103,23 +212,23 @@ def main():
         indices=train_set.indices,
     )
 
-    train_loader = make_loader(ds, train_set, sampler=sampler, num_workers=args.num_workers)
-    val_loader   = make_loader(ds, val_set,   batch_size=args.batch_size, num_workers=args.num_workers)
-    test_loader  = make_loader(ds, test_set,  batch_size=args.batch_size, num_workers=args.num_workers)
+    train_loader = make_loader(train_set, sampler=sampler, num_workers=args.num_workers)
+    val_loader   = make_loader(val_set,   batch_size=args.batch_size, num_workers=args.num_workers)
+    test_loader  = make_loader(test_set,  batch_size=args.batch_size, num_workers=args.num_workers)
 
     # Model
-    model = BaselineTactileEncoder(
-        vision_resnet_emb_size=2048,
-        tactile_resnet_emb_size=2048,
-        model_emb_size=args.model_emb,
+    model = GraspStabilityLSTM(
+        frames_per_sec=F2,
+        ft_dim=FT_DIM,
+        gripper_dim=GR_DIM,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
         modalities=args.modalities,
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.SGD(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        filter(lambda p: p.requires_grad, model.parameters()), # only train submodules that we want to train
         lr=args.lr,
         weight_decay=args.weight_decay,
         momentum=0.9,
@@ -143,19 +252,34 @@ def main():
                 sampler.activate()
                 print(f"[iter {iteration}] LR annealed to {scheduler.get_last_lr()}")
 
-            tac, rgb, ft, grip, gf, label, _ = batch_to_device(batch, device)
+            tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
 
             optimizer.zero_grad()
-            logits = model(tac, rgb, ft, grip, gf)
-            loss   = criterion(logits, label)
+            logits = model(tac, rgb, ft, grip, gf).squeeze(1)  # (B,)
+            loss   = criterion(logits, label.float())
             loss.backward()
             optimizer.step()
 
-            if iteration % 50 == 0:
-                val_loss, val_acc = evaluate(model, val_loader, criterion, device)
-                print(f"[iter {iteration:4d}] train_loss={loss.item():.4f}  "
+            if iteration % 10 == 0:
+                val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
+                    model, val_loader, criterion, device)
+                print(f"[iter {iteration:4d}] "
+                      f"train_loss={loss.item():.4f}  "
                       f"val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%  "
+                      f"prec={val_prec:.3f}  rec={val_rec:.3f}  f1={val_f1:.3f}  "
                       f"DRS={'on' if sampler.is_active else 'off'}")
+
+                if use_wandb:
+                    wandb.log({
+                        'iter':           iteration,
+                        'train/loss':     loss.item(),
+                        'val/loss':       val_loss,
+                        'val/acc':        val_acc,
+                        'val/precision':  val_prec,
+                        'val/recall':     val_rec,
+                        'val/f1':         val_f1,
+                        'drs_active':     int(sampler.is_active),
+                    }, step=iteration)
 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
@@ -165,9 +289,21 @@ def main():
 
     # test
     print("\nLoading best checkpoint for test evaluation...")
-    model.load_state_dict(torch.load('best_model.pt'))
-    test_loss, test_acc = evaluate(model, test_loader, criterion, device)
-    print(f"Test loss={test_loss:.4f}  Test acc={test_acc*100:.2f}%")
+    model.load_state_dict(torch.load('best_model.pt', map_location=device))
+    test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(
+        model, test_loader, criterion, device)
+    print(f"Test loss={test_loss:.4f}  acc={test_acc*100:.2f}%  "
+          f"prec={test_prec:.3f}  rec={test_rec:.3f}  f1={test_f1:.3f}")
+
+    if use_wandb:
+        wandb.log({
+            'test/loss':      test_loss,
+            'test/acc':       test_acc,
+            'test/precision': test_prec,
+            'test/recall':    test_rec,
+            'test/f1':        test_f1,
+        })
+        wandb.finish()
 
 
 if __name__ == '__main__':

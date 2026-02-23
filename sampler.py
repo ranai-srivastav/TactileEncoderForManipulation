@@ -85,13 +85,14 @@ class DRSSampler(Sampler):
         r = len(self.s_neq) / max(len(self.s_eq), 1)
         self.r = r
 
-        if len(self.s_neq) > 0 and sigma <= r:
+        if len(self.s_neq) > 0 and sigma < r:
             raise ValueError(
-                f"sigma ({sigma}) must be > r ({r:.4f}). "
+                f"sigma ({sigma}) must be >= r ({r:.4f}). "
                 "Increase sigma or check your dataset split."
             )
 
-        self.keep_prob = r / sigma  # probability of keeping an S= example
+        # When sigma == r, keep_prob == 1.0 (DRS is a no-op but still valid).
+        self.keep_prob = r / sigma if sigma > 0 else 0.0
 
         n_total = len(all_indices)
         # Estimate number of batches per epoch using the full pool size
@@ -127,9 +128,12 @@ class DRSSampler(Sampler):
             yield self._sample_batch()
 
     def _sample_batch(self) -> List[int]:
-        # Step 1: Draw B̃ uniformly at random
+        # Step 1: Draw B̃ uniformly at random.
+        # Use replace=True when the pool is smaller than batch_size (e.g. small
+        # subsampled datasets) to avoid a ValueError from numpy.
+        replace = self.batch_size > len(self.all_indices)
         b_tilde_idx = self.rng.choice(
-            self.all_indices, size=self.batch_size, replace=False
+            self.all_indices, size=self.batch_size, replace=replace
         )
 
         if not self._active:
