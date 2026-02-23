@@ -93,7 +93,7 @@ def parse_args():
     p.add_argument('--test_objects', nargs='+', default=['mug', 'bowl'])
     p.add_argument('--test_poses',   nargs='+', type=int, default=[1, 2, 3, 4, 5])
     p.add_argument('--sigma',        type=float, default=1.0)   # 0.5 for T; 1.0 for V or V+T
-    p.add_argument('--batch_size',   type=int,   default=200)
+    p.add_argument('--batch_size',   type=int,   default=32)
     p.add_argument('--lr',           type=float, default=0.01)
     p.add_argument('--weight_decay', type=float, default=0.01)
     p.add_argument('--dropout',      type=float, default=0.1)
@@ -244,6 +244,23 @@ def main():
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.1)
 
+    if use_wandb:
+        wandb.log({
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "dropout": args.dropout,
+            "hidden_dim": args.hidden_dim,
+            "frames_per_sec": F2,
+            "ft_dim": FT_DIM,
+            "gripper_dim": GR_DIM,
+            "modalities": args.modalities,
+            "sigma": args.sigma,
+            "batch_size": args.batch_size,
+            "n_iters": args.n_iters,
+            "anneal_iter": args.anneal_iter,
+            "sequence_length": args.L,
+        })
+    
     # training loop
     best_val_acc = 0.0
     iteration    = 0
