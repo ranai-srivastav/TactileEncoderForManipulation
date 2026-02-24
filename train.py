@@ -100,6 +100,8 @@ def parse_args():
     p.add_argument('--hidden_dim',   type=int,   default=256)
     p.add_argument('--n_iters',      type=int,   default=600)
     p.add_argument('--anneal_iter',  type=int,   default=300)
+    p.add_argument('--F1',          type=int,   default=1)
+    p.add_argument('--F2',          type=int,   default=1)
     p.add_argument('--num_workers',  type=int,   default=4)
     p.add_argument('--modalities',   nargs='+',  default=['V', 'T', 'FT', 'G', 'GF'],
                    help='Active modalities: V T FT G GF')
@@ -131,9 +133,9 @@ def make_loader(subset, sampler=None, batch_size=32, num_workers=4, shuffle=Fals
     if sampler is not None:
         # batch_sampler controls both batching and shuffling — don't pass batch_size/shuffle
         return DataLoader(subset.dataset, batch_sampler=sampler,
-                          num_workers=num_workers, collate_fn=collate_variable_length)
+                          num_workers=num_workers)
     return DataLoader(subset, batch_size=batch_size, shuffle=shuffle,
-                      num_workers=num_workers, collate_fn=collate_variable_length)
+                      num_workers=num_workers)
 
 
 def batch_to_device(batch, device):
@@ -194,6 +196,8 @@ def main():
 
     # set episode length cap before dataset construction
     _dl.L = args.L
+    _dl.F1 = args.F1
+    _dl.F2 = args.F2
 
     # dataset
     ds = PoseItDataset(root_dir=args.root_dir)

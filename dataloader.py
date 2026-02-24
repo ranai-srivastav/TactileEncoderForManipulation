@@ -46,11 +46,11 @@ from torchvision import transforms
 LABEL_MAP = {'pass': 0, 'slip': 1, 'drop': 1}
 IMAGE_SIZE = (224, 224)
 
-F1     = 2        # image frames sampled per second
-F2     = 2        # sensor readings sampled per second
+F1     = 1        # image frames sampled per second     @TODO Make 1
+F2     = 1        # sensor readings sampled per second  @TODO Make 1
 FT_DIM = F2 * 6  # flattened F/T dim per timestep
 GR_DIM = F2 * 2  # flattened gripper dim per timestep
-L      = None     # optional max-seconds cap (None = no limit)
+L      = None     # optional max-seconds cap (None = no limit) @TODO Make 8
 phase  = 'grasp+pose'  # window used: grasping → stability
 
 
