@@ -27,7 +27,7 @@ If a bucket is completely empty, zeros / black frames are used.
 import re
 import csv
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -45,6 +45,8 @@ F2 = 2              # items uniformly sampled per second bucket
 
 FT_DIM  = F2 * 6   # F/T  feature size per timestep
 GR_DIM  = F2 * 2   # gripper feature size per timestep
+
+STANDARDIZE_EPS = 1e-8   # avoid div-by-zero in standardization
 
 IMG_TRANSFORM = transforms.Compose([
     transforms.Resize(IMAGE_SIZE),
@@ -249,10 +251,39 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
     }
 
 
+#TODO @parthsin standardization according to the paper
+def compute_dataset_stats(dataset: "PoseItDataset", indices: List[int]) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Compute mean and std for ft, gripper, and gripper_force over the given subset.
+    Standardization (mean=0, std=1 per coordinate).
+    Returns dict with keys 'ft', 'gripper', 'gf' -> (mean, std) tensors.
+    """
+    ft_list, grip_list, gf_list = [], [], []
+    for i in indices:
+        s = dataset.samples[i]
+        ft_list.append(s['ft'].numpy())
+        grip_list.append(s['gripper'].numpy())
+        gf_list.append(s['gripper_force'].numpy())
+
+    def _mean_std(arr_list):
+        stacked = np.concatenate([a.reshape(-1, a.shape[-1]) for a in arr_list], axis=0)
+        mean = np.mean(stacked, axis=0).astype(np.float32)
+        std = np.std(stacked, axis=0).astype(np.float32) + STANDARDIZE_EPS
+        return torch.tensor(mean), torch.tensor(std)
+
+    stats = {
+        'ft': _mean_std(ft_list),
+        'gripper': _mean_std(grip_list),
+        'gf': _mean_std(gf_list),
+    }
+    return stats
+
+
 class PoseItDataset(Dataset):
     def __init__(self,
                  root_dir: Optional[str] = None,
-                 sample_dirs: Optional[List[str]] = None):
+                 sample_dirs: Optional[List[str]] = None,
+                 stats: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None):
         assert root_dir or sample_dirs, "Provide root_dir or sample_dirs"
         dirs = [Path(d) for d in sample_dirs] if sample_dirs \
                else sorted(Path(root_dir).iterdir())
@@ -274,17 +305,33 @@ class PoseItDataset(Dataset):
 
         print(f"Loaded {len(self.samples)} samples ({skipped} skipped)")
 
+        self.stats = stats
+        if stats is not None:
+            print("Standardization enabled (ft, gripper, gf)")
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
+        ft = s['ft']
+        grip = s['gripper']
+        gf = s['gripper_force']
+
+        if self.stats is not None:
+            mean_ft, std_ft = self.stats['ft']
+            mean_grip, std_grip = self.stats['gripper']
+            mean_gf, std_gf = self.stats['gf']
+            ft = (ft - mean_ft) / std_ft
+            grip = (grip - mean_grip) / std_grip
+            gf = (gf - mean_gf) / std_gf
+
         return (
             s['tactile'],        # (T, F1, 3, H, W)
             s['rgb'],            # (T, F1, 3, H, W)
-            s['ft'],             # (T, F2*6)
-            s['gripper'],        # (T, F2*2)
-            s['gripper_force'],  # (1,)
+            ft,                  # (T, F2*6) standardized if stats set
+            grip,                # (T, F2*2) standardized if stats set
+            gf,                  # (1,) standardized if stats set
             s['label'],          # scalar
             s['pose_label'],     # scalar
         )

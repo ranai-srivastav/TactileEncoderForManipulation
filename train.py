@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataloader import PoseItDataset, split_by_object, split_by_pose, uniform_random_split
+from dataloader import PoseItDataset, compute_dataset_stats, split_by_object, split_by_pose, uniform_random_split
 from sampler import DRSSampler
 from model import BaselineTactileEncoder
 
@@ -94,6 +94,10 @@ def main():
     ds = PoseItDataset(root_dir=args.root_dir)
     train_set, val_set, test_set = make_split(ds, args)
     print(f"Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
+
+    # standardization: compute mean/std from training set, apply to all splits
+    stats = compute_dataset_stats(ds, train_set.indices)
+    ds.stats = stats
 
     # deferred sampling
     sampler = DRSSampler(
