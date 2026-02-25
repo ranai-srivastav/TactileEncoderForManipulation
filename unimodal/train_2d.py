@@ -1,4 +1,9 @@
 import argparse
+import os
+import sys
+
+# Add project root to path so dataloader.py can be found when running from any directory
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import torch
 import torch.nn as nn
@@ -6,7 +11,15 @@ from torch.utils.data import DataLoader
 
 import dataloader as _dl
 from dataloader import PoseItDataset, collate_variable_length, split_by_object
-from unimodal.unimodal_2d import GraspClassifier
+from unimodal_2d import GraspClassifier
+
+'''
+Usage: 
+    python train_2d.py --modality rgb
+    python train_2d.py --modality tactile
+    python unimodal/train_2d.py --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight --modality rgb
+
+'''
 
 
 def parse_args():
