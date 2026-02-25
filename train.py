@@ -242,13 +242,14 @@ def main():
     ).to(device)
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.SGD(
-        filter(lambda p: p.requires_grad, model.parameters()), # only train submodules that we want to train
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
         weight_decay=args.weight_decay,
-        momentum=0.9,
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.n_iters, eta_min=1e-6
+    )
 
     if use_wandb:
         wandb.log({
@@ -283,11 +284,10 @@ def main():
             if iteration >= args.n_iters:
                 break
 
-            # LR anneal + activate DRS at the right iteration
+            # Activate DRS at the right iteration (decoupled from LR schedule)
             if iteration == args.anneal_iter:
-                scheduler.step()
                 sampler.activate()
-                print(f"[iter {iteration}] LR annealed to {scheduler.get_last_lr()}")
+                print(f"[iter {iteration}] DRS activated")
 
             tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
 
@@ -295,7 +295,9 @@ def main():
             logits = model(tac, rgb, ft, grip, gf).squeeze(1)  # (B,)
             loss   = criterion(logits, label.float())
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
 
             if iteration % 10 == 0:
                 val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
@@ -316,6 +318,7 @@ def main():
                         'val/recall':     val_rec,
                         'val/f1':         val_f1,
                         'drs_active':     int(sampler.is_active),
+                        'lr':             scheduler.get_last_lr()[0],
                     }, step=iteration)
 
                 if sampler.is_active and val_f1 > best_val_f1:
