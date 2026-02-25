@@ -32,8 +32,8 @@ def parse_args():
     p.add_argument('--lr',          type=float, default=1e-3)
     p.add_argument('--epochs',      type=int,   default=20)
     p.add_argument('--num_workers', type=int,   default=4)
-    p.add_argument('--L',           type=int,   default=20,
-                   help='Max seconds per episode')
+    p.add_argument('--L',           type=int,   default=3,
+                   help='Seconds to keep before the shake stage (last L seconds; episodes shorter than L are dropped)')
     p.add_argument('--test_objects', nargs='+', default=['flashlight'])
     return p.parse_args()
 
