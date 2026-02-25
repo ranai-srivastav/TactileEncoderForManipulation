@@ -13,6 +13,7 @@ python train.py --split random --anneal_iter 300 --n_iters 600
 """
 
 import argparse
+import os
 
 import torch
 import torch.nn as nn
@@ -26,8 +27,7 @@ except ImportError:
 
 import dataloader as _dl
 from dataloader import (PoseItDataset, split_by_object, split_by_pose,
-                        uniform_random_split, collate_variable_length, F2,
-                        FT_DIM, GR_DIM)
+                        uniform_random_split, F2, FT_DIM, GR_DIM)
 from sampler import DRSSampler
 from model import GraspStabilityLSTM
 
@@ -117,6 +117,7 @@ def parse_args():
                    help='W&B entity/team. Default is "mrsd-smores". Set to None to disable W&B logging.')
     p.add_argument('--overfit', action='store_true',
                    help='Use a single sample for train/val/test to sanity-check the model.')
+    p.add_argument("--model_save_path", type=str, default="trained_models/best_model.pt")
     return p.parse_args()
 
 
@@ -139,7 +140,8 @@ def make_loader(subset, sampler=None, batch_size=32, num_workers=4, shuffle=Fals
 
 
 def batch_to_device(batch, device):
-    tac, rgb, ft, grip, gf, label, pose_label, lengths = batch
+    tac, rgb, ft, grip, gf, label, pose_label = batch
+    lengths = [tac.shape[1]] * tac.shape[0]  # uniform T since L is fixed
     return (
         tac.to(device),
         rgb.to(device),
@@ -265,9 +267,14 @@ def main():
             "sequence_length": args.L,
         })
     
+    # checkpoint paths
+    save_dir    = os.path.dirname(args.model_save_path) or '.'
+    latest_path = os.path.join(save_dir, 'model_latest.pt')
+    os.makedirs(save_dir, exist_ok=True)
+
     # training loop
-    best_val_acc = 0.0
-    iteration    = 0
+    best_val_f1 = 0.0
+    iteration   = 0
 
     while iteration < args.n_iters:
         model.train()
@@ -311,16 +318,27 @@ def main():
                         'drs_active':     int(sampler.is_active),
                     }, step=iteration)
 
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    torch.save(model.state_dict(), 'best_model.pt')
+                if sampler.is_active and val_f1 > best_val_f1:
+                    best_val_f1 = val_f1
+                    torch.save(model.state_dict(), args.model_save_path)
+
+                # Rolling latest checkpoint — delete previous, save current
+                if os.path.exists(latest_path):
+                    os.remove(latest_path)
+                torch.save(model.state_dict(), latest_path)
+
+                # Upload both checkpoints to W&B
+                if use_wandb:
+                    wandb.save(latest_path, base_path=save_dir)
+                    if os.path.exists(args.model_save_path):
+                        wandb.save(args.model_save_path, base_path=save_dir)
 
             model.train()   # restore training mode after evaluate()
             iteration += 1
 
     # test
     print("\nLoading best checkpoint for test evaluation...")
-    model.load_state_dict(torch.load('best_model.pt', map_location=device))
+    model.load_state_dict(torch.load(args.model_save_path, map_location=device))
     test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(
         model, test_loader, criterion, device)
     print(f"Test loss={test_loss:.4f}  acc={test_acc*100:.2f}%  "
