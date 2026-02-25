@@ -32,30 +32,35 @@ Folder format: `<object>_<timestamp>_F<force>_pose<idx>`
 
 **Purpose:** Loads the GelSight dataset, parses episode folders, builds per-sample tensors, and provides train/val/test split utilities.
 
-Each episode is sampled at a fixed rate (`F1 = 2` image frames/sec, `F2 = 2` sensor readings/sec) and clipped to `L` seconds. GelSight frames are baseline-subtracted (each frame minus the first frame at grasp time). Episodes with partially-filled temporal buckets are skipped with a `[WARN]` print.
+Each episode is sampled at a fixed rate and clipped to `L` seconds. GelSight frames are baseline-subtracted (each frame minus the first frame at grasp time). Episodes with partially-filled temporal buckets are skipped with a `[WARN]` print.
+
+Because `L` is always set, all sequences in a batch are the same length — no padding is needed and the default PyTorch collate is used everywhere. `collate_variable_length` is defined in this file for potential future use but is not passed to any DataLoader.
 
 **What you can change here:**
 | Constant | Default | Effect |
 |----------|---------|--------|
-| `F1` | `2` | Image frames sampled per second — higher = richer visual signal, much more GPU memory |
-| `F2` | `2` | Sensor readings sampled per second — affects `FT_DIM` and `GR_DIM` |
+| `F1` | `1` | Image frames sampled per second — higher = richer visual signal, much more GPU memory |
+| `F2` | `1` | Sensor readings sampled per second — affects `FT_DIM` and `GR_DIM` |
+| `L` | `20` | Max seconds per episode |
 | `phase` | `'grasp+pose'` | Which episode phases to include in a sample |
 
-> `L` (max seconds per episode) is set at runtime by `train.py` before the dataset is constructed — do not set it directly in this file.
+> These module-level defaults match the `train.py` CLI defaults. `train.py` sets `_dl.L`, `_dl.F1`, and `_dl.F2` before constructing the dataset, but since the defaults are identical, no override is needed unless you're changing them.
 
 ---
 
 ### `model.py` — `GraspStabilityLSTM`
 
-**Purpose:** Defines the multimodal fusion architecture. Two frozen ResNet50 backbones encode tactile and RGB frames independently per second. Their embeddings are concatenated with force-torque, gripper state, and gripper force, projected to `hidden_dim`, then processed by a 2-layer bidirectional LSTM. The last hidden state is classified by a small MLP.
+**Purpose:** Defines the multimodal fusion architecture. Two frozen ResNet50 backbones encode tactile and RGB frames independently per second. Their embeddings are concatenated with force-torque, gripper state, and gripper force, then passed through a two-stage projection (with LayerNorm) to `hidden_dim`, processed by a 2-layer bidirectional LSTM, and classified by a small MLP.
 
 ```
 tactile (B,T,F1,3,H,W) ──► ResNet50 ──► (B,T,F1×2048) ─┐
 rgb     (B,T,F1,3,H,W) ──► ResNet50 ──► (B,T,F1×2048) ─┤
-ft      (B,T,12)        ──────────────────────────────── ┤ concat → project → BiLSTM → FC → (B,1)
-gripper (B,T,4)         ──────────────────────────────── ┤
+ft      (B,T,6)         ──────────────────────────────── ┤ concat → project → BiLSTM → FC → (B,1)
+gripper (B,T,2)         ──────────────────────────────── ┤
 gf      (B,1)           ──────────────────────────────── ┘
 ```
+
+Projection is two-stage: `Linear(pre_lstm_dim → hidden_dim×2) → ReLU → LayerNorm → Dropout → Linear(hidden_dim×2 → hidden_dim) → ReLU → Dropout`. LayerNorm (not BatchNorm) is used so that normalization operates over the feature dimension for each `(batch, timestep)` position independently.
 
 **What you can change here:**
 | Parameter | Default | Effect |
@@ -118,6 +123,8 @@ DRS is **deferred**: it behaves as a standard random sampler until `activate()` 
 | `--num_workers` | `4` | DataLoader worker processes. Use `0` for debugging |
 | `--modalities` | `V T FT G GF` | Active input modalities. Any subset of: `V` (RGB), `T` (tactile), `FT` (force-torque), `G` (gripper), `GF` (gripper force) |
 | `--L` | `20` | Max seconds per episode. Longer episodes are clipped at this value |
+| `--F1` | `1` | Image frames sampled per second. Overrides `dataloader.F1` before dataset construction |
+| `--F2` | `1` | Sensor readings sampled per second. Overrides `dataloader.F2` before dataset construction |
 | `--subsample` | `1.0` | Fraction of dataset to load (e.g. `0.01` = 1%). Useful for quick tests |
 | `--wandb_project` | `TEMU` | W&B project name. Set to `None` to disable W&B logging |
 | `--wandb_run` | `None` | W&B run name (auto-generated if omitted) |
@@ -300,5 +307,5 @@ To run multiple agents in parallel across SLURM jobs, put `wandb agent ...` in y
 - **Slow convergence?** Try increasing `--lr` to `0.05` or switching `--anneal_iter` to `200` for an earlier LR drop.
 - **Overfitting on train?** Increase `--weight_decay` (try `0.05`) or `--dropout` (try `0.3`).
 - **Class imbalance?** Decrease `--anneal_iter` to activate DRS earlier, or increase `--sigma` toward `1.0`.
-- **OOM on GPU?** Reduce `--batch_size`, `--L`, or `--hidden_dim`. Setting `F1=1` in `dataloader.py` halves image memory.
+- **OOM on GPU?** Reduce `--batch_size`, `--L`, or `--hidden_dim`. `F1` is already `1` by default; increasing it multiplies image memory by `F1`.
 - **Debugging pipeline?** Use `--subsample 0.01 --num_workers 0 --n_iters 20` for fast iteration.

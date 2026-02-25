@@ -40,9 +40,9 @@ class GraspStabilityLSTM(nn.Module):
 
     def __init__(
         self,
-        frames_per_sec: int = 2,   # F1 — image frames sampled per second
-        ft_dim: int = 12,          # FT_DIM = F2 * 6
-        gripper_dim: int = 4,      # GR_DIM = F2 * 2
+        frames_per_sec: int = 1,   # F1 — image frames sampled per second
+        ft_dim: int = 6,           # FT_DIM = F2 * 6
+        gripper_dim: int = 2,      # GR_DIM = F2 * 2
         hidden_dim: int = 256,
         lstm_layers: int = 2,
         dropout: float = 0.1,
@@ -57,9 +57,9 @@ class GraspStabilityLSTM(nn.Module):
 
         # --- vision encoders (ResNet50, FC stripped → 2048-d) ---
         self.rgb_encoder        = resnet50(weights=ResNet50_Weights.DEFAULT)
-        self.rgb_encoder.fc     = nn.Identity()
+        self.rgb_encoder.fc     = nn.Identity()  # type: ignore[assignment]
         self.tactile_encoder    = resnet50(weights=ResNet50_Weights.DEFAULT)
-        self.tactile_encoder.fc = nn.Identity()
+        self.tactile_encoder.fc = nn.Identity()  # type: ignore[assignment]
 
         if freeze_resnet:
             for p in chain(self.rgb_encoder.parameters(),
@@ -70,7 +70,11 @@ class GraspStabilityLSTM(nn.Module):
         # concat: [tac_emb (F1*2048), rgb_emb (F1*2048), ft (FT_DIM), grip (GR_DIM), gf (1)]
         pre_lstm_dim = frames_per_sec * self.RESNET_EMB * 2 + ft_dim + gripper_dim + 1
         self.projection = nn.Sequential(
-            nn.Linear(pre_lstm_dim, hidden_dim),
+            nn.Linear(pre_lstm_dim, hidden_dim *2),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim *2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
@@ -131,6 +135,11 @@ class GraspStabilityLSTM(nn.Module):
         fused     = torch.cat([tac_emb, rgb_emb, ft, gripper, gf], dim=-1)  # (B, T, pre_lstm_dim)
         projected = self.projection(fused)                                    # (B, T, hidden_dim)
 
-        # --- LSTM over T seconds, classify from last hidden state ---
+        # --- LSTM over T seconds, classify from full BiLSTM context ---
         lstm_out, _ = self.lstm(projected)           # (B, T, hidden_dim*2)
-        return self.classifier(lstm_out[:, -1, :])   # (B, 1)
+        # Forward stream: full context lives at the LAST timestep (T-1)
+        # Backward stream: full context lives at the FIRST timestep (0)
+        h = self.lstm.hidden_size
+        last = torch.cat([lstm_out[:, -1, :h],       # forward  at T-1: seen 0→T-1
+                          lstm_out[:,  0, h:]], dim=-1)  # backward at  0: seen T-1→0
+        return self.classifier(last)                 # (B, 1)

@@ -46,11 +46,11 @@ from torchvision import transforms
 LABEL_MAP = {'pass': 0, 'slip': 1, 'drop': 1}
 IMAGE_SIZE = (224, 224)
 
-F1     = 1        # image frames sampled per second     @TODO Make 1
-F2     = 1        # sensor readings sampled per second  @TODO Make 1
-FT_DIM = F2 * 6  # flattened F/T dim per timestep
-GR_DIM = F2 * 2  # flattened gripper dim per timestep
-L      = None     # optional max-seconds cap (None = no limit) @TODO Make 8
+F1     = 1        # image frames sampled per second
+F2     = 1        # sensor readings sampled per second
+FT_DIM = F2 * 6  # flattened F/T dim per timestep  (= 6 when F2=1)
+GR_DIM = F2 * 2  # flattened gripper dim per timestep  (= 2 when F2=1)
+L      = 20       # max seconds per episode (train.py sets this before constructing the dataset)
 phase  = 'grasp+pose'  # window used: grasping → stability
 
 
@@ -211,7 +211,9 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
     # T consecutive seconds: [t_grasp, t_grasp+1, ..., t_stability-1]
     seconds = list(range(t_grasp, t_stability))
     if L is not None:
-        seconds = seconds[:L]
+        if len(seconds) < L:
+            return None          # too short — drop
+        seconds = seconds[-L:]   # keep last L seconds (closest to stability)
     if not seconds:
         return None
 
@@ -446,15 +448,16 @@ if __name__ == '__main__':
         print(f"pose_label   : {pose_label}")
         print(f"\nF1={F1}, F2={F2}  ->  FT_DIM={FT_DIM}, GR_DIM={GR_DIM}")
 
-        print("\n=== Batch with custom collate (padded) ===")
-        loader = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=collate_variable_length)
+        print("\n=== Default batch (uniform length, no collate needed) ===")
+        loader = DataLoader(ds, batch_size=4, shuffle=True)
         batch = next(iter(loader))
-        tac_b, rgb_b, ft_b, grip_b, gf_b, lbl_b, pl_b, lengths_b = batch
+        tac_b, rgb_b, ft_b, grip_b, gf_b, lbl_b, pl_b = batch
+        lengths_b = [tac_b.shape[1]] * tac_b.shape[0]
 
         print(f"tactile : {tac_b.shape}")
         print(f"rgb     : {rgb_b.shape}")
         print(f"ft      : {ft_b.shape}")
         print(f"gripper : {grip_b.shape}")
-        print(f"lengths : {lengths_b}")
-        print(f"\nmax_T in batch: {tac_b.shape[1]}")
-        print(f"actual sequence lengths: {lengths_b.tolist()}")
+        print(f"lengths : {lengths_b}  (uniform — derived from shape)")
+        print(f"\nT in batch: {tac_b.shape[1]}")
+        print(f"actual sequence lengths: {lengths_b}")
