@@ -82,8 +82,8 @@ See the [Training Reference](#training-reference) section below for all CLI argu
 **What you can change here:**
 - Optimizer: currently SGD with momentum=0.9. To use Adam, edit lines ~239–244.
 - Scheduler: currently `StepLR(step_size=1, gamma=0.1)` — a single ×0.1 LR drop at `anneal_iter`. Edit line 245 to use cosine annealing, etc.
-- Logging frequency: `iteration % 10` at line 272 — change `10` to log more or less often.
-- Checkpoint metric: currently saves best by `val_acc`. Edit line 293 to save by `val_f1` if class imbalance is a concern.
+- Logging frequency: `iteration % 10` — change `10` to log more or less often.
+- Checkpoints: every 10 iterations, `model_latest.pt` is saved (rolling — previous deleted) and both it and `best_model.pt` are uploaded to W&B. `best_model.pt` is only written when DRS is active and `val_f1` improves, so it is never a trivial all-negative solution.
 
 ---
 
@@ -130,6 +130,7 @@ DRS is **deferred**: it behaves as a standard random sampler until `activate()` 
 | `--wandb_run` | `None` | W&B run name (auto-generated if omitted) |
 | `--wandb_entity` | `mrsd-smores` | W&B team/entity |
 | `--overfit` | off | Flag: use a single sample for train/val/test to sanity-check the model |
+| `--model_save_path` | `trained_models/best_model.pt` | Path for the best-val-F1 checkpoint. A rolling `model_latest.pt` is also saved in the same directory every 10 iterations |
 
 ---
 
