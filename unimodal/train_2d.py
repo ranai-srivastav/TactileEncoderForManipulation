@@ -36,7 +36,7 @@ def parse_args():
     p.add_argument('--L',           type=int,   default=3,
                    help='Last L seconds')
     p.add_argument('--test_objects', nargs='+', default=['flashlight'])
-    p.add_argument('--checkpoint',  type=str,   default='trained_models/best_2d.pt',
+    p.add_argument('--checkpoint',  type=str,   default='unimodal/best_2d.pt',
                    help='Path to save/load model checkpoint')
     p.add_argument('--test',        action='store_true',
                    help='Load checkpoint and evaluate on test set only')

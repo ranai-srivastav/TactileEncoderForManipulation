@@ -1,19 +1,19 @@
 import torch
 import torch.nn as nn
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet50, ResNet50_Weights
 
 
 class GraspClassifier(nn.Module):
     """
-    ResNet-18 extracts per-frame features from RGB images,
+    ResNet-50 extracts per-frame features from RGB images,
     then mean-pool over valid timesteps (masking padding),
     then MLP classifies grasp outcome (pass vs fail).
     """
 
     def __init__(self, num_classes=2, freeze_backbone=True):
         super().__init__()
-        backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
-        self.feat_dim = backbone.fc.in_features  # 512
+        backbone = resnet50(weights=ResNet50_Weights.DEFAULT)
+        self.feat_dim = backbone.fc.in_features  # 2048
         backbone.fc = nn.Identity()
         self.backbone = backbone
 
