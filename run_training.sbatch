@@ -13,7 +13,6 @@ module load anaconda3
 conda activate /ocean/projects/cis260031p/shared/temu_conda
 
 cd /ocean/projects/cis260031p/srivastr/TactileEncoderForManipulation
-mkdir -p logs
 
 # ── training ──────────────────────────────────────────────────────────────────
 python train.py \
@@ -22,11 +21,13 @@ python train.py \
     --test_objects mug bowl flashlight \
     --sigma      1.0 \
     --batch_size 164 \
-    --lr         0.005 \
+    --lr         0.001 \
     --weight_decay 0.01 \
     --hidden_dim 256 \
     --n_iters    6000 \
     --anneal_iter 1000 \
     --modalities V T FT G GF \
+    --subsample 1.0 \
     --num_workers 4 \
+    --L 9 \
     --wandb_run  FirstFullRun_ranais
