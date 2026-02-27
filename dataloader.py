@@ -51,6 +51,7 @@ F1     = 1        # image frames sampled per second
 F2     = 1        # sensor readings sampled per second
 FT_DIM = F2 * 6  # flattened F/T dim per timestep  (= 6 when F2=1)
 GR_DIM = F2 * 2  # flattened gripper dim per timestep  (= 2 when F2=1)
+RB_DIM = None    # flattened robot-state dim per timestep (= F2 * robot_csv_feature_dim)
 L      = 20       # max seconds per episode (train.py sets this before constructing the dataset)
 phase  = 'grasp+pose'  # window used: grasping → stability
 
@@ -226,6 +227,10 @@ def _build_sample(sample_dir: Path,
 
     ft_ts, ft_val = _read_csv_timeseries(sample_dir / 'f_t.csv',     time_col=0)
     gr_ts, gr_val = _read_csv_timeseries(sample_dir / 'gripper.csv', time_col=0)
+    rb_ts, rb_val = _read_csv_timeseries(sample_dir / 'robot.csv',   time_col=0)
+    robot_dim = rb_val.shape[1] if rb_val.ndim == 2 else 0
+    if robot_dim == 0:
+        return None
 
     gel_by_sec = {}
     if load_tactile:
@@ -245,6 +250,7 @@ def _build_sample(sample_dir: Path,
 
     ft_seq      = []
     gr_seq      = []
+    rb_seq      = []
     tactile_seq = []
     rgb_seq     = []
 
@@ -268,6 +274,16 @@ def _build_sample(sample_dir: Path,
                   f"in second {sec}, need F2={F2}. Skipping sample.")
             return None
         gr_seq.append(gr_row)
+
+        # Robot joint state
+        rb_mask   = rb_ts == sec
+        rb_bucket = rb_val[rb_mask]
+        rb_row    = _sample_bucket(rb_bucket, n_cols=robot_dim, f=F2)
+        if rb_row is None:
+            print(f"[WARN] {sample_dir.name}: only {len(rb_bucket)} robot rows "
+                  f"in second {sec}, need F2={F2}. Skipping sample.")
+            return None
+        rb_seq.append(rb_row)
 
         if load_tactile:
             # GelSight: F1 frames from this second, subtract baseline
@@ -296,6 +312,7 @@ def _build_sample(sample_dir: Path,
                           else _empty_image_sequence(len(seconds))),             # (T, F1|0, 3, H, W)
         'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),    # (T, F2*6)
         'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),    # (T, F2*2)
+        'robot':         torch.tensor(np.stack(rb_seq), dtype=torch.float32),    # (T, F2*robot_dim)
         'gripper_force': torch.tensor([meta['force']], dtype=torch.float32),     # (1,)
         'label':         torch.tensor(LABEL_MAP[shake_str],            dtype=torch.long),
         'pose_label':    torch.tensor(LABEL_MAP[pose_str],             dtype=torch.long),
@@ -369,6 +386,7 @@ class PoseItDataset(Dataset):
             s['rgb'],            # (T, F1, 3, H, W)
             s['ft'],             # (T, F2*6)
             s['gripper'],        # (T, F2*2)
+            s['robot'],          # (T, F2*robot_dim)
             s['gripper_force'],  # (1,)
             s['label'],          # scalar
             s['pose_label'],     # scalar
@@ -419,10 +437,10 @@ def collate_variable_length(batch):
     Input: list of tuples from PoseItDataset.__getitem__
     Output: padded batch + sequence lengths
     """
-    tactile_list, rgb_list, ft_list, gripper_list = [], [], [], []
+    tactile_list, rgb_list, ft_list, gripper_list, robot_list = [], [], [], [], []
     gf_list, label_list, pose_label_list, lengths = [], [], [], []
 
-    for tac, rgb, ft, grip, gf, label, pose_label in batch:
+    for tac, rgb, ft, grip, robot, gf, label, pose_label in batch:
         T = tac.shape[0]
         lengths.append(T)
 
@@ -430,6 +448,7 @@ def collate_variable_length(batch):
         rgb_list.append(rgb)
         ft_list.append(ft)
         gripper_list.append(grip)
+        robot_list.append(robot)
         gf_list.append(gf)
         label_list.append(label)
         pose_label_list.append(pose_label)
@@ -451,6 +470,7 @@ def collate_variable_length(batch):
     rgb_batch     = pad_to_max(rgb_list, max_T)
     ft_batch      = pad_to_max(ft_list, max_T)
     gripper_batch = pad_to_max(gripper_list, max_T)
+    robot_batch   = pad_to_max(robot_list, max_T)
 
     gf_batch    = torch.stack(gf_list)
     labels      = torch.stack(label_list)
@@ -458,7 +478,7 @@ def collate_variable_length(batch):
     lengths     = torch.tensor(lengths, dtype=torch.long)
 
     return (
-        tactile_batch, rgb_batch, ft_batch, gripper_batch,
+        tactile_batch, rgb_batch, ft_batch, gripper_batch, robot_batch,
         gf_batch, labels, pose_labels, lengths
     )
 
@@ -471,11 +491,12 @@ if __name__ == '__main__':
     if len(ds) == 0:
         print("No samples found — check your root_dir path.")
     else:
-        tac, rgb, ft, grip, gf, label, pose_label = ds[0]
+        tac, rgb, ft, grip, robot, gf, label, pose_label = ds[0]
         print(f"tactile      : {tac.shape}")   # (T, F1, 3, 224, 224)
         print(f"rgb          : {rgb.shape}")   # (T, F1, 3, 224, 224)
         print(f"ft           : {ft.shape}")    # (T, F2*6)
         print(f"gripper      : {grip.shape}")  # (T, F2*2)
+        print(f"robot        : {robot.shape}") # (T, F2*robot_dim)
         print(f"gripper_force: {gf.shape}")    # (1,)
         print(f"label        : {label}")
         print(f"pose_label   : {pose_label}")
@@ -484,13 +505,14 @@ if __name__ == '__main__':
         print("\n=== Default batch (uniform length, no collate needed) ===")
         loader = DataLoader(ds, batch_size=4, shuffle=True)
         batch = next(iter(loader))
-        tac_b, rgb_b, ft_b, grip_b, gf_b, lbl_b, pl_b = batch
+        tac_b, rgb_b, ft_b, grip_b, robot_b, gf_b, lbl_b, pl_b = batch
         lengths_b = [tac_b.shape[1]] * tac_b.shape[0]
 
         print(f"tactile : {tac_b.shape}")
         print(f"rgb     : {rgb_b.shape}")
         print(f"ft      : {ft_b.shape}")
         print(f"gripper : {grip_b.shape}")
+        print(f"robot   : {robot_b.shape}")
         print(f"lengths : {lengths_b}  (uniform — derived from shape)")
         print(f"\nT in batch: {tac_b.shape[1]}")
         print(f"actual sequence lengths: {lengths_b}")

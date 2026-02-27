@@ -29,7 +29,7 @@ import dataloader as _dl
 from dataloader import (PoseItDataset, split_by_object, split_by_pose,
                         uniform_random_split)
 from sampler import DRSSampler
-from model import ForceTorqueOnlyLSTM, GraspStabilityLSTM
+from model import ForceTorqueOnlyLSTM, GraspStabilityLSTM, RobotStateOnlyLSTM
 
 
 def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
@@ -99,7 +99,7 @@ def parse_args():
     p.add_argument('--dropout',      type=float, default=0.1)
     p.add_argument('--hidden_dim',   type=int,   default=256)
     p.add_argument('--arch',         default='multimodal_lstm',
-                   choices=['multimodal_lstm', 'ft_lstm'])
+                   choices=['multimodal_lstm', 'ft_lstm', 'robot_lstm'])
     p.add_argument('--n_iters',      type=int,   default=600)
     p.add_argument('--anneal_iter',  type=int,   default=300)
     p.add_argument('--F1',          type=int,   default=1)
@@ -142,13 +142,14 @@ def make_loader(subset, sampler=None, batch_size=32, num_workers=4, shuffle=Fals
 
 
 def batch_to_device(batch, device):
-    tac, rgb, ft, grip, gf, label, pose_label = batch
+    tac, rgb, ft, grip, robot, gf, label, pose_label = batch
     lengths = [tac.shape[1]] * tac.shape[0]  # uniform T since L is fixed
     return (
         tac.to(device),
         rgb.to(device),
         ft.to(device),
         grip.to(device),
+        robot.to(device),
         gf.to(device),
         label.to(device),
         pose_label.to(device),
@@ -162,8 +163,8 @@ def evaluate(model, loader, criterion, device):
     total_loss = 0.0
     tp, fp, fn, n = 0, 0, 0, 0
     for batch in loader:
-        tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
-        logits = model(tac, rgb, ft, grip, gf).squeeze(1)   # (B,)
+        tac, rgb, ft, grip, robot, gf, label, _, lengths = batch_to_device(batch, device)
+        logits = model(tac, rgb, ft, grip, gf, robot=robot).squeeze(1)   # (B,)
         total_loss += criterion(logits, label.float()).item() * len(label)
         preds  = logits > 0
         actual = label.bool()
@@ -204,7 +205,7 @@ def main():
     _dl.F2 = args.F2
 
     # dataset
-    load_images = args.arch != 'ft_lstm'
+    load_images = args.arch not in ('ft_lstm', 'robot_lstm')
     print(f"Image loading: {'enabled' if load_images else 'disabled'} for arch={args.arch}")
     ds = PoseItDataset(
         root_dir=args.root_dir,
@@ -241,11 +242,18 @@ def main():
 
     ft_dim = args.F2 * 6
     gripper_dim = args.F2 * 2
+    robot_dim = ds.samples[0]['robot'].shape[-1] if ds.samples else 0
 
     # Model
     if args.arch == 'ft_lstm':
         model = ForceTorqueOnlyLSTM(
             ft_dim=ft_dim,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+        ).to(device)
+    elif args.arch == 'robot_lstm':
+        model = RobotStateOnlyLSTM(
+            robot_dim=robot_dim,
             hidden_dim=args.hidden_dim,
             dropout=args.dropout,
         ).to(device)
@@ -279,6 +287,7 @@ def main():
             "frames_per_sec": args.F2,
             "ft_dim": ft_dim,
             "gripper_dim": gripper_dim,
+            "robot_dim": robot_dim,
             "modalities": args.modalities,
             "sigma": args.sigma,
             "batch_size": args.batch_size,
@@ -308,10 +317,10 @@ def main():
                 sampler.activate()
                 print(f"[iter {iteration}] DRS activated")
 
-            tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
+            tac, rgb, ft, grip, robot, gf, label, _, lengths = batch_to_device(batch, device)
 
             optimizer.zero_grad()
-            logits = model(tac, rgb, ft, grip, gf).squeeze(1)  # (B,)
+            logits = model(tac, rgb, ft, grip, gf, robot=robot).squeeze(1)  # (B,)
             loss   = criterion(logits, label.float())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

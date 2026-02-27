@@ -46,10 +46,58 @@ class ForceTorqueOnlyLSTM(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def forward(self, tactile, rgb, ft, gripper, gripper_force):
-        del tactile, rgb, gripper, gripper_force
+    def forward(self, tactile, rgb, ft, gripper, gripper_force, robot=None):
+        del tactile, rgb, gripper, gripper_force, robot
 
         encoded = self.encoder(ft)
+        lstm_out, _ = self.lstm(encoded)
+        h = self.lstm.hidden_size
+        summary = torch.cat([lstm_out[:, -1, :h], lstm_out[:, 0, h:]], dim=-1)
+        return self.classifier(summary)
+
+
+class RobotStateOnlyLSTM(nn.Module):
+    """Robot joint-state unimodal baseline with the multimodal forward signature."""
+
+    def __init__(
+        self,
+        robot_dim: int,
+        hidden_dim: int = 256,
+        lstm_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.robot_dim = robot_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(robot_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, tactile, rgb, ft, gripper, gripper_force, robot=None):
+        del tactile, rgb, ft, gripper, gripper_force
+        if robot is None:
+            raise ValueError("RobotStateOnlyLSTM requires a robot tensor")
+
+        encoded = self.encoder(robot)
         lstm_out, _ = self.lstm(encoded)
         h = self.lstm.hidden_size
         summary = torch.cat([lstm_out[:, -1, :h], lstm_out[:, 0, h:]], dim=-1)
@@ -150,7 +198,7 @@ class GraspStabilityLSTM(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def forward(self, tactile, rgb, ft, gripper, gripper_force):
+    def forward(self, tactile, rgb, ft, gripper, gripper_force, robot=None):
         """
         Args:
             tactile:       (B, T, F1, 3, H, W)
@@ -158,10 +206,12 @@ class GraspStabilityLSTM(nn.Module):
             ft:            (B, T, FT_DIM)
             gripper:       (B, T, GR_DIM)
             gripper_force: (B, 1)
+            robot:         ignored; accepted for training-loop compatibility
 
         Returns:
             (B, 1) raw logits.
         """
+        del robot
         # --- modality masking (zero-out disabled inputs) ---
         if 'T'  not in self.modalities: tactile       = tactile       * 0.0
         if 'V'  not in self.modalities: rgb           = rgb           * 0.0
