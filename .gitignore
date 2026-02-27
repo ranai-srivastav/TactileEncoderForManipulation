@@ -7,3 +7,5 @@ __pycache__/
 .venv-cu/
 .venv-uv-cu124/
 trained_models/
+.monitor_state/
+runs/
