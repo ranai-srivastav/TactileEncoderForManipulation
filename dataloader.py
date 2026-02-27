@@ -32,6 +32,7 @@ GelSight frame captured at t_grasp (the start of the grasping phase).
 
 import re
 import csv
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -303,16 +304,20 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
 class PoseItDataset(Dataset):
     def __init__(self,
                  root_dir: Optional[str] = None,
-                 sample_dirs: Optional[List[str]] = None):
+                 sample_dirs: Optional[List[str]] = None,
+                 show_progress: bool = True,
+                 progress_every: int = 100):
         assert root_dir or sample_dirs, "Provide root_dir or sample_dirs"
         dirs = [Path(d) for d in sample_dirs] if sample_dirs \
                else sorted(Path(root_dir).iterdir())
+        dirs = [d for d in dirs if d.is_dir()]
 
         self.samples = []
         skipped = 0
-        for d in dirs:
-            if not d.is_dir():
-                continue
+        total = len(dirs)
+        t0 = time.time()
+
+        for i, d in enumerate(dirs, start=1):
             try:
                 s = _build_sample(d)
                 if s is not None:
@@ -323,8 +328,22 @@ class PoseItDataset(Dataset):
                 print(f"[WARN] Skipping {d.name}: {e}")
                 skipped += 1
 
+            if show_progress and (i % progress_every == 0 or i == total):
+                elapsed = time.time() - t0
+                rate = i / elapsed if elapsed > 0 else 0.0
+                remaining = max(total - i, 0)
+                eta = remaining / rate if rate > 0 else float('inf')
+                eta_str = f"{eta:.1f}s" if np.isfinite(eta) else "inf"
+                print(
+                    f"[PoseItDataset] {i}/{total} ({(100.0 * i / max(total, 1)):.1f}%)  "
+                    f"loaded={len(self.samples)} skipped={skipped}  "
+                    f"elapsed={elapsed:.1f}s eta={eta_str}"
+                )
+
+        elapsed = time.time() - t0
         print(f"Loaded {len(self.samples)} samples ({skipped} skipped)  "
-              f"[L={L}, F1={F1}, F2={F2}, phase='{phase}']")
+              f"[L={L}, F1={F1}, F2={F2}, phase='{phase}']  "
+              f"in {elapsed:.1f}s")
 
     def __len__(self) -> int:
         return len(self.samples)
