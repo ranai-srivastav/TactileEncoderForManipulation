@@ -204,7 +204,13 @@ def main():
     _dl.F2 = args.F2
 
     # dataset
-    ds = PoseItDataset(root_dir=args.root_dir)
+    load_images = args.arch != 'ft_lstm'
+    print(f"Image loading: {'enabled' if load_images else 'disabled'} for arch={args.arch}")
+    ds = PoseItDataset(
+        root_dir=args.root_dir,
+        load_tactile=load_images,
+        load_rgb=load_images,
+    )
     if args.subsample < 1.0:
         import random
         k = max(4, int(len(ds.samples) * args.subsample))

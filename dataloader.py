@@ -191,7 +191,13 @@ def _load_image(path: Optional[Path]) -> torch.Tensor:
     return IMG_TRANSFORM(Image.open(path).convert('RGB'))
 
 
-def _build_sample(sample_dir: Path) -> Optional[dict]:
+def _empty_image_sequence(num_seconds: int) -> torch.Tensor:
+    return torch.empty((num_seconds, 0, 3, *IMAGE_SIZE), dtype=torch.float32)
+
+
+def _build_sample(sample_dir: Path,
+                  load_tactile: bool = True,
+                  load_rgb: bool = True) -> Optional[dict]:
     meta   = _parse_folder_name(sample_dir.name)
     stages = _read_stages(sample_dir / 'stages.csv')
     labels = _read_labels(sample_dir / 'label.csv')
@@ -221,21 +227,21 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
     ft_ts, ft_val = _read_csv_timeseries(sample_dir / 'f_t.csv',     time_col=0)
     gr_ts, gr_val = _read_csv_timeseries(sample_dir / 'gripper.csv', time_col=0)
 
-    gel_files = _list_image_files(sample_dir / 'gelsight')
-    rgb_files = _list_image_files(sample_dir / 'rgb')
-
-    # Group image paths by integer second
     gel_by_sec = {}
-    for ts, _, p in gel_files:
-        gel_by_sec.setdefault(ts, []).append(p)
+    if load_tactile:
+        gel_files = _list_image_files(sample_dir / 'gelsight')
+        for ts, _, p in gel_files:
+            gel_by_sec.setdefault(ts, []).append(p)
+
+        # GelSight baseline: first frame of the first second
+        baseline_paths = gel_by_sec.get(t_grasp, [])
+        baseline = _load_image(baseline_paths[0] if baseline_paths else None)
 
     rgb_by_sec = {}
-    for ts, _, p in rgb_files:
-        rgb_by_sec.setdefault(ts, []).append(p)
-
-    # GelSight baseline: first frame of the first second
-    baseline_paths = gel_by_sec.get(t_grasp, [])
-    baseline = _load_image(baseline_paths[0] if baseline_paths else None)
+    if load_rgb:
+        rgb_files = _list_image_files(sample_dir / 'rgb')
+        for ts, _, p in rgb_files:
+            rgb_by_sec.setdefault(ts, []).append(p)
 
     ft_seq      = []
     gr_seq      = []
@@ -263,27 +269,31 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
             return None
         gr_seq.append(gr_row)
 
-        # GelSight: F1 frames from this second, subtract baseline
-        gel_paths = _sample_image_bucket(gel_by_sec.get(sec, []), f=F1)
-        if gel_paths is None:
-            print(f"[WARN] {sample_dir.name}: only {len(gel_by_sec.get(sec, []))} GelSight frames "
-                  f"in second {sec}, need F1={F1}. Skipping sample.")
-            return None
-        gel_frames = torch.stack([_load_image(p) - baseline for p in gel_paths])
-        tactile_seq.append(gel_frames)                          # (F1, 3, H, W)
+        if load_tactile:
+            # GelSight: F1 frames from this second, subtract baseline
+            gel_paths = _sample_image_bucket(gel_by_sec.get(sec, []), f=F1)
+            if gel_paths is None:
+                print(f"[WARN] {sample_dir.name}: only {len(gel_by_sec.get(sec, []))} GelSight frames "
+                      f"in second {sec}, need F1={F1}. Skipping sample.")
+                return None
+            gel_frames = torch.stack([_load_image(p) - baseline for p in gel_paths])
+            tactile_seq.append(gel_frames)                      # (F1, 3, H, W)
 
-        # RGB: F1 frames from this second
-        rgb_paths = _sample_image_bucket(rgb_by_sec.get(sec, []), f=F1)
-        if rgb_paths is None:
-            print(f"[WARN] {sample_dir.name}: only {len(rgb_by_sec.get(sec, []))} RGB frames "
-                  f"in second {sec}, need F1={F1}. Skipping sample.")
-            return None
-        rgb_frames = torch.stack([_load_image(p) for p in rgb_paths])
-        rgb_seq.append(rgb_frames)                              # (F1, 3, H, W)
+        if load_rgb:
+            # RGB: F1 frames from this second
+            rgb_paths = _sample_image_bucket(rgb_by_sec.get(sec, []), f=F1)
+            if rgb_paths is None:
+                print(f"[WARN] {sample_dir.name}: only {len(rgb_by_sec.get(sec, []))} RGB frames "
+                      f"in second {sec}, need F1={F1}. Skipping sample.")
+                return None
+            rgb_frames = torch.stack([_load_image(p) for p in rgb_paths])
+            rgb_seq.append(rgb_frames)                          # (F1, 3, H, W)
 
     return {
-        'tactile':       torch.stack(tactile_seq),                               # (T, F1, 3, H, W)
-        'rgb':           torch.stack(rgb_seq),                                   # (T, F1, 3, H, W)
+        'tactile':       (torch.stack(tactile_seq) if load_tactile
+                          else _empty_image_sequence(len(seconds))),             # (T, F1|0, 3, H, W)
+        'rgb':           (torch.stack(rgb_seq) if load_rgb
+                          else _empty_image_sequence(len(seconds))),             # (T, F1|0, 3, H, W)
         'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),    # (T, F2*6)
         'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),    # (T, F2*2)
         'gripper_force': torch.tensor([meta['force']], dtype=torch.float32),     # (1,)
@@ -305,6 +315,8 @@ class PoseItDataset(Dataset):
     def __init__(self,
                  root_dir: Optional[str] = None,
                  sample_dirs: Optional[List[str]] = None,
+                 load_tactile: bool = True,
+                 load_rgb: bool = True,
                  show_progress: bool = True,
                  progress_every: int = 100):
         assert root_dir or sample_dirs, "Provide root_dir or sample_dirs"
@@ -312,6 +324,8 @@ class PoseItDataset(Dataset):
                else sorted(Path(root_dir).iterdir())
         dirs = [d for d in dirs if d.is_dir()]
 
+        self.load_tactile = load_tactile
+        self.load_rgb = load_rgb
         self.samples = []
         skipped = 0
         total = len(dirs)
@@ -319,7 +333,7 @@ class PoseItDataset(Dataset):
 
         for i, d in enumerate(dirs, start=1):
             try:
-                s = _build_sample(d)
+                s = _build_sample(d, load_tactile=load_tactile, load_rgb=load_rgb)
                 if s is not None:
                     self.samples.append(s)
                 else:
