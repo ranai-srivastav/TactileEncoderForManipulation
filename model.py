@@ -2,7 +2,58 @@ from itertools import chain
 
 import torch
 import torch.nn as nn
-from torchvision.models import resnet50, ResNet50_Weights
+
+try:
+    from torchvision.models import resnet50, ResNet50_Weights
+except ImportError:
+    resnet50 = None
+    ResNet50_Weights = None
+
+
+class ForceTorqueOnlyLSTM(nn.Module):
+    """Force-torque unimodal baseline with the multimodal forward signature."""
+
+    def __init__(
+        self,
+        ft_dim: int = 6,
+        hidden_dim: int = 256,
+        lstm_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.ft_dim = ft_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(ft_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, tactile, rgb, ft, gripper, gripper_force):
+        del tactile, rgb, gripper, gripper_force
+
+        encoded = self.encoder(ft)
+        lstm_out, _ = self.lstm(encoded)
+        h = self.lstm.hidden_size
+        summary = torch.cat([lstm_out[:, -1, :h], lstm_out[:, 0, h:]], dim=-1)
+        return self.classifier(summary)
 
 
 class GraspStabilityLSTM(nn.Module):
@@ -50,6 +101,8 @@ class GraspStabilityLSTM(nn.Module):
         modalities=None,           # collection of {'V','T','FT','G','GF'}; None = all
     ):
         super().__init__()
+        if resnet50 is None or ResNet50_Weights is None:
+            raise ImportError("torchvision is required for GraspStabilityLSTM")
         self.frames_per_sec = frames_per_sec
         self.ft_dim         = ft_dim
         self.gripper_dim    = gripper_dim

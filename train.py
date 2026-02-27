@@ -27,9 +27,9 @@ except ImportError:
 
 import dataloader as _dl
 from dataloader import (PoseItDataset, split_by_object, split_by_pose,
-                        uniform_random_split, F2, FT_DIM, GR_DIM)
+                        uniform_random_split)
 from sampler import DRSSampler
-from model import GraspStabilityLSTM
+from model import ForceTorqueOnlyLSTM, GraspStabilityLSTM
 
 
 def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
@@ -98,6 +98,8 @@ def parse_args():
     p.add_argument('--weight_decay', type=float, default=0.01)
     p.add_argument('--dropout',      type=float, default=0.1)
     p.add_argument('--hidden_dim',   type=int,   default=256)
+    p.add_argument('--arch',         default='multimodal_lstm',
+                   choices=['multimodal_lstm', 'ft_lstm'])
     p.add_argument('--n_iters',      type=int,   default=600)
     p.add_argument('--anneal_iter',  type=int,   default=300)
     p.add_argument('--F1',          type=int,   default=1)
@@ -231,15 +233,25 @@ def main():
     val_loader   = make_loader(val_set,   batch_size=args.batch_size, num_workers=args.num_workers)
     test_loader  = make_loader(test_set,  batch_size=args.batch_size, num_workers=args.num_workers)
 
+    ft_dim = args.F2 * 6
+    gripper_dim = args.F2 * 2
+
     # Model
-    model = GraspStabilityLSTM(
-        frames_per_sec=F2,
-        ft_dim=FT_DIM,
-        gripper_dim=GR_DIM,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-        modalities=args.modalities,
-    ).to(device)
+    if args.arch == 'ft_lstm':
+        model = ForceTorqueOnlyLSTM(
+            ft_dim=ft_dim,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+        ).to(device)
+    else:
+        model = GraspStabilityLSTM(
+            frames_per_sec=args.F2,
+            ft_dim=ft_dim,
+            gripper_dim=gripper_dim,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+            modalities=args.modalities,
+        ).to(device)
 
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(
@@ -257,9 +269,10 @@ def main():
             "weight_decay": args.weight_decay,
             "dropout": args.dropout,
             "hidden_dim": args.hidden_dim,
-            "frames_per_sec": F2,
-            "ft_dim": FT_DIM,
-            "gripper_dim": GR_DIM,
+            "arch": args.arch,
+            "frames_per_sec": args.F2,
+            "ft_dim": ft_dim,
+            "gripper_dim": gripper_dim,
             "modalities": args.modalities,
             "sigma": args.sigma,
             "batch_size": args.batch_size,

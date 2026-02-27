@@ -216,6 +216,18 @@ python train.py \
     --wandb_run pose-split-full-fusion
 ```
 
+### 8. Force-torque unimodal baseline
+Runs the dedicated FT-only BiLSTM baseline with the same training pipeline but ignores visual and gripper inputs inside the model.
+```bash
+python train.py \
+    --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
+    --arch ft_lstm \
+    --split random \
+    --sigma 1.0 \
+    --anneal_iter 300 --n_iters 600 \
+    --wandb_run baseline-ft-lstm
+```
+
 ---
 
 ## Modality Ablations

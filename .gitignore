@@ -4,3 +4,5 @@ dataset
 .zed
 wandb/
 __pycache__/
+.venv-cu/
+trained_models/
