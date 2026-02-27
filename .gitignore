@@ -5,4 +5,5 @@ dataset
 wandb/
 __pycache__/
 .venv-cu/
+.venv-uv-cu124/
 trained_models/
