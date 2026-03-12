@@ -4,3 +4,4 @@ dataset
 .zed
 wandb/
 __pycache__/
+*.pt
