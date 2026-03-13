@@ -92,12 +92,17 @@ def parse_args():
     p.add_argument('--split',        default='object', choices=['object', 'pose', 'random'])
     p.add_argument('--test_objects', nargs='+', default=['mug', 'bowl'])
     p.add_argument('--test_poses',   nargs='+', type=int, default=[1, 2, 3, 4, 5])
-    p.add_argument('--sigma',        type=float, default=1.0)   # 0.5 for T; 1.0 for V or V+T
+    p.add_argument('--sigma',        type=float, default=0.5,
+                   help='DRS target S≠/S= ratio. 0.5 = gentler resampling')
+    p.add_argument('--drs_iter',     type=int,   default=400,
+                   help='Iteration at which DRS activates (separate from LR anneal)')
     p.add_argument('--batch_size',   type=int,   default=32)
     p.add_argument('--lr',           type=float, default=0.01)
     p.add_argument('--weight_decay', type=float, default=0.01)
     p.add_argument('--dropout',      type=float, default=0.1)
     p.add_argument('--hidden_dim',   type=int,   default=256)
+    p.add_argument('--lstm_layers',  type=int,   default=2,
+                   help='Number of LSTM layers (default: 2)')
     p.add_argument('--n_iters',      type=int,   default=600)
     p.add_argument('--anneal_iter',  type=int,   default=300)
     p.add_argument('--F1',          type=int,   default=1)
@@ -115,6 +120,8 @@ def parse_args():
                    help='W&B run name (optional).')
     p.add_argument('--wandb_entity',  type=str, default="mrsd-smores",
                    help='W&B entity/team. Default is "mrsd-smores". Set to None to disable W&B logging.')
+    p.add_argument('--unidirectional', action='store_true',
+                   help='Use unidirectional LSTM (default: bidirectional)')
     p.add_argument('--overfit', action='store_true',
                    help='Use a single sample for train/val/test to sanity-check the model.')
     p.add_argument("--model_save_path", type=str, default="trained_models/best_model.pt")
@@ -193,6 +200,12 @@ def main():
             entity=args.wandb_entity,
             config=vars(args),
         )
+        # Use "iter" as x-axis for all training/val metrics so plots align properly
+        wandb.define_metric("iter")
+        wandb.define_metric("train/*", step_metric="iter")
+        wandb.define_metric("val/*", step_metric="iter")
+        wandb.define_metric("lr", step_metric="iter")
+        wandb.define_metric("drs_active", step_metric="iter")
     elif args.wandb_project is not None:
         print("[WARN] wandb not installed — W&B logging disabled.")
 
@@ -212,7 +225,8 @@ def main():
         ds.samples = ds.samples[:1]
         overfit_set = Subset(ds, [0])
         train_set = val_set = test_set = overfit_set
-        args.anneal_iter = args.n_iters + 1   # disable DRS (S≠ may be empty with 1 sample)
+        args.anneal_iter = args.n_iters + 1   # disable LR anneal
+        args.drs_iter = args.n_iters + 1      # disable DRS (S≠ may be empty with 1 sample)
         print("Overfit mode: using 1 sample for train/val/test, DRS disabled")
     else:
         train_set, val_set, test_set = make_split(ds, args)
@@ -231,43 +245,34 @@ def main():
     val_loader   = make_loader(val_set,   batch_size=args.batch_size, num_workers=args.num_workers)
     test_loader  = make_loader(test_set,  batch_size=args.batch_size, num_workers=args.num_workers)
 
+    # pos_weight: upweight minority (unstable) to avoid predicting only majority class
+    train_labels = [ds.samples[i]['label'].item() for i in train_set.indices]
+    n_pos = sum(train_labels)
+    n_neg = len(train_labels) - n_pos
+    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(device)
+    print(f"pos_weight={pos_weight.item():.3f} (n_pos={n_pos}, n_neg={n_neg})")
+
     # Model
     model = GraspStabilityLSTM(
         frames_per_sec=F2,
         ft_dim=FT_DIM,
         gripper_dim=GR_DIM,
         hidden_dim=args.hidden_dim,
+        lstm_layers=args.lstm_layers,
+        bidirectional=not args.unidirectional,
         dropout=args.dropout,
         modalities=args.modalities,
     ).to(device)
 
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.SGD(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
+        momentum=0.9,
         weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.n_iters, eta_min=1e-6
-    )
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.1)
 
-    if use_wandb:
-        wandb.log({
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "dropout": args.dropout,
-            "hidden_dim": args.hidden_dim,
-            "frames_per_sec": F2,
-            "ft_dim": FT_DIM,
-            "gripper_dim": GR_DIM,
-            "modalities": args.modalities,
-            "sigma": args.sigma,
-            "batch_size": args.batch_size,
-            "n_iters": args.n_iters,
-            "anneal_iter": args.anneal_iter,
-            "sequence_length": args.L,
-        })
-    
     # checkpoint paths
     save_dir    = os.path.dirname(args.model_save_path) or '.'
     latest_path = os.path.join(save_dir, 'model_latest.pt')
@@ -284,8 +289,12 @@ def main():
             if iteration >= args.n_iters:
                 break
 
-            # Activate DRS at the right iteration (decoupled from LR schedule)
+            # LR anneal at anneal_iter (paper: 10x drop at iter 300)
             if iteration == args.anneal_iter:
+                scheduler.step()
+                print(f"[iter {iteration}] LR annealed to {scheduler.get_last_lr()}")
+            # DRS activates at drs_iter (decoupled; can be later to avoid overcorrection)
+            if iteration == args.drs_iter:
                 sampler.activate()
                 print(f"[iter {iteration}] DRS activated")
 
@@ -295,11 +304,9 @@ def main():
             logits = model(tac, rgb, ft, grip, gf).squeeze(1)  # (B,)
             loss   = criterion(logits, label.float())
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            scheduler.step()
 
-            if iteration % 10 == 0:
+            if iteration % 10 == 0 or iteration == args.n_iters - 1:
                 val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
                     model, val_loader, criterion, device)
                 print(f"[iter {iteration:4d}] "
@@ -321,7 +328,7 @@ def main():
                         'lr':             scheduler.get_last_lr()[0],
                     }, step=iteration)
 
-                if sampler.is_active and val_f1 > best_val_f1:
+                if val_f1 > best_val_f1:
                     best_val_f1 = val_f1
                     torch.save(model.state_dict(), args.model_save_path)
 
@@ -354,6 +361,10 @@ def main():
             'test/precision': test_prec,
             'test/recall':    test_rec,
             'test/f1':        test_f1,
+        }, step=args.n_iters - 1)
+        wandb.run.summary.update({
+            'test/loss': test_loss, 'test/acc': test_acc,
+            'test/precision': test_prec, 'test/recall': test_rec, 'test/f1': test_f1,
         })
         wandb.finish()
 

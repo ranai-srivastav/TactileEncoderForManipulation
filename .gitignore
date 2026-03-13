@@ -4,4 +4,8 @@ dataset
 .zed
 wandb/
 __pycache__/
+<<<<<<< HEAD
 *.pt
+=======
+*.pt
+>>>>>>> ranais/new_dataloader

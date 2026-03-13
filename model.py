@@ -45,6 +45,7 @@ class GraspStabilityLSTM(nn.Module):
         gripper_dim: int = 2,      # GR_DIM = F2 * 2
         hidden_dim: int = 256,
         lstm_layers: int = 2,
+        bidirectional: bool = True,
         dropout: float = 0.1,
         freeze_resnet: bool = True,
         modalities=None,           # collection of {'V','T','FT','G','GF'}; None = all
@@ -54,6 +55,7 @@ class GraspStabilityLSTM(nn.Module):
         self.ft_dim         = ft_dim
         self.gripper_dim    = gripper_dim
         self.modalities     = set(modalities or ['V', 'T', 'FT', 'G', 'GF'])
+        self.bidirectional  = bidirectional
 
         # --- vision encoders (ResNet50, FC stripped → 2048-d) ---
         self.rgb_encoder        = resnet50(weights=ResNet50_Weights.DEFAULT)
@@ -79,23 +81,30 @@ class GraspStabilityLSTM(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # --- 2-layer bidirectional LSTM ---
-        self.lstm = nn.LSTM(
+        # --- 2-layer LSTM/GRU (bidirectional or unidirectional) ---
+        self.lstm = nn.GRU(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=lstm_layers,
             batch_first=True,
-            bidirectional=True,
+            bidirectional=bidirectional,
             dropout=dropout if lstm_layers > 1 else 0.0,
         )
 
-        # --- classifier (hidden_dim * 2 because bidirectional) ---
+        # --- classifier (hidden_dim * 2 if bidirectional else hidden_dim) ---
+        classifier_in = hidden_dim * 2 if bidirectional else hidden_dim
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 64),
+            nn.Linear(classifier_in, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 1),
         )
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.rgb_encoder.eval()
+        self.tactile_encoder.eval()
+        return self
 
     def forward(self, tactile, rgb, ft, gripper, gripper_force):
         """
@@ -135,11 +144,12 @@ class GraspStabilityLSTM(nn.Module):
         fused     = torch.cat([tac_emb, rgb_emb, ft, gripper, gf], dim=-1)  # (B, T, pre_lstm_dim)
         projected = self.projection(fused)                                    # (B, T, hidden_dim)
 
-        # --- LSTM over T seconds, classify from full BiLSTM context ---
-        lstm_out, _ = self.lstm(projected)           # (B, T, hidden_dim*2)
-        # Forward stream: full context lives at the LAST timestep (T-1)
-        # Backward stream: full context lives at the FIRST timestep (0)
-        h = self.lstm.hidden_size
-        last = torch.cat([lstm_out[:, -1, :h],       # forward  at T-1: seen 0→T-1
-                          lstm_out[:,  0, h:]], dim=-1)  # backward at  0: seen T-1→0
-        return self.classifier(last)                 # (B, 1)
+        # --- LSTM over T seconds, classify from final hidden state ---
+        lstm_out, _ = self.lstm(projected)
+        if self.bidirectional:
+            # Forward at T-1: seen 0→T-1; Backward at 0: seen T-1→0
+            h = self.lstm.hidden_size
+            last = torch.cat([lstm_out[:, -1, :h], lstm_out[:, 0, h:]], dim=-1)
+        else:
+            last = lstm_out[:, -1, :]   # (B, hidden_dim)
+        return self.classifier(last)
