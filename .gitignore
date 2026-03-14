@@ -5,3 +5,4 @@ dataset
 wandb/
 __pycache__/
 *.pt
+.venv/
