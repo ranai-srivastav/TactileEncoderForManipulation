@@ -385,51 +385,63 @@ def _max_count_from_entries(entries: List[Tuple[int, int, Path]]) -> int:
     return _max_count_from_seconds(seconds)
 
 
-def _pad_tensor_by_second(values: torch.Tensor,
-                          second_timestamps: torch.Tensor,
-                          seconds: torch.Tensor,
+def _second_bucket_layout(second_timestamps: torch.Tensor,
+                          seconds: torch.Tensor) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
+    """Return per-second slice bounds for sorted second timestamps.
+
+    `second_timestamps` and `seconds` are assumed to be sorted in ascending
+    order. The returned `starts` / `ends` arrays index into the original item
+    tensors so all related fields can reuse the same layout work.
+    """
+    if len(seconds) == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty, torch.zeros(0, dtype=torch.long)
+
+    ts_np = second_timestamps.detach().cpu().numpy()
+    seconds_np = seconds.detach().cpu().numpy()
+    starts = np.searchsorted(ts_np, seconds_np, side='left')
+    ends = np.searchsorted(ts_np, seconds_np, side='right')
+    counts = torch.from_numpy((ends - starts).astype(np.int64))
+    return starts, ends, counts
+
+
+def _pad_tensor_by_layout(values: torch.Tensor,
+                          starts: np.ndarray,
+                          ends: np.ndarray,
                           pad_value: float = 0.0,
-                          max_count: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-    counts = torch.tensor(
-        [(second_timestamps == second).sum().item() for second in seconds],
-        dtype=torch.long,
-    )
-    target_max_count = int(counts.max().item()) if len(counts) > 0 else 0
+                          max_count: Optional[int] = None) -> torch.Tensor:
+    target_max_count = int((ends - starts).max()) if len(starts) > 0 else 0
     if max_count is not None:
         target_max_count = max(target_max_count, max_count)
-    shape = (len(seconds), target_max_count, *values.shape[1:])
+
+    shape = (len(starts), target_max_count, *values.shape[1:])
     padded = torch.full(shape, pad_value, dtype=values.dtype)
 
-    for i, second in enumerate(seconds.tolist()):
-        idx = torch.nonzero(second_timestamps == second, as_tuple=False).flatten()
-        if len(idx) == 0:
+    for i, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
+        if start == end:
             continue
-        padded[i, :len(idx)] = values[idx]
+        padded[i, :end - start] = values[start:end]
 
-    return padded, counts
+    return padded
 
 
-def _pad_scalar_metadata_by_second(values: torch.Tensor,
-                                   second_timestamps: torch.Tensor,
-                                   seconds: torch.Tensor,
-                                   pad_value,
-                                   max_count: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-    counts = torch.tensor(
-        [(second_timestamps == second).sum().item() for second in seconds],
-        dtype=torch.long,
-    )
-    target_max_count = int(counts.max().item()) if len(counts) > 0 else 0
+def _pad_scalar_by_layout(values: torch.Tensor,
+                          starts: np.ndarray,
+                          ends: np.ndarray,
+                          pad_value,
+                          max_count: Optional[int] = None) -> torch.Tensor:
+    target_max_count = int((ends - starts).max()) if len(starts) > 0 else 0
     if max_count is not None:
         target_max_count = max(target_max_count, max_count)
-    padded = torch.full((len(seconds), target_max_count), pad_value, dtype=values.dtype)
 
-    for i, second in enumerate(seconds.tolist()):
-        idx = torch.nonzero(second_timestamps == second, as_tuple=False).flatten()
-        if len(idx) == 0:
+    padded = torch.full((len(starts), target_max_count), pad_value, dtype=values.dtype)
+
+    for i, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
+        if start == end:
             continue
-        padded[i, :len(idx)] = values[idx]
+        padded[i, :end - start] = values[start:end]
 
-    return padded, counts
+    return padded
 
 
 def _bucket_image_entries(entries: List[Tuple[int, int, Path]],
@@ -444,29 +456,16 @@ def _bucket_image_entries(entries: List[Tuple[int, int, Path]],
         mode=mode,
         zero_channels=zero_channels,
     )
-    bucketed_frames, counts = _pad_tensor_by_second(
-        frames, second_timestamps, seconds, pad_value=0.0, max_count=max_count
+    starts, ends, counts = _second_bucket_layout(second_timestamps, seconds)
+    bucketed_frames = _pad_tensor_by_layout(frames, starts, ends, pad_value=0.0, max_count=max_count)
+    bucketed_timestamps = _pad_scalar_by_layout(
+        timestamps, starts, ends, pad_value=float('nan'), max_count=max_count
     )
-    bucketed_timestamps, _ = _pad_scalar_metadata_by_second(
-        timestamps,
-        second_timestamps,
-        seconds,
-        pad_value=float('nan'),
-        max_count=max_count,
+    bucketed_second_timestamps = _pad_scalar_by_layout(
+        second_timestamps, starts, ends, pad_value=-1, max_count=max_count
     )
-    bucketed_second_timestamps, _ = _pad_scalar_metadata_by_second(
-        second_timestamps,
-        second_timestamps,
-        seconds,
-        pad_value=-1,
-        max_count=max_count,
-    )
-    bucketed_frame_indices, _ = _pad_scalar_metadata_by_second(
-        frame_indices,
-        second_timestamps,
-        seconds,
-        pad_value=-1,
-        max_count=max_count,
+    bucketed_frame_indices = _pad_scalar_by_layout(
+        frame_indices, starts, ends, pad_value=-1, max_count=max_count
     )
     valid_mask = bucketed_second_timestamps >= 0
     return (
@@ -486,22 +485,15 @@ def _bucket_timeseries(values: np.ndarray,
     values_tensor = _timeseries_to_tensor(values)
     second_timestamps = torch.tensor(timestamps, dtype=torch.long)
     interp_timestamps = _interpolate_second_timestamps(timestamps)
-    bucketed_values, counts = _pad_tensor_by_second(
-        values_tensor, second_timestamps, seconds, pad_value=0.0, max_count=max_count
+    starts, ends, counts = _second_bucket_layout(second_timestamps, seconds)
+    bucketed_values = _pad_tensor_by_layout(
+        values_tensor, starts, ends, pad_value=0.0, max_count=max_count
     )
-    bucketed_timestamps, _ = _pad_scalar_metadata_by_second(
-        interp_timestamps,
-        second_timestamps,
-        seconds,
-        pad_value=float('nan'),
-        max_count=max_count,
+    bucketed_timestamps = _pad_scalar_by_layout(
+        interp_timestamps, starts, ends, pad_value=float('nan'), max_count=max_count
     )
-    bucketed_second_timestamps, _ = _pad_scalar_metadata_by_second(
-        second_timestamps,
-        second_timestamps,
-        seconds,
-        pad_value=-1,
-        max_count=max_count,
+    bucketed_second_timestamps = _pad_scalar_by_layout(
+        second_timestamps, starts, ends, pad_value=-1, max_count=max_count
     )
     valid_mask = bucketed_second_timestamps >= 0
     return bucketed_values, bucketed_timestamps, bucketed_second_timestamps, counts, valid_mask
