@@ -27,7 +27,7 @@ except ImportError:
 
 import dataloader as _dl
 from dataloader import (PoseItDataset, split_by_object, split_by_pose,
-                        uniform_random_split, F2, FT_DIM, GR_DIM)
+                        uniform_random_split)
 from sampler import DRSSampler
 from model import GraspStabilityLSTM
 
@@ -213,6 +213,8 @@ def main():
     _dl.L = args.L
     _dl.F1 = args.F1
     _dl.F2 = args.F2
+    FT_DIM = _dl.F2 * 6   # recompute after CLI override — not captured at import time
+    GR_DIM = _dl.F2 * 2
 
     # dataset
     ds = PoseItDataset(root_dir=args.root_dir)
@@ -254,7 +256,7 @@ def main():
 
     # Model
     model = GraspStabilityLSTM(
-        frames_per_sec=F2,
+        frames_per_sec=args.F1,
         ft_dim=FT_DIM,
         gripper_dim=GR_DIM,
         hidden_dim=args.hidden_dim,
@@ -346,26 +348,32 @@ def main():
             model.train()   # restore training mode after evaluate()
             iteration += 1
 
-    # test
-    print("\nLoading best checkpoint for test evaluation...")
-    model.load_state_dict(torch.load(args.model_save_path, map_location=device))
-    test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(
-        model, test_loader, criterion, device)
-    print(f"Test loss={test_loss:.4f}  acc={test_acc*100:.2f}%  "
-          f"prec={test_prec:.3f}  rec={test_rec:.3f}  f1={test_f1:.3f}")
+    # test — evaluate both best_model.pt and model_latest.pt
+    print("\n=== Test evaluation ===")
+    for ckpt_label, ckpt_path in [("best_model", args.model_save_path), ("model_latest", latest_path)]:
+        if not os.path.exists(ckpt_path):
+            print(f"[WARN] {ckpt_path} not found — skipping")
+            continue
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(
+            model, test_loader, criterion, device)
+        print(f"[{ckpt_label}] loss={test_loss:.4f}  acc={test_acc*100:.2f}%  "
+              f"prec={test_prec:.3f}  rec={test_rec:.3f}  f1={test_f1:.3f}")
+        if use_wandb:
+            wandb.log({
+                f'test_{ckpt_label}/loss':      test_loss,
+                f'test_{ckpt_label}/acc':       test_acc,
+                f'test_{ckpt_label}/precision': test_prec,
+                f'test_{ckpt_label}/recall':    test_rec,
+                f'test_{ckpt_label}/f1':        test_f1,
+            }, step=args.n_iters - 1)
+            wandb.run.summary.update({
+                f'test_{ckpt_label}/loss': test_loss, f'test_{ckpt_label}/acc': test_acc,
+                f'test_{ckpt_label}/precision': test_prec,
+                f'test_{ckpt_label}/recall': test_rec, f'test_{ckpt_label}/f1': test_f1,
+            })
 
     if use_wandb:
-        wandb.log({
-            'test/loss':      test_loss,
-            'test/acc':       test_acc,
-            'test/precision': test_prec,
-            'test/recall':    test_rec,
-            'test/f1':        test_f1,
-        }, step=args.n_iters - 1)
-        wandb.run.summary.update({
-            'test/loss': test_loss, 'test/acc': test_acc,
-            'test/precision': test_prec, 'test/recall': test_rec, 'test/f1': test_f1,
-        })
         wandb.finish()
 
 
