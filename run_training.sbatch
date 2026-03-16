@@ -30,4 +30,4 @@ python train.py \
     --subsample 1.0 \
     --num_workers 4 \
     --L 9 \
-    --wandb_run  FirstFullRun_ranais
+    --wandb_run  

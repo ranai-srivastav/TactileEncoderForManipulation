@@ -77,28 +77,28 @@ Per second t:
   Linear(4105→hidden_dim*2) → ReLU → LayerNorm(hidden_dim*2) → Dropout
     → Linear(hidden_dim*2→hidden_dim) → ReLU → Dropout → (B, hidden_dim)
 
-sequence of L steps → 2-layer BiLSTM
+sequence of L steps → 2-layer BiLSTM (always bidirectional, hardcoded)
   → cat[forward at t=T-1, backward at t=0] → (B, hidden_dim*2)
   → FC(hidden*2→64) → ReLU → Dropout → FC(64→1) → (B, 1) logit
   (4 FC layers total: 2 in projection, 2 in classifier head)
 
-Loss: BCEWithLogitsLoss
+Loss: BCEWithLogitsLoss (no pos_weight)
 Predict: logit > 0 → slip/drop
 ```
 
 Constructor args:
 ```python
 GraspStabilityLSTM(
-    frames_per_sec=F2,    # frames per second (= F1 = F2 = 1 by default)
+    frames_per_sec=1,     # F1 — image frames per second (⚠ train.py currently passes F2 by mistake)
     ft_dim=FT_DIM,        # 6  (F2*6, with F2=1)
     gripper_dim=GR_DIM,   # 2  (F2*2, with F2=1)
     hidden_dim=256,
-    lstm_layers=2,
     dropout=0.1,
     freeze_resnet=True,
     modalities=None,      # set of {'V','T','FT','G','GF'}; None = all active
 )
 ```
+Note: `bidirectional` and `lstm_layers` args were removed — now hardcoded to BiLSTM with 2 layers.
 
 Modality masking: disabled modalities zeroed before any encoder (in `forward`).
 Keys: `V`=RGB, `T`=tactile, `FT`=force-torque, `G`=gripper, `GF`=gripper_force.
@@ -111,24 +111,25 @@ Key CLI args:
 --split          object | pose | random
 --test_objects   used with --split object
 --test_poses     used with --split pose
---sigma          DRS target S≠/S= ratio (0.5 or 1.0)
+--sigma          DRS target S≠/S= ratio (default 1.0)
 --batch_size     default 32
---lr             default 0.01 (SGD + momentum=0.9)
+--lr             default 0.01 (AdamW)
 --weight_decay   default 0.01
 --dropout        default 0.1
 --hidden_dim     default 256
 --n_iters        total training iterations
---anneal_iter    iteration at which DRS activates and LR steps ×0.1
+--anneal_iter    iteration at which DRS activates (LR handled by CosineAnnealingLR)
 --num_workers    default 4
 --modalities     e.g. --modalities V T FT  (subset to activate)
 --L              max seconds per episode (default 20)
---F1             image frames per second (default 1; sets dataloader.F1 — matches module default)
---F2             sensor readings per second (default 1; sets dataloader.F2 — matches module default)
+--F1             image frames per second (default 1; sets dataloader.F1)
+--F2             sensor readings per second (default 1; sets dataloader.F2)
 --subsample      fraction of dataset to load (e.g. 0.01 for quick tests)
---wandb_project   W&B project name (default "TEMU"; set to None to disable)
---wandb_run       W&B run name (optional)
---wandb_entity    W&B entity/team (default "mrsd-smores")
---overfit         flag: use 1 sample for train/val/test — sanity-check mode, DRS disabled
+--wandb_project  W&B project name (default "TEMU"; set to None to disable)
+--wandb_run      W&B run name (optional)
+--wandb_entity   W&B entity/team (default "mrsd-smores")
+--overfit        flag: use 1 sample for train/val/test — sanity-check mode, DRS disabled
+                 ⚠ best_model.pt never saved in overfit mode (DRS never activates) → test crashes
 --model_save_path path for best checkpoint (default "trained_models/best_model.pt");
                   `model_latest.pt` is saved in the same directory
 ```
@@ -139,13 +140,13 @@ Execution flow:
 3. If `--overfit`: shrink to 1 sample, use it for train/val/test, disable DRS (`anneal_iter = n_iters+1`)
    Else: split → `print_dataset_stats` (per-phase pass/fail/unknown for all/train/val/test)
 4. Create `DRSSampler` (inactive until `anneal_iter`)
-5. Build model, criterion=`BCEWithLogitsLoss`, optimizer=SGD, scheduler=StepLR
+5. Build model, criterion=`BCEWithLogitsLoss` (no pos_weight), optimizer=AdamW, scheduler=CosineAnnealingLR
 6. Training loop: every 10 iters — evaluate, log metrics to console + W&B, then:
-   - Save `best_model.pt` (by val F1, only after DRS activates; only when val_f1 improves)
+   - Save `best_model.pt` only when **both** `sampler.is_active` and `val_f1 > best_val_f1`
    - Save rolling `model_latest.pt` in same dir (delete previous before writing)
-   - Upload both to W&B via `wandb.save()` (`best_model.pt` only if it already exists)
-   `model.train()` is explicitly called after every `evaluate()` call (cuDNN RNN requirement)
-7. Test evaluation on `best_model.pt`
+   - Gradient clipping: `clip_grad_norm_(max_norm=1.0)` before `optimizer.step()`
+   - `model.train()` called at top of while loop (not after each evaluate block)
+7. Test evaluation loads `best_model.pt` (⚠ crashes if file was never written)
 
 `evaluate()` returns: `(loss, acc, precision, recall, f1)` — binary classification metrics.
 
@@ -171,19 +172,20 @@ Sampling uses `replace=True` automatically when `batch_size > len(train_indices)
 | File | Status | Notes |
 |------|--------|-------|
 | `dataloader.py` | ✅ Current | All bugs fixed; `uniform_random_split` guards empty splits |
-| `model.py` | ✅ Current | ResNet50, modality masking, flat concat, BiLSTM |
-| `train.py` | ✅ Current | `--overfit` flag added; `model.train()` bug fixed; W&B defaults set |
+| `model.py` | ✅ Current | ResNet50, modality masking, flat concat, BiLSTM (fixed from GRU); bidirectional hardcoded |
+| `train.py` | ✅ Current | AdamW + CosineAnnealingLR; grad clipping; DRS-gated best_model save; W&B logging |
 | `sampler.py` | ✅ Current | DRS fixed: `replace` guard, `sigma < r` check (was `<=`) |
-| `README.md` | ✅ Current | Full documentation: file blurbs, all CLI params, 7 example commands, ablation matrix, W&B sweep YAML |
-| `test.ipynb` | ✅ Current | 13-section interactive notebook; all DataLoaders use default collate |
+| `README.md` | ⚠ Stale | CLI args changed (removed `--drs_iter`, `--lstm_layers`, `--unidirectional`; sigma default 1.0; AdamW/cosine) |
+| `test.ipynb` | ⚠ Stale | May reference old model constructor args (`lstm_layers`, `bidirectional`) |
 | `CLAUDE.md` | ✅ This file | |
 
 ---
 
 ## Work In Progress / Next Steps
 
-- **Full training run** not yet executed. Overfit sanity check passed (loss decreased ~0.73→0.35 over 500 iters, val_acc=100% from iter 30). Pipeline is confirmed working.
-- **Next:** Run full training with `--split random --anneal_iter 300 --n_iters 600` and monitor W&B for val/f1 after DRS activates.
+- **Known bugs:** see `TODO.md`
+- **README and notebook** need updating to match current CLI and model API (see TODO.md)
+- **Full training run** not yet validated with new AdamW + CosineAnnealingLR setup.
 
 ---
 
@@ -196,7 +198,7 @@ python train.py --split random --subsample 0.01 --anneal_iter 0 \
     --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
     --wandb_project None
 
-# Single-sample overfit check (confirms model can learn; loss should fall toward 0)
+# Single-sample overfit check (⚠ best_model.pt not saved; test eval will crash)
 python train.py --overfit --n_iters 500 --batch_size 1 \
     --lr 0.001 --weight_decay 0.0 --num_workers 0 \
     --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
@@ -221,7 +223,9 @@ python visualize_sampler.py --root /ocean/projects/cis260031p/shared/dataset/Gel
 
 - **ResNet50** chosen over ResNet18 for vision backbone
 - **Flat concat** for FT/gripper (no small MLP encoders) — matches `parth_dev` style
-- **BCEWithLogitsLoss + 1 logit** kept (not CrossEntropy + 2 logits)
+- **BCEWithLogitsLoss + 1 logit** kept (not CrossEntropy + 2 logits); no `pos_weight` (removed)
+- **AdamW + CosineAnnealingLR** (replaced SGD+StepLR); gradient clipping `max_norm=1.0`
+- **BiLSTM hardcoded** — removed `--unidirectional` and `--lstm_layers` CLI args; always 2-layer BiLSTM
 - **L enforced in dataloader** (not in model.forward) — `_build_sample` drops sequences shorter than L; clips longer ones to `seconds[-L:]` (last L seconds, closest to stability event)
 - **Modality masking** via zero-multiplication in `forward()` — disabled modalities still pass through encoders (zeroed input), shape is preserved
 - **LSTM operates over T seconds** (one step per second, F1 frames flattened per step) — not over T×F1 individual frames
@@ -229,7 +233,7 @@ python visualize_sampler.py --root /ocean/projects/cis260031p/shared/dataset/Gel
 - **Bucket underfill** (0 < k < F): prints `[WARN]` and skips sample — no forward-fill
 - **`--subsample`, `split_by_object`, `split_by_pose`** all confirmed working correctly — kept
 - **`collate_variable_length` not used** as `collate_fn` anywhere — all DataLoaders use default PyTorch collate since `L` guarantees uniform T. `lengths` computed in `batch_to_device` from `tac.shape[1]` for forward-compatibility. Method kept in `dataloader.py` for potential future use.
-- **`--F1` / `--F2` CLI args** added to `train.py` (default 1 each); set `dataloader.F1` / `dataloader.F2` before dataset construction — defaults match module defaults so no actual override unless changed
+- **`--F1` / `--F2` CLI args** set `dataloader.F1` / `dataloader.F2` before dataset construction — defaults match module defaults so no actual override unless changed; note latent bug if non-default (see TODO.md)
 
 ## Bugs Fixed
 
@@ -240,8 +244,9 @@ python visualize_sampler.py --root /ocean/projects/cis260031p/shared/dataset/Gel
 | `dataloader.py:367` | `uniform_random_split` produced empty val set for small N | `n_val = max(1, ...)`, `n_train = max(1, min(..., n-n_val-1))` |
 | `train.py:254` | `torch.load` missing `map_location` → crashes on CPU/GPU mismatch | Added `map_location=device` |
 | `train.py:evaluate` | Division by zero when loader has no batches | Added `if n == 0: return 0,0,0,0,0` guard |
-| `train.py:288` | `model.train()` not called after `evaluate()` → `RuntimeError: cudnn RNN backward can only be called in training mode` on second iteration | Added `model.train()` after every validation block |
+| `train.py:288` | `model.train()` not called after `evaluate()` → `RuntimeError: cudnn RNN backward can only be called in training mode` on second iteration | `model.train()` now called at top of while loop |
 | `model.py:136` | `lstm_out[:, -1, :]` takes backward stream at t=T which has only seen one step (backward context is full at t=0, not t=T) | Use `cat[lstm_out[:,-1,:h], lstm_out[:,0,h:]]` — forward at T + backward at 0 |
 | `model.py:43-45` | Constructor defaults `frames_per_sec=2, ft_dim=12, gripper_dim=4` didn't match dataloader constants (F1=1, FT_DIM=6, GR_DIM=2) | Fixed to `frames_per_sec=1, ft_dim=6, gripper_dim=2` |
 | `dataloader.py:463` | `lengths_b.tolist()` called on a Python list → `AttributeError` | Removed `.tolist()` |
-| `model.py:projection` | `nn.BatchNorm1d(hidden_dim*2)` applied to `(B, T, hidden_dim*2)` — BN treats `dim=1=T` as the channel axis, normalizing over `(batch, features)` per timestep instead of over `(batch, timesteps)` per feature | Replaced with `nn.LayerNorm(hidden_dim*2)`, which normalizes over `dim=-1` independently for each `(B, T)` position |
+| `model.py:projection` | `nn.BatchNorm1d(hidden_dim*2)` applied to `(B, T, hidden_dim*2)` — BN treats `dim=1=T` as the channel axis | Replaced with `nn.LayerNorm(hidden_dim*2)` |
+| `model.py` | `nn.GRU` used in class named `GraspStabilityLSTM` | Changed to `nn.LSTM` |
