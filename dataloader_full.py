@@ -61,6 +61,32 @@ class PoseItPaddingMetadata(StrEnum):
 ALL_MODALITIES: Tuple[PoseItModality, ...] = tuple(PoseItModality)
 
 
+@dataclass(frozen=True)
+class PoseItItemsPerSecond:
+    """Typed per-modality target counts used in ``BY_SECOND`` mode."""
+
+    tactile: int = 30
+    rgb: int = 5
+    depth: int = 5
+    side_cam: int = 30
+    top_cam: int = 30
+    ft: int = 100
+    gripper: int = 10
+    robot: int = 2970
+
+    def as_dict(self) -> Dict[PoseItModality, int]:
+        return {
+            PoseItModality.TACTILE: self.tactile,
+            PoseItModality.RGB: self.rgb,
+            PoseItModality.DEPTH: self.depth,
+            PoseItModality.SIDE_CAM: self.side_cam,
+            PoseItModality.TOP_CAM: self.top_cam,
+            PoseItModality.FT: self.ft,
+            PoseItModality.GRIPPER: self.gripper,
+            PoseItModality.ROBOT: self.robot,
+        }
+
+
 class PoseItFullSample(TypedDict, total=False):
     time_layout: PoseItTimeLayout
     padding_metadata: PoseItPaddingMetadata
@@ -353,6 +379,16 @@ def _normalize_padding_metadata(padding_metadata: PoseItPaddingMetadata) -> Pose
     return PoseItPaddingMetadata(padding_metadata)
 
 
+def _normalize_items_per_second(
+    items_per_second: Optional[PoseItItemsPerSecond],
+) -> Dict[PoseItModality, int]:
+    normalized = (items_per_second or PoseItItemsPerSecond()).as_dict()
+    for modality, value in normalized.items():
+        if value < 0:
+            raise ValueError(f"items_per_second for {modality.value} must be >= 0, got {value}")
+    return normalized
+
+
 def _include_counts(padding_metadata: PoseItPaddingMetadata) -> bool:
     return padding_metadata in (PoseItPaddingMetadata.COUNTS, PoseItPaddingMetadata.BOTH)
 
@@ -369,20 +405,6 @@ def _second_grid(start_timestamp: Optional[int], end_timestamp: Optional[int]) -
     if start_timestamp is None or end_timestamp is None or end_timestamp < start_timestamp:
         return torch.zeros(0, dtype=torch.long)
     return torch.arange(start_timestamp, end_timestamp + 1, dtype=torch.long)
-
-
-def _max_count_from_seconds(second_timestamps: np.ndarray) -> int:
-    if len(second_timestamps) == 0:
-        return 0
-    _, counts = np.unique(second_timestamps, return_counts=True)
-    return int(counts.max())
-
-
-def _max_count_from_entries(entries: List[Tuple[int, int, Path]]) -> int:
-    if not entries:
-        return 0
-    seconds = np.array([ts for ts, _, _ in entries], dtype=np.int64)
-    return _max_count_from_seconds(seconds)
 
 
 def _second_bucket_layout(second_timestamps: torch.Tensor,
@@ -405,16 +427,20 @@ def _second_bucket_layout(second_timestamps: torch.Tensor,
     return starts, ends, counts
 
 
+def _truncate_layout(starts: np.ndarray,
+                     ends: np.ndarray,
+                     target_count: int) -> Tuple[np.ndarray, torch.Tensor]:
+    truncated_ends = np.minimum(ends, starts + target_count)
+    counts = torch.from_numpy((truncated_ends - starts).astype(np.int64))
+    return truncated_ends, counts
+
+
 def _pad_tensor_by_layout(values: torch.Tensor,
                           starts: np.ndarray,
                           ends: np.ndarray,
-                          pad_value: float = 0.0,
-                          max_count: Optional[int] = None) -> torch.Tensor:
-    target_max_count = int((ends - starts).max()) if len(starts) > 0 else 0
-    if max_count is not None:
-        target_max_count = max(target_max_count, max_count)
-
-    shape = (len(starts), target_max_count, *values.shape[1:])
+                          target_count: int,
+                          pad_value: float = 0.0) -> torch.Tensor:
+    shape = (len(starts), target_count, *values.shape[1:])
     padded = torch.full(shape, pad_value, dtype=values.dtype)
 
     for i, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
@@ -428,13 +454,9 @@ def _pad_tensor_by_layout(values: torch.Tensor,
 def _pad_scalar_by_layout(values: torch.Tensor,
                           starts: np.ndarray,
                           ends: np.ndarray,
-                          pad_value,
-                          max_count: Optional[int] = None) -> torch.Tensor:
-    target_max_count = int((ends - starts).max()) if len(starts) > 0 else 0
-    if max_count is not None:
-        target_max_count = max(target_max_count, max_count)
-
-    padded = torch.full((len(starts), target_max_count), pad_value, dtype=values.dtype)
+                          target_count: int,
+                          pad_value) -> torch.Tensor:
+    padded = torch.full((len(starts), target_count), pad_value, dtype=values.dtype)
 
     for i, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
         if start == end:
@@ -449,23 +471,24 @@ def _bucket_image_entries(entries: List[Tuple[int, int, Path]],
                           transform,
                           mode: Optional[str],
                           zero_channels: int,
-                          max_count: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                          target_count: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     frames, timestamps, second_timestamps, frame_indices = _stack_image_entries(
         entries,
         transform=transform,
         mode=mode,
         zero_channels=zero_channels,
     )
-    starts, ends, counts = _second_bucket_layout(second_timestamps, seconds)
-    bucketed_frames = _pad_tensor_by_layout(frames, starts, ends, pad_value=0.0, max_count=max_count)
+    starts, ends, _ = _second_bucket_layout(second_timestamps, seconds)
+    truncated_ends, counts = _truncate_layout(starts, ends, target_count)
+    bucketed_frames = _pad_tensor_by_layout(frames, starts, truncated_ends, target_count, pad_value=0.0)
     bucketed_timestamps = _pad_scalar_by_layout(
-        timestamps, starts, ends, pad_value=float('nan'), max_count=max_count
+        timestamps, starts, truncated_ends, target_count, pad_value=float('nan')
     )
     bucketed_second_timestamps = _pad_scalar_by_layout(
-        second_timestamps, starts, ends, pad_value=-1, max_count=max_count
+        second_timestamps, starts, truncated_ends, target_count, pad_value=-1
     )
     bucketed_frame_indices = _pad_scalar_by_layout(
-        frame_indices, starts, ends, pad_value=-1, max_count=max_count
+        frame_indices, starts, truncated_ends, target_count, pad_value=-1
     )
     valid_mask = bucketed_second_timestamps >= 0
     return (
@@ -481,19 +504,20 @@ def _bucket_image_entries(entries: List[Tuple[int, int, Path]],
 def _bucket_timeseries(values: np.ndarray,
                        timestamps: np.ndarray,
                        seconds: torch.Tensor,
-                       max_count: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                       target_count: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     values_tensor = _timeseries_to_tensor(values)
     second_timestamps = torch.tensor(timestamps, dtype=torch.long)
     interp_timestamps = _interpolate_second_timestamps(timestamps)
-    starts, ends, counts = _second_bucket_layout(second_timestamps, seconds)
+    starts, ends, _ = _second_bucket_layout(second_timestamps, seconds)
+    truncated_ends, counts = _truncate_layout(starts, ends, target_count)
     bucketed_values = _pad_tensor_by_layout(
-        values_tensor, starts, ends, pad_value=0.0, max_count=max_count
+        values_tensor, starts, truncated_ends, target_count, pad_value=0.0
     )
     bucketed_timestamps = _pad_scalar_by_layout(
-        interp_timestamps, starts, ends, pad_value=float('nan'), max_count=max_count
+        interp_timestamps, starts, truncated_ends, target_count, pad_value=float('nan')
     )
     bucketed_second_timestamps = _pad_scalar_by_layout(
-        second_timestamps, starts, ends, pad_value=-1, max_count=max_count
+        second_timestamps, starts, truncated_ends, target_count, pad_value=-1
     )
     valid_mask = bucketed_second_timestamps >= 0
     return bucketed_values, bucketed_timestamps, bucketed_second_timestamps, counts, valid_mask
@@ -589,28 +613,6 @@ def _build_full_entry_index(sample_dir: Path,
     return sample_index
 
 
-def _dataset_shape_stats(samples: List[Dict[str, object]],
-                         modalities: Tuple[PoseItModality, ...]) -> Dict[PoseItModality, int]:
-    max_items_per_second = {modality: 0 for modality in modalities}
-    selected = set(modalities)
-
-    for sample in samples:
-        for spec in IMAGE_MODALITY_SPECS:
-            if spec.modality in selected:
-                max_items_per_second[spec.modality] = max(
-                    max_items_per_second[spec.modality],
-                    _max_count_from_entries(sample[spec.entries_key]),
-                )
-        for spec in TIMESERIES_MODALITY_SPECS:
-            if spec.modality in selected:
-                max_items_per_second[spec.modality] = max(
-                    max_items_per_second[spec.modality],
-                    _max_count_from_seconds(sample[spec.timestamps_key]),
-                )
-
-    return max_items_per_second
-
-
 class PoseItDataLoaderFull(Dataset):
     """Lazy full-duration PoseIt dataset loader.
 
@@ -629,18 +631,25 @@ class PoseItDataLoaderFull(Dataset):
             ``(N_items, ...)``.
             ``PoseItTimeLayout.BY_SECOND`` buckets each modality by integer
             second and returns shape ``(T, M_modality, ...)``, where ``T`` is the
-            number of seconds in that sample and ``M_modality`` is the
-            dataset-wide max number of items seen in any one second for that
-            modality.
+            number of seconds in that sample and ``M_modality`` is the configured
+            target count for that modality.
         padding_metadata:
             Controls whether ``BY_SECOND`` mode returns
             ``*_counts_per_second``, ``*_valid_mask``, or both.
+        items_per_second:
+            Typed per-modality target widths used in ``BY_SECOND`` mode. Seconds
+            with fewer than the target count are zero-padded. Seconds with more
+            than the target count are truncated in timestamp order. Defaults are
+            the latest full-dataset medians: tactile=30, rgb=5, depth=5,
+            side_cam=30, top_cam=30, ft=100, gripper=10, robot=2970.
 
     Notes:
         In ``BY_SECOND`` mode, only axes 1+ are dataset-consistent. The leading
         time axis ``T`` is allowed to vary across samples.
         Data tensors are padded with zeros, interpolated timestamps with
         ``nan``, and coarse integer timestamps / frame indices with ``-1``.
+        ``*_counts_per_second`` reflects the returned item count after any
+        truncation to ``items_per_second``.
     """
 
     def __init__(self,
@@ -648,7 +657,8 @@ class PoseItDataLoaderFull(Dataset):
                  sample_dirs: Optional[List[str]] = None,
                  modalities: Optional[Iterable[PoseItModality]] = None,
                  time_layout: PoseItTimeLayout = PoseItTimeLayout.FLAT,
-                 padding_metadata: PoseItPaddingMetadata = PoseItPaddingMetadata.COUNTS):
+                 padding_metadata: PoseItPaddingMetadata = PoseItPaddingMetadata.COUNTS,
+                 items_per_second: Optional[PoseItItemsPerSecond] = None):
         assert root_dir or sample_dirs, "Provide root_dir or sample_dirs"
         if root_dir is not None and not Path(root_dir).is_dir():
             raise FileNotFoundError(f"Dataset root does not exist or is not a directory: {root_dir}")
@@ -659,6 +669,7 @@ class PoseItDataLoaderFull(Dataset):
         self._selected_modalities = set(self.modalities)
         self.time_layout = _normalize_time_layout(time_layout)
         self.padding_metadata = _normalize_padding_metadata(padding_metadata)
+        self.items_per_second = _normalize_items_per_second(items_per_second)
         self.samples = []
         skipped = 0
         for directory in dirs:
@@ -670,10 +681,6 @@ class PoseItDataLoaderFull(Dataset):
                 print(f"[WARN] Skipping {directory.name}: {exc}")
                 skipped += 1
 
-        self.max_items_per_second = _dataset_shape_stats(
-            self.samples,
-            self.modalities,
-        )
         print(f"Loaded {len(self.samples)} full-duration samples ({skipped} skipped)  "
               f"[modalities={[m.value for m in self.modalities]}, layout={self.time_layout.value}, "
               f"padding={self.padding_metadata.value}]")
@@ -716,7 +723,7 @@ class PoseItDataLoaderFull(Dataset):
                     transform=spec.transform,
                     mode=spec.mode,
                     zero_channels=spec.zero_channels,
-                    max_count=self.max_items_per_second[spec.modality],
+                    target_count=self.items_per_second[spec.modality],
                 )
                 _maybe_add_padding_metadata(
                     result,
@@ -745,7 +752,7 @@ class PoseItDataLoaderFull(Dataset):
                     sample[spec.values_key],
                     sample[spec.timestamps_key],
                     seconds=actual_seconds,
-                    max_count=self.max_items_per_second[spec.modality],
+                    target_count=self.items_per_second[spec.modality],
                 )
                 _maybe_add_padding_metadata(
                     result,
@@ -837,7 +844,7 @@ def _check_by_second_sample(dataset: PoseItDataLoaderFull,
         coarse = sample[f'{spec.sample_key}_second_timestamps']
         frame_indices = sample[f'{spec.sample_key}_frame_indices']
         assert data.shape[0] == timestamps.shape[0] == coarse.shape[0] == frame_indices.shape[0] == t
-        assert data.shape[1] == dataset.max_items_per_second[spec.modality]
+        assert data.shape[1] == dataset.items_per_second[spec.modality]
         assert timestamps.shape == coarse.shape == frame_indices.shape == data.shape[:2]
 
         if _include_counts(dataset.padding_metadata):
@@ -860,7 +867,7 @@ def _check_by_second_sample(dataset: PoseItDataLoaderFull,
         timestamps = sample[f'{spec.sample_key}_timestamps']
         coarse = sample[f'{spec.sample_key}_second_timestamps']
         assert data.shape[0] == timestamps.shape[0] == coarse.shape[0] == t
-        assert data.shape[1] == dataset.max_items_per_second[spec.modality]
+        assert data.shape[1] == dataset.items_per_second[spec.modality]
         assert timestamps.shape == coarse.shape == data.shape[:2]
 
         if _include_counts(dataset.padding_metadata):
@@ -891,8 +898,8 @@ def _run_case(name: str, dataset: PoseItDataLoaderFull) -> None:
         print("  timestamps  : (T, M_modality)")
         print("  counts      : (T,) when requested")
         print("  valid_mask  : (T, M_modality) when requested")
-    print(f"Dataset-wide max items/sec: "
-          f"{ {mod.value: dataset.max_items_per_second[mod] for mod in dataset.modalities} }")
+    print(f"Target items/sec: "
+          f"{ {mod.value: dataset.items_per_second[mod] for mod in dataset.modalities} }")
 
     for i in range(len(dataset)):
         sample = dataset[i]
