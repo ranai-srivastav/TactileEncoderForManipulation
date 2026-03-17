@@ -269,13 +269,24 @@ def _parse_wb_list(values):
 def main():
     args   = parse_args()
     # Normalize list args that W&B may pass as a Python-repr string
-    args.freeze     = _parse_wb_list(args.freeze or [])
-    args.modalities = _parse_wb_list(args.modalities)
+    args.freeze       = _parse_wb_list(args.freeze or [])
+    args.modalities   = _parse_wb_list(args.modalities)
+    args.test_objects = _parse_wb_list(args.test_objects or [])
+    args.test_poses   = [int(x) for x in _parse_wb_list([str(v) for v in (args.test_poses or [])])]
     # Fraction-based overrides — keep anneal/DRS milestones proportional to n_iters
     if args.anneal_frac is not None:
         args.anneal_iter = int(args.anneal_frac * args.n_iters)
     if args.drs_frac is not None:
         args.drs_iter = int(args.drs_frac * args.n_iters)
+    # Auto-cap batch_size when ResNets are unfrozen — effective ResNet batch is batch_size * L * F1.
+    # Budget: ~28 GB, ~175 MB/image with gradients, 2 encoders.
+    resnet_unfrozen = ('resnet_rgb' not in args.freeze) or ('resnet_tactile' not in args.freeze)
+    if resnet_unfrozen:
+        max_bs = max(1, 28_000 // (args.L * args.F1 * 2 * 175))
+        if args.batch_size > max_bs:
+            print(f"[INFO] ResNet unfrozen: auto-capping batch_size {args.batch_size} → {max_bs} "
+                  f"(effective ResNet batch = {max_bs * args.L * args.F1})")
+            args.batch_size = max_bs
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
@@ -368,14 +379,20 @@ def main():
         ce_weight = torch.tensor([1.0, pos_weight.item()], dtype=torch.float32).to(device)
         criterion = nn.CrossEntropyLoss(weight=ce_weight)
 
-    # Optimizer
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    # Optimizer — ResNet params (if unfrozen) get lr/10 to avoid destroying pretrained features
+    resnet_param_ids = {id(p) for p in list(model.rgb_encoder.parameters())
+                                      + list(model.tactile_encoder.parameters())}
+    head_params    = [p for p in model.parameters() if p.requires_grad and id(p) not in resnet_param_ids]
+    resnet_params  = [p for p in model.parameters() if p.requires_grad and id(p) in resnet_param_ids]
+    param_groups   = [{'params': head_params, 'lr': args.lr}]
+    if resnet_params:
+        param_groups.append({'params': resnet_params, 'lr': args.lr / 10})
     if args.optimizer == 'sgd':
         optimizer = torch.optim.SGD(
-            trainable_params, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+            param_groups, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
     else:  # adamw
         optimizer = torch.optim.AdamW(
-            trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+            param_groups, lr=args.lr, weight_decay=args.weight_decay)
 
     # LR scheduler
     if args.lr_scheduler == 'step':
@@ -396,6 +413,7 @@ def main():
             'loss_fn':              'BCE' if args.n_outputs == 1 else ('CrossEntropy+tau' if args.tau > 0 else 'CrossEntropy'),
             'tau':                  args.tau,
             'optimizer_type':       args.optimizer,
+            'lr_resnet':            args.lr / 10 if resnet_params else 0.0,
             'scheduler_type':       args.lr_scheduler,
             'modalities_str':       '+'.join(sorted(args.modalities)),
             'n_active_modalities':  len(args.modalities),
@@ -500,6 +518,7 @@ def main():
                         'val/pos_pred_rate':      val_ppr,
                         'drs_active':             int(sampler.is_active),
                         'lr':                     current_lr,
+                        'lr_resnet':              optimizer.param_groups[1]['lr'] if len(optimizer.param_groups) > 1 else 0.0,
                     }, step=iteration)
 
                 if val_f1 > best_val_f1:

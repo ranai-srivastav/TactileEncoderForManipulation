@@ -121,9 +121,13 @@ Key CLI args:
 --test_poses        used with --split pose
 --sigma             DRS target S≠/S= ratio (default 0.5)
 --drs_iter          iteration at which DRS activates (default 400; decoupled from LR anneal)
+--drs_frac          float: if set, drs_iter = int(drs_frac * n_iters). Overrides --drs_iter.
+                    Use in sweeps so DRS always fires regardless of n_iters value.
 --anneal_iter       iteration at which StepLR steps down (default 300; only for --lr_scheduler step)
---batch_size        default 32
---lr                default 0.01
+--anneal_frac       float: if set, anneal_iter = int(anneal_frac * n_iters). Overrides --anneal_iter.
+                    Use in sweeps so LR drop always fires regardless of n_iters value.
+--batch_size        default 32; auto-capped when ResNets are unfrozen (see below)
+--lr                default 0.01; ResNet params trained at lr/10 (see optimizer param groups)
 --weight_decay      default 0.01
 --dropout           default 0.1
 --hidden_dim        default 256
@@ -141,7 +145,8 @@ Key CLI args:
 --wandb_entity      W&B entity/team (default "mrsd-smores")
 --overfit           flag: use 1 sample for train/val/test — sanity-check mode
 --model_save_path   path for best checkpoint (default "trained_models/best_model.pt");
-                    `model_latest.pt` is saved in the same directory
+                    overridden to "trained_models/<wandb_run_id>/best_model.pt" when W&B active
+                    (prevents checkpoint collisions between parallel sweep agents)
 # --- sweep / optimizer ---
 --optimizer         sgd (momentum=0.9) | adamw  (default: sgd)
 --lr_scheduler      step | cosine_warm | none  (default: step)
@@ -153,20 +158,40 @@ Key CLI args:
                     choices: resnet_rgb, resnet_tactile, projection, gru, classifier
                     pass --freeze with no args to train everything end-to-end
 --clip_grad_norm    max gradient norm (default 1.0; 0 = disabled)
+--tau               float (default 0.0): adds tau * ||W_majority||_2 to CE loss.
+                    Only active with --n_outputs 2. Penalizes majority class (S=) weight norm.
 ```
+
+**Auto batch-size cap (ResNets unfrozen):**
+The forward pass packs ALL `B × T × F1` frames into a single ResNet call. When ResNets are
+unfrozen, all intermediate activations must be stored for backprop (~175 MB/image with grads).
+If any ResNet is unfrozen, `batch_size` is automatically capped:
+```
+max_bs = 28_000 // (L * F1 * 2 * 175)   # 28 GB budget, 2 encoders, 175 MB/image
+```
+For L=5: max ~16; L=9: max ~9; L=13: max ~6. A warning is printed if the cap fires.
+
+**Optimizer param groups (differential LR):**
+ResNet parameters (when unfrozen) are placed in a separate param group with `lr = args.lr / 10`.
+All other trainable parameters (projection, GRU, classifier) use `lr = args.lr`.
+This prevents large LR destroying pretrained ResNet features during fine-tuning.
+The scheduler scales both groups by the same factor, preserving the 1/10 ratio throughout.
 
 Execution flow:
 1. Set `_dl.L`, `_dl.F1`, `_dl.F2`; recompute local `FT_DIM = _dl.F2*6`, `GR_DIM = _dl.F2*2`
+   Apply `--anneal_frac`/`--drs_frac` overrides; auto-cap `batch_size` if ResNets unfrozen
 2. Load dataset, optionally subsample (`max(4, int(N * subsample))` samples)
 3. If `--overfit`: shrink to 1 sample, use it for train/val/test, disable DRS and LR anneal
    Else: split → `print_dataset_stats` (per-phase pass/fail/unknown for all/train/val/test)
 4. Compute `pos_weight = n_neg / n_pos` from train split labels
 5. Create `DRSSampler` (inactive until `drs_iter`)
-6. Build model, criterion (BCE or CE), optimizer (SGD or AdamW), scheduler (StepLR/CosineWarm/None)
+6. Build model, criterion (BCE or CE), optimizer with param groups (ResNets lr/10), scheduler
 7. W&B `config.update` — adds derived stats: `n_params_total`, `n_params_trainable`, `loss_fn`,
-   `optimizer_type`, `scheduler_type`, `modalities_str`, `n_active_modalities`, freeze flags,
-   `n_train/val/test`, `n_pos_train`, `n_neg_train`, `pos_weight_value`, `class_balance_train`
-8. Training loop: every 10 iters — evaluate, log metrics to console + W&B, then:
+   `tau`, `lr_resnet`, `optimizer_type`, `scheduler_type`, `modalities_str`, `n_active_modalities`,
+   freeze flags, `n_train/val/test`, `n_pos_train`, `n_neg_train`, `pos_weight_value`, `class_balance_train`
+   Checkpoint path set to `trained_models/<wandb_run_id>/` (collision-safe for parallel agents)
+8. Training loop: every 10 iters — evaluate, log metrics to console + W&B (`lr`, `lr_resnet`,
+   `train/loss`, `train/grad_norm`, `val/f1`, `val/tpr`, `val/tnr`, `val/pos_pred_rate`, etc.), then:
    - Save `best_model.pt` when `val_f1 > best_val_f1` (no DRS gate)
    - Save rolling `model_latest.pt` in same dir (delete previous before writing)
    - `model.train()` called at top of while loop and after each evaluate block
@@ -215,9 +240,9 @@ F1 = _dl.F1; F2 = _dl.F2; FT_DIM = _dl.F2 * 6; GR_DIM = _dl.F2 * 2
 
 | File | Status | Notes |
 |------|--------|-------|
-| `dataloader.py` | ✅ Current | All bugs fixed; `uniform_random_split` guards empty splits |
+| `dataloader.py` | ✅ Current | All bugs fixed; `uniform_random_split` guards empty splits; progress prints every 50 folders |
 | `model.py` | ✅ Current | ResNet50, modality masking, flat concat, GRU; per-component freeze (5 components); n_outputs (1=BCE, 2=CE) |
-| `train.py` | ✅ Current | Sweep-ready: optimizer (SGD/AdamW), scheduler (step/cosine_warm/none), n_outputs, `--freeze` list, rich W&B logging, modality ablation at test |
+| `train.py` | ✅ Current | Sweep-ready: optimizer (SGD/AdamW), scheduler (step/cosine_warm/none), n_outputs, `--freeze` list, differential LR (ResNets lr/10), auto batch-size cap, per-run-ID checkpoint paths, rich W&B logging, modality ablation at test |
 | `sampler.py` | ✅ Current | DRS fixed: `replace` guard, `sigma < r` check |
 | `test.ipynb` | ✅ Current | F1_CFG/F2_CFG/HIDDEN_DIM in Section 0; proper override in Section 1; frames_per_sec=F1 throughout |
 | `README.md` | ⚠ Stale | See TODO.md #6 |
@@ -288,6 +313,10 @@ python visualize_sampler.py --root /ocean/projects/cis260031p/shared/dataset/Gel
 - **Bucket underfill** (0 < k < F): prints `[WARN]` and skips sample — no forward-fill
 - **`collate_variable_length` not used** — all DataLoaders use default PyTorch collate since `L` guarantees uniform T
 - **Dual test eval** — both `best_model.pt` (best val_f1) and `model_latest.pt` (final weights) evaluated at end; missing checkpoint prints `[WARN]` and is skipped
+- **Differential LR** — ResNet params (if unfrozen) trained at `lr/10` via separate param group; head params (projection, GRU, classifier) use full `lr`; scheduler scales both groups proportionally
+- **Auto batch-size cap** — when ResNets unfrozen, `batch_size` capped to `28_000 // (L × F1 × 2 × 175)` to avoid OOM (effective ResNet batch = B×T×F1)
+- **Per-run checkpoint paths** — when W&B active, saves to `trained_models/<wandb_run_id>/`; prevents collision between parallel sweep agents sharing the filesystem
+- **anneal_frac / drs_frac** — sweep-friendly fraction-based alternatives; override absolute iter values in-place before `wandb.init`, so `vars(args)` captures the computed values
 
 ## Bugs Fixed
 
@@ -309,3 +338,5 @@ python visualize_sampler.py --root /ocean/projects/cis260031p/shared/dataset/Gel
 | `test.ipynb` | `frames_per_sec=F2` in Sections 12 & 13 | Fixed to `frames_per_sec=F1` |
 | `test.ipynb` | No F1/F2 config in Section 0; `_dl.F1`/`_dl.F2` never set | Added `F1_CFG`/`F2_CFG`/`HIDDEN_DIM` to Section 0; override + recompute in Section 1 |
 | `test.ipynb` | `hidden_dim=512` hardcoded in Section 12 (train.py default is 256) | Replaced with `HIDDEN_DIM` config var |
+| `train.py` | Parallel sweep agents all write to same `trained_models/best_model.pt` → size mismatch at test eval | Checkpoint dir now `trained_models/<wandb_run_id>/` when W&B active |
+| `train.py` | CUDA OOM with large batch + unfrozen ResNet — B×T×F1 images processed in single ResNet call | Auto-cap: `max_bs = 28_000 // (L × F1 × 2 × 175)` when ResNets unfrozen |

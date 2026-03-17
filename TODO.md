@@ -13,6 +13,9 @@ Open issues identified during code review.
 > - Stale `FT_DIM`/`GR_DIM` if `--F2` non-default → **fixed**: recomputed after `_dl.F2 = args.F2`
 > - `test.ipynb` had no F1/F2 config; `_dl.F1`/`_dl.F2` never set → **fixed**: `F1_CFG`/`F2_CFG`/`HIDDEN_DIM` in Section 0, override in Section 1
 > - `test.ipynb` `hidden_dim=512` hardcoded → **fixed**: replaced with `HIDDEN_DIM` config var
+> - Parallel sweep agents collide on same checkpoint path → **fixed**: checkpoint dir is `trained_models/<wandb_run_id>/` when W&B active
+> - CUDA OOM with unfrozen ResNet + large batch → **fixed**: auto batch-size cap based on L, F1
+> - ResNet fine-tuning destroys pretrained features at high LR → **fixed**: differential LR (ResNets get lr/10 via param group)
 
 ---
 
@@ -30,15 +33,28 @@ This dict is defined but never referenced anywhere. Remove it.
 
 ---
 
+## Cleanup
+
+### 2. `--resnet_lr_scale` not exposed as CLI arg — `train.py`
+The ResNet learning rate is hardcoded to `args.lr / 10`. This factor cannot be swept or overridden without changing the code. Add `--resnet_lr_scale` (float, default 0.1) and use it in the param group:
+```python
+p.add_argument('--resnet_lr_scale', type=float, default=0.1,
+               help='LR multiplier for unfrozen ResNet params (default: 0.1 = lr/10)')
+# in optimizer setup:
+{'params': resnet_params, 'lr': args.lr * args.resnet_lr_scale}
+```
+
+---
+
 ## Documentation
 
-### 2. `README.md` needs updating
-The README still references old/removed CLI args and outdated defaults:
-- `--drs_iter` now exists (was previously `--anneal_iter` for DRS)
-- `--lstm_layers` and `--unidirectional` now exist
-- `--sigma` default is 0.5 (not 1.0)
-- Optimizer is SGD + StepLR (not AdamW + CosineAnnealingLR)
-- Example commands may have invalid flags
+### 3. `README.md` needs updating *(partially done — verify completeness)*
+Key items that were recently added and should appear in README:
+- `--anneal_frac`, `--drs_frac` sweep-friendly fraction args
+- `--tau` regularization arg
+- Auto batch-size cap behavior for unfrozen ResNets
+- Differential LR (ResNets get lr/10)
+- Per-run checkpoint paths (`trained_models/<wandb_run_id>/`)
 
 ---
 
