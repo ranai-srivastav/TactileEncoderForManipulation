@@ -1,0 +1,95 @@
+# Data Generalization Sweep
+# Grid over episode length (L) and held-out test objects.
+# Question: how does episode length affect overfitting?
+#           do models generalize across different object groups?
+#
+# 5 × 3 = 15 runs total — exhaustive, deterministic.
+# All training hyperparameters are fixed at sensible defaults.
+#
+# Usage:
+#   wandb sweep sweep_data.yaml        # prints <sweep-id>
+#   wandb agent mrsd-smores/TEMU/<sweep-id>
+#
+# Parallelism: submit the agent command in multiple SLURM jobs to run simultaneously.
+
+program: train.py
+method: grid
+metric:
+  name: val/f1
+  goal: maximize
+
+parameters:
+  # ── Swept dimensions ──────────────────────────────────────────────────────
+  L:
+    values: [5, 13]       # max episode length in seconds
+
+  test_objects:
+    values:
+      - [mug, bowl, flashlight]
+
+  # ── Fixed: data ───────────────────────────────────────────────────────────
+  modalities:
+    value: [V, T, FT, G, GF]          # all modalities
+  split:
+    value: object                     # held-out objects — makes test_objects active
+  F1:
+    value: 1
+  F2:
+    value: 1
+  subsample:
+    value: 1.0                        # full dataset
+
+  # ── Fixed: training ───────────────────────────────────────────────────────
+  n_iters:
+    value: 1200
+  drs_frac:
+    values: [0, 0.33, 0.66, 1.0]                       # DRS activates at iteration 400 (67% of 600)
+  batch_size:
+    value: 200
+  lr:
+    value: 0.001
+  weight_decay:
+    value: 0.01
+  dropout:
+    value: 0.1
+  clip_grad_norm:
+    value: 1.0
+  sigma:
+    value: 1.0
+
+  # ── Fixed: optimizer / scheduler ─────────────────────────────────────────
+  optimizer:
+    value: adamw
+  lr_scheduler:
+    value: cosine_warm
+  cosine_t0:
+    value: 100              # restart cycle length in iters
+  cosine_t_mult:
+    value: 2                # cycle length multiplier
+  # anneal_frac is ignored when lr_scheduler=cosine_warm (step-based drop never fires)
+
+  # ── Fixed: architecture ───────────────────────────────────────────────────
+  hidden_dim:
+    value: 256
+  tau:
+    values: [0, 1]
+  lstm_layers:
+    value: 2
+  n_outputs:
+    values: [1, 2]                          # BCE loss
+  freeze:
+    values: 
+      - [resnet_rgb, resnet_tactile]
+      - []
+
+  # ── Fixed: infra ──────────────────────────────────────────────────────────
+  root_dir:
+    value: /ocean/projects/cis260031p/shared/dataset/Gelsight
+  num_workers:
+    value: 4
+  model_save_path:
+    value: trained_models/best_model.pt
+  wandb_project:
+    value: TEMU
+  wandb_entity:
+    value: mrsd-smores

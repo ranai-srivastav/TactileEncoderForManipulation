@@ -1,0 +1,115 @@
+# Optimizer / Architecture Hyperparameter Sweep
+# Random search over training configuration.
+# Question: what optimizer, LR schedule, and architecture settings maximize F1?
+#
+# Method: random (NOT bayes) — random search is preferred here because:
+#   - Mixed discrete + continuous params break GP surrogate models
+#   - Multiple parallel SLURM agents collapse Bayesian optimization to random anyway
+#   - Noisy training objectives (DRS, stochastic batches) confuse the GP
+#   - Random search is embarrassingly parallel and matches Bayes in practice
+#
+# Data is fixed: all modalities, split=object, L=20.
+# Run as many agents as you have GPU budget; ~50 runs gives good coverage.
+#
+# Usage:
+#   wandb sweep sweep_optimizer.yaml   # prints <sweep-id>
+#   wandb agent mrsd-smores/TEMU/<sweep-id>
+#
+# Parallelism: submit the agent command in multiple SLURM jobs to run simultaneously.
+
+program: train.py
+method: random
+metric:
+  name: val/f1
+  goal: maximize
+
+parameters:
+  # ── Fixed: data ───────────────────────────────────────────────────────────
+  modalities:
+    value: [V, T, FT, G, GF]          # all modalities — fixed for fair comparison
+  split:
+    value: object
+  test_objects:
+    value: [mug, bowl, flashlight]
+  L:
+    value: 20
+  F1:
+    value: 1
+  F2:
+    value: 1
+  subsample:
+    value: 1.0                        # full dataset
+
+  # ── Swept: training duration ──────────────────────────────────────────────
+  n_iters:
+    values: [600, 1000, 2000]
+
+  anneal_frac:                        # LR drop as fraction of n_iters (always valid)
+    distribution: uniform
+    min: 0.3
+    max: 0.8
+
+  drs_frac:                           # DRS activation as fraction of n_iters (always valid)
+    distribution: uniform
+    min: 0.4
+    max: 0.9
+
+  # ── Swept: optimizer ──────────────────────────────────────────────────────
+  optimizer:
+    values: [sgd, adamw]
+
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.05
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.001
+    max: 0.05
+
+  # ── Swept: LR scheduler ───────────────────────────────────────────────────
+  lr_scheduler:
+    values: [step, cosine_warm, none]
+
+  # cosine_t0 is ignored when lr_scheduler != cosine_warm — harmless in other runs
+  cosine_t0:
+    values: [50, 100, 200]
+
+  # ── Swept: class imbalance ────────────────────────────────────────────────
+  sigma:
+    values: [0.5, 1.0, 1.5]
+
+  # ── Swept: architecture ───────────────────────────────────────────────────
+  hidden_dim:
+    values: [128, 256, 512]
+
+  lstm_layers:
+    values: [1, 2]
+
+  dropout:
+    values: [0.0, 0.1, 0.3]
+
+  n_outputs:
+    values: [1, 2]                    # 1=BCE, 2=CrossEntropy
+
+  freeze:
+    values:
+      - [resnet_rgb, resnet_tactile]             # default: both ResNets frozen
+      - [resnet_rgb, resnet_tactile, projection] # freeze up to GRU
+
+  # ── Fixed: infra ──────────────────────────────────────────────────────────
+  batch_size:
+    value: 32
+  clip_grad_norm:
+    value: 1.0
+  num_workers:
+    value: 4
+  root_dir:
+    value: /ocean/projects/cis260031p/shared/dataset/Gelsight
+  model_save_path:
+    value: trained_models/best_model.pt
+  wandb_project:
+    value: TEMU
+  wandb_entity:
+    value: mrsd-smores

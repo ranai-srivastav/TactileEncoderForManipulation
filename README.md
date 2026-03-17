@@ -118,16 +118,20 @@ DRS is **deferred**: it behaves as a standard random sampler until `activate()` 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--lr_scheduler` | `step` | `step` — single ×0.1 drop at `anneal_iter`<br>`cosine_warm` — CosineAnnealingWarmRestarts, stepped every iter<br>`none` — constant LR |
-| `--anneal_iter` | `300` | Iteration at which `step` scheduler steps |
+| `--anneal_iter` | `300` | Iteration at which `step` scheduler steps. ⚠️ Must be < `--n_iters` or the drop never fires |
+| `--anneal_frac` | `None` | If set, overrides `--anneal_iter` with `int(anneal_frac × n_iters)`. Use in sweeps to keep the drop proportional to training length |
 | `--cosine_t0` | `100` | T_0 (iters per first restart cycle) for `cosine_warm` |
 | `--cosine_t_mult` | `2` | T_mult (cycle length multiplier) for `cosine_warm` |
+
+> `--anneal_iter` is ignored when `--lr_scheduler cosine_warm` or `none`. `--cosine_t0`/`--cosine_t_mult` are ignored when `--lr_scheduler step` or `none`.
 
 #### Class imbalance (DRS)
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--sigma` | `0.5` | DRS target S≠/S= ratio per batch. `0.5` = gentle, `1.0` = full balance. Must be ≥ natural ratio |
-| `--drs_iter` | `400` | Iteration at which DRS activates (decoupled from `anneal_iter`) |
+| `--drs_iter` | `400` | Iteration at which DRS activates. ⚠️ Must be < `--n_iters` or DRS never fires |
+| `--drs_frac` | `None` | If set, overrides `--drs_iter` with `int(drs_frac × n_iters)`. Use in sweeps to keep DRS activation proportional to training length |
 
 #### Model architecture
 
@@ -213,9 +217,9 @@ python train.py \
 ```bash
 python train.py \
     --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
-    --split object --test_objects mug bowl \
+    --split object --test_objects mug bowl flashlight \
     --modalities V T FT G GF \
-    --anneal_iter 300 --drs_iter 400 --n_iters 600 \
+    --anneal_frac 0.5 --drs_frac 0.67 --n_iters 600 \
     --sigma 1.0 --lr 0.01 --L 20 \
     --wandb_run full-all-modalities-obj-split
 ```
@@ -278,114 +282,37 @@ The `--modalities` flag accepts any subset of `V T FT G GF`. Disabled modalities
 
 ---
 
-## W&B Hyperparameter Sweep
+## W&B Hyperparameter Sweeps
 
-Save the following as `sweep.yaml`, then:
+Two focused sweep files are provided, each targeting a different research question. Both use all modalities and `split=object`.
+
 ```bash
-wandb sweep sweep.yaml          # prints <sweep-id>
+# Initialize a sweep (run once)
+wandb sweep sweep_data.yaml           # prints <sweep-id>
 wandb agent mrsd-smores/TEMU/<sweep-id>
+
+# Parallelism on Bridges-2: put wandb agent in a SLURM job script and sbatch multiple copies
 ```
 
-To run multiple agents in parallel across SLURM jobs, put `wandb agent ...` in your job script and submit multiple copies.
+> **⚠️ Sweep method choice:** `random` is preferred over `bayes` for mixed discrete+continuous params (optimizer, lr_scheduler, n_outputs). Bayesian optimization assumes continuous inputs, doesn't parallelize well across multiple SLURM agents, and underperforms random search on noisy objectives.
 
-### Modality interaction sweep (recommended starting point)
-Understand which modalities matter and how they interact.
+| File | Method | Runs | Question |
+|------|--------|------|----------|
+| [`sweep_data.yaml`](sweep_data.yaml) | grid | 15 | How does episode length and held-out object group affect generalization? |
+| [`sweep_optimizer.yaml`](sweep_optimizer.yaml) | random | unlimited | What optimizer, LR schedule, and architecture config maximize F1? |
 
-```yaml
-program: train.py
-method: grid
-metric:
-  name: val/f1
-  goal: maximize
+### sweep_data.yaml — data generalization (15 runs, grid)
 
-parameters:
-  # Fixed
-  root_dir:       { value: /ocean/projects/cis260031p/shared/dataset/Gelsight }
-  split:          { value: random }
-  n_iters:        { value: 600 }
-  anneal_iter:    { value: 300 }
-  drs_iter:       { value: 400 }
-  num_workers:    { value: 4 }
-  L:              { value: 20 }
-  lr:             { value: 0.01 }
-  sigma:          { value: 1.0 }
+Sweeps `L` (5–30 s) × `test_objects` (3 object groups). Everything else fixed. Grid is appropriate here because the space is small and you want exhaustive coverage.
 
-  # Sweep modality combinations
-  modalities:
-    values:
-      - [V, T, FT, G, GF]   # all
-      - [V, T]               # vision only
-      - [FT, G, GF]          # sensors only
-      - [V, T, FT]           # vision + force
-      - [T]                  # tactile only
-      - [V]                  # rgb only
-      - [V, FT, G, GF]       # no tactile
-      - [T, FT, G, GF]       # no rgb
-```
+### sweep_optimizer.yaml — training config (random, ~50–100 runs)
 
-### Full hyperparameter sweep
-```yaml
-program: train.py
-method: bayes
-metric:
-  name: val/f1
-  goal: maximize
+Sweeps optimizer, LR, scheduler, DRS timing, hidden_dim, dropout, lstm_layers, n_outputs, freeze strategy.
 
-parameters:
-  # Fixed
-  root_dir:    { value: /ocean/projects/cis260031p/shared/dataset/Gelsight }
-  split:       { value: random }
-  n_iters:     { value: 600 }
-  num_workers: { value: 4 }
-  L:           { value: 20 }
-  modalities:  { value: [V, T, FT, G, GF] }
+**Uses `--anneal_frac` and `--drs_frac`** (fractions of `n_iters`) to ensure LR drop and DRS activation always fire — no invalid combinations regardless of `n_iters`.
 
-  # Optimizer
-  optimizer:
-    values: [sgd, adamw]
-  lr:
-    distribution: log_uniform_values
-    min: 0.0001
-    max: 0.1
-  weight_decay:
-    distribution: log_uniform_values
-    min: 0.0001
-    max: 0.1
-
-  # LR schedule
-  lr_scheduler:
-    values: [step, cosine_warm, none]
-  anneal_iter:
-    values: [150, 300, 450]
-  cosine_t0:
-    values: [50, 100, 200]
-
-  # Architecture
-  hidden_dim:
-    values: [128, 256, 512]
-  lstm_layers:
-    values: [1, 2, 3]
-  dropout:
-    values: [0.0, 0.1, 0.3, 0.5]
-  n_outputs:
-    values: [1, 2]
-
-  # Freeze strategy
-  freeze:
-    values:
-      - [resnet_rgb, resnet_tactile]            # default — both ResNets frozen
-      - [resnet_rgb, resnet_tactile, projection] # freeze up to GRU
-      - [resnet_rgb, resnet_tactile, gru]        # freeze ResNets + GRU
-      - []                                       # train everything
-
-  # DRS
-  sigma:
-    values: [0.5, 1.0]
-  drs_iter:
-    values: [0, 200, 400]
-  batch_size:
-    values: [16, 32, 64]
-```
+> `--anneal_iter` / `--drs_iter` set absolute iteration numbers — they silently do nothing if > `n_iters`.
+> `--anneal_frac` / `--drs_frac` set them as a fraction of `n_iters` and are preferred in sweeps.
 
 ---
 

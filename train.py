@@ -148,6 +148,18 @@ def parse_args():
                         'Example: --freeze resnet_rgb resnet_tactile gru')
     p.add_argument('--clip_grad_norm', type=float, default=1.0,
                    help='Max gradient norm for clipping (0 = disabled)')
+    p.add_argument('--tau', type=float, default=0.0,
+                   help='Tau regularization: adds tau * ||W_majority||_2 to CE loss. '
+                        'Only active with --n_outputs 2. tau=0 disables it. '
+                        'Typical range: 0.001–0.1 (tau=1 adds the full weight norm, '
+                        'which is usually 3–10x larger than CE loss).')
+    # --- sweep-friendly iter fractions ---
+    p.add_argument('--anneal_frac', type=float, default=None,
+                   help='If set, anneal_iter = int(anneal_frac * n_iters). Overrides --anneal_iter. '
+                        'Use in sweeps so the LR drop stays proportional to training length.')
+    p.add_argument('--drs_frac', type=float, default=None,
+                   help='If set, drs_iter = int(drs_frac * n_iters). Overrides --drs_iter. '
+                        'Use in sweeps so DRS activation stays proportional to training length.')
     return p.parse_args()
 
 
@@ -243,6 +255,11 @@ def _ablation_eval(model, loader, criterion, device, active_modalities):
 
 def main():
     args   = parse_args()
+    # Fraction-based overrides — keep anneal/DRS milestones proportional to n_iters
+    if args.anneal_frac is not None:
+        args.anneal_iter = int(args.anneal_frac * args.n_iters)
+    if args.drs_frac is not None:
+        args.drs_iter = int(args.drs_frac * args.n_iters)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
@@ -360,7 +377,8 @@ def main():
         wandb.config.update({
             'n_params_total':       n_params_total,
             'n_params_trainable':   n_params_trainable,
-            'loss_fn':              'BCE' if args.n_outputs == 1 else 'CrossEntropy',
+            'loss_fn':              'BCE' if args.n_outputs == 1 else ('CrossEntropy+tau' if args.tau > 0 else 'CrossEntropy'),
+            'tau':                  args.tau,
             'optimizer_type':       args.optimizer,
             'scheduler_type':       args.lr_scheduler,
             'modalities_str':       '+'.join(sorted(args.modalities)),
@@ -415,6 +433,12 @@ def main():
                 loss = criterion(logits.squeeze(1), label.float())
             else:
                 loss = criterion(logits, label.long())
+                if args.tau > 0.0:
+                    # Tau regularization: penalize L2 norm of majority class (S=, class 0)
+                    # weight vector in the final classifier layer.
+                    # Pulls W_majority toward zero; leaves W_minority untouched.
+                    majority_w = model.classifier[-1].weight[0]  # shape: (64,)
+                    loss = loss + args.tau * majority_w.norm(2)
             loss.backward()
 
             # Gradient clipping + norm logging
