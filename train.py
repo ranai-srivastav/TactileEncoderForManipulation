@@ -414,8 +414,12 @@ def main():
             'class_balance_train':  n_pos / max(len(train_labels), 1),
         }, allow_val_change=True)
 
-    # checkpoint paths
-    save_dir    = os.path.dirname(args.model_save_path) or '.'
+    # checkpoint paths — use W&B run ID to avoid collisions between parallel agents
+    if use_wandb:
+        save_dir = os.path.join('trained_models', wandb.run.id)
+        args.model_save_path = os.path.join(save_dir, 'best_model.pt')
+    else:
+        save_dir = os.path.dirname(args.model_save_path) or '.'
     latest_path = os.path.join(save_dir, 'model_latest.pt')
     os.makedirs(save_dir, exist_ok=True)
 
