@@ -141,10 +141,10 @@ def parse_args():
     p.add_argument('--n_outputs',      type=int, default=1, choices=[1, 2],
                    help='Output head size: 1=BCEWithLogitsLoss, 2=CrossEntropyLoss')
     p.add_argument('--freeze',         nargs='*',
-                   choices=['resnet_rgb', 'resnet_tactile', 'projection', 'gru', 'classifier'],
                    default=['resnet_rgb', 'resnet_tactile'],
                    help='Components to freeze. Default: both ResNets. '
                         'Pass --freeze with no args to train everything. '
+                        'Choices: resnet_rgb, resnet_tactile, projection, gru, classifier. '
                         'Example: --freeze resnet_rgb resnet_tactile gru')
     p.add_argument('--clip_grad_norm', type=float, default=1.0,
                    help='Max gradient norm for clipping (0 = disabled)')
@@ -253,8 +253,24 @@ def _ablation_eval(model, loader, criterion, device, active_modalities):
     return results
 
 
+def _parse_wb_list(values):
+    """W&B passes nargs='*'/nargs='+' args as a Python-repr string, e.g.
+    \"['resnet_rgb', 'resnet_tactile']\" instead of separate tokens.
+    Detect and unwrap that case so --freeze and --modalities work in sweeps."""
+    import ast
+    if not values:
+        return []
+    if len(values) == 1 and values[0].startswith('['):
+        parsed = ast.literal_eval(values[0])
+        return [str(x) for x in parsed]
+    return values
+
+
 def main():
     args   = parse_args()
+    # Normalize list args that W&B may pass as a Python-repr string
+    args.freeze     = _parse_wb_list(args.freeze or [])
+    args.modalities = _parse_wb_list(args.modalities)
     # Fraction-based overrides — keep anneal/DRS milestones proportional to n_iters
     if args.anneal_frac is not None:
         args.anneal_iter = int(args.anneal_frac * args.n_iters)
