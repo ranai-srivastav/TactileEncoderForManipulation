@@ -17,6 +17,7 @@ python MBT/mbt_train.py --overfit --n_iters 100 --lr 0.001 --num_workers 0 \
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -41,27 +42,19 @@ from mbt_model import MBTGraspStability
 
 
 def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
-    """Print per-phase label distribution for the loaded dataset and each split.
-
-    Phases:
-      Grasp     — label for the grasping phase (stored as grasp_label; -1 = unknown)
-      Pose      — label for the pose phase (pose_label)
-      Stability — label for the stability/retract phase (label, used for training)
-    """
+    """Print per-phase label distribution for the loaded dataset and each split."""
 
     def _count(samples):
         c = {
-            'grasp':     [0, 0, 0],   # [pass, fail, unknown]
+            'grasp':     [0, 0, 0],
             'pose':      [0, 0, 0],
             'stability': [0, 0, 0],
         }
         for s in samples:
             g = s.get('grasp_label', -1)
             c['grasp'][0 if g == 0 else (1 if g == 1 else 2)] += 1
-
             p = s['pose_label'].item()
             c['pose'][0 if p == 0 else 1] += 1
-
             l = s['label'].item()
             c['stability'][0 if l == 0 else 1] += 1
         return c
@@ -104,7 +97,10 @@ def parse_args():
                    help='DRS target S≠/S= ratio. 0.5 = gentler resampling')
     p.add_argument('--drs_iter',     type=int,   default=400,
                    help='Iteration at which DRS activates (separate from LR anneal)')
-    p.add_argument('--batch_size',   type=int,   default=32)
+    p.add_argument('--batch_size',   type=int,   default=4,
+                   help='Micro-batch size per GPU forward pass (keep small for V100)')
+    p.add_argument('--grad_accum',   type=int,   default=8,
+                   help='Gradient accumulation steps. Effective batch = batch_size × grad_accum')
     p.add_argument('--lr',           type=float, default=1e-4,
                    help='Peak learning rate (default: 1e-4 for AdamW with frozen backbone)')
     p.add_argument('--weight_decay', type=float, default=0.01)
@@ -130,11 +126,11 @@ def parse_args():
     p.add_argument('--subsample',    type=float, default=1.0,
                    help='Fraction of dataset to use (e.g. 0.01 for 1%%)')
     p.add_argument('--wandb_project', type=str, default="TEMU",
-                   help='W&B project name. Default is `TEMU`. Set to None to disable W&B logging.')
+                   help='W&B project name. Set to None to disable W&B logging.')
     p.add_argument('--wandb_run',     type=str, default=None,
                    help='W&B run name (optional).')
     p.add_argument('--wandb_entity',  type=str, default="mrsd-smores",
-                   help='W&B entity/team. Default is "mrsd-smores". Set to None to disable W&B logging.')
+                   help='W&B entity/team. Set to None to disable W&B logging.')
     p.add_argument('--overfit', action='store_true',
                    help='Use a single sample for train/val/test to sanity-check the model.')
     p.add_argument("--model_save_path", type=str, default="trained_models/best_mbt_model.pt")
@@ -152,7 +148,6 @@ def make_split(dataset, args):
 
 def make_loader(subset, sampler=None, batch_size=32, num_workers=4, shuffle=False):
     if sampler is not None:
-        # batch_sampler controls both batching and shuffling — don't pass batch_size/shuffle
         return DataLoader(subset.dataset, batch_sampler=sampler,
                           num_workers=num_workers)
     return DataLoader(subset, batch_size=batch_size, shuffle=shuffle,
@@ -161,7 +156,7 @@ def make_loader(subset, sampler=None, batch_size=32, num_workers=4, shuffle=Fals
 
 def batch_to_device(batch, device):
     tac, rgb, ft, grip, gf, label, pose_label = batch
-    lengths = [tac.shape[1]] * tac.shape[0]  # uniform T since L is fixed
+    lengths = [tac.shape[1]] * tac.shape[0]
     return (
         tac.to(device),
         rgb.to(device),
@@ -181,8 +176,9 @@ def evaluate(model, loader, criterion, device):
     tp, fp, fn, n = 0, 0, 0, 0
     for batch in loader:
         tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
-        logits = model(tac, rgb, ft, grip, gf).squeeze(-1)   # (B, 1) → (B,)
-        total_loss += criterion(logits, label.float()).item() * len(label)
+        with torch.autocast('cuda', enabled=torch.cuda.is_available()):
+            logits = model(tac, rgb, ft, grip, gf).squeeze(-1)
+            total_loss += criterion(logits, label.float()).item() * len(label)
         preds  = logits > 0
         actual = label.bool()
         tp += (preds &  actual).sum().item()
@@ -211,6 +207,9 @@ def main():
         raise ValueError(
             f"Invalid modality keys: {bad_mods}. "
             f"Valid keys are: {sorted(valid_mods)}")
+
+    effective_batch = args.batch_size * args.grad_accum
+    print(f"Batch: {args.batch_size} micro × {args.grad_accum} accum = {effective_batch} effective")
 
     # W&B initialisation
     use_wandb = _WANDB_AVAILABLE and args.wandb_project is not None
@@ -245,15 +244,15 @@ def main():
         ds.samples = ds.samples[:1]
         overfit_set = Subset(ds, [0])
         train_set = val_set = test_set = overfit_set
-        args.anneal_iter = args.n_iters + 1   # disable LR anneal
-        args.drs_iter = args.n_iters + 1      # disable DRS (S≠ may be empty with 1 sample)
+        args.anneal_iter = args.n_iters + 1
+        args.drs_iter = args.n_iters + 1
         print("Overfit mode: using 1 sample for train/val/test, DRS disabled")
     else:
         train_set, val_set, test_set = make_split(ds, args)
         print(f"Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
         print_dataset_stats(ds, train_set, val_set, test_set)
 
-    # deferred sampling
+    # DRS sampler uses the micro-batch size (what the DataLoader actually yields)
     sampler = DRSSampler(
         dataset=ds,
         sigma=args.sigma,
@@ -265,14 +264,14 @@ def main():
     val_loader   = make_loader(val_set,   batch_size=args.batch_size, num_workers=args.num_workers)
     test_loader  = make_loader(test_set,  batch_size=args.batch_size, num_workers=args.num_workers)
 
-    # pos_weight: upweight minority (unstable) to avoid predicting only majority class
+    # pos_weight
     train_labels = [ds.samples[i]['label'].item() for i in train_set.indices]
     n_pos = sum(train_labels)
     n_neg = len(train_labels) - n_pos
     pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(device)
     print(f"pos_weight={pos_weight.item():.3f} (n_pos={n_pos}, n_neg={n_neg})")
 
-    # Model — pass max_timesteps=L so positional embedding tables are sized correctly
+    # Model
     model = MBTGraspStability(
         frames_per_sec=_dl.F1,
         ft_dim=FT_DIM,
@@ -286,7 +285,6 @@ def main():
         modalities=args.modalities,
     ).to(device)
 
-    # Print trainable vs frozen parameter counts
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {trainable:,} trainable / {total:,} total "
@@ -294,15 +292,12 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # AdamW is better suited than SGD for training adapters and lightweight blocks
-    # on top of a frozen backbone. Use differential learning rates: higher for the
-    # lightweight trainable blocks, lower for the AdaptFormer adapters.
+    # Differential learning rates: lightweight blocks full LR, adapters 10× lower
     adapter_params = []
     other_params   = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # AdaptFormer adapter parameters (down/up/scale in visual stream blocks)
         if any(k in name for k in ['_down.', '_up.', '_scale', '.down.', '.up.', '.scale']):
             adapter_params.append(param)
         else:
@@ -310,18 +305,20 @@ def main():
 
     optimizer = torch.optim.AdamW([
         {'params': other_params,   'lr': args.lr},
-        {'params': adapter_params, 'lr': args.lr * 0.1},  # adapters train slower
+        {'params': adapter_params, 'lr': args.lr * 0.1},
     ], weight_decay=args.weight_decay)
 
-    # Cosine annealing after warmup: constant LR until anneal_iter, then cosine decay
-    # to 0 over the remaining iterations
+    # Cosine annealing: constant LR until anneal_iter, then cosine decay to 0
     def lr_lambda(it):
         if it < args.anneal_iter:
             return 1.0
         progress = (it - args.anneal_iter) / max(args.n_iters - args.anneal_iter, 1)
-        return 0.5 * (1.0 + __import__('math').cos(__import__('math').pi * progress))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Mixed precision — cuts memory roughly in half for the frozen ViT forward passes
+    scaler = torch.GradScaler('cuda', enabled=torch.cuda.is_available())
 
     # checkpoint paths
     save_dir    = os.path.dirname(args.model_save_path) or '.'
@@ -331,6 +328,8 @@ def main():
     # training loop
     best_val_f1 = 0.0
     iteration   = 0
+    accum_step  = 0       # tracks micro-steps within one accumulation window
+    accum_loss  = 0.0     # running loss across accumulation steps
 
     while iteration < args.n_iters:
         model.train()
@@ -340,59 +339,72 @@ def main():
                 break
 
             # DRS activates at drs_iter
-            if iteration == args.drs_iter:
+            if iteration == args.drs_iter and accum_step == 0:
                 sampler.activate()
                 print(f"[iter {iteration}] DRS activated")
 
             tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
 
-            optimizer.zero_grad()
-            logits = model(tac, rgb, ft, grip, gf).squeeze(-1)  # (B, 1) → (B,)
-            loss   = criterion(logits, label.float())
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
+            # Forward pass with mixed precision
+            with torch.autocast('cuda', enabled=torch.cuda.is_available()):
+                logits = model(tac, rgb, ft, grip, gf).squeeze(-1)
+                loss   = criterion(logits, label.float()) / args.grad_accum
 
-            if iteration % 10 == 0 or iteration == args.n_iters - 1:
-                val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
-                    model, val_loader, criterion, device)
-                current_lr = optimizer.param_groups[0]['lr']
-                print(f"[iter {iteration:4d}] "
-                      f"train_loss={loss.item():.4f}  "
-                      f"val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%  "
-                      f"prec={val_prec:.3f}  rec={val_rec:.3f}  f1={val_f1:.3f}  "
-                      f"lr={current_lr:.2e}  "
-                      f"DRS={'on' if sampler.is_active else 'off'}")
+            # Backward (scaled for mixed precision)
+            scaler.scale(loss).backward()
+            accum_loss += loss.item() * args.grad_accum  # unscale for logging
+            accum_step += 1
 
-                if use_wandb:
-                    wandb.log({
-                        'iter':           iteration,
-                        'train/loss':     loss.item(),
-                        'val/loss':       val_loss,
-                        'val/acc':        val_acc,
-                        'val/precision':  val_prec,
-                        'val/recall':     val_rec,
-                        'val/f1':         val_f1,
-                        'drs_active':     int(sampler.is_active),
-                        'lr':             current_lr,
-                    }, step=iteration)
+            # Optimizer step after grad_accum micro-batches
+            if accum_step >= args.grad_accum:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
 
-                if val_f1 > best_val_f1:
-                    best_val_f1 = val_f1
-                    torch.save(model.state_dict(), args.model_save_path)
+                # Logging and evaluation
+                if iteration % 10 == 0 or iteration == args.n_iters - 1:
+                    val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
+                        model, val_loader, criterion, device)
+                    current_lr = optimizer.param_groups[0]['lr']
+                    avg_train_loss = accum_loss / args.grad_accum
+                    print(f"[iter {iteration:4d}] "
+                          f"train_loss={avg_train_loss:.4f}  "
+                          f"val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%  "
+                          f"prec={val_prec:.3f}  rec={val_rec:.3f}  f1={val_f1:.3f}  "
+                          f"lr={current_lr:.2e}  "
+                          f"DRS={'on' if sampler.is_active else 'off'}")
 
-                # Rolling latest checkpoint
-                if os.path.exists(latest_path):
-                    os.remove(latest_path)
-                torch.save(model.state_dict(), latest_path)
+                    if use_wandb:
+                        wandb.log({
+                            'iter':           iteration,
+                            'train/loss':     avg_train_loss,
+                            'val/loss':       val_loss,
+                            'val/acc':        val_acc,
+                            'val/precision':  val_prec,
+                            'val/recall':     val_rec,
+                            'val/f1':         val_f1,
+                            'drs_active':     int(sampler.is_active),
+                            'lr':             current_lr,
+                        }, step=iteration)
 
-                if use_wandb:
-                    wandb.save(latest_path, base_path=save_dir)
-                    if os.path.exists(args.model_save_path):
-                        wandb.save(args.model_save_path, base_path=save_dir)
+                    if val_f1 > best_val_f1:
+                        best_val_f1 = val_f1
+                        torch.save(model.state_dict(), args.model_save_path)
 
-            model.train()   # re-enable adapter dropout after evaluate()
-            iteration += 1
+                    if os.path.exists(latest_path):
+                        os.remove(latest_path)
+                    torch.save(model.state_dict(), latest_path)
+
+                    if use_wandb:
+                        wandb.save(latest_path, base_path=save_dir)
+                        if os.path.exists(args.model_save_path):
+                            wandb.save(args.model_save_path, base_path=save_dir)
+
+                model.train()
+                accum_step = 0
+                accum_loss = 0.0
+                iteration += 1
 
     # test
     print("\nLoading best checkpoint for test evaluation...")

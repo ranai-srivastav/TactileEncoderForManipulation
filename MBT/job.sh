@@ -12,6 +12,15 @@ conda activate /ocean/projects/cis260031p/shared/temu_conda
 cd /ocean/projects/cis260031p/mlee12/TactileEncoderForManipulation
 
 # MBT — 5-modality bottleneck fusion
-python MBT/train.py --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
-  --split random --modalities V T FT G GF --sigma 0.5 --n_iters 600 --anneal_iter 300 \
-  --batch_size 32 --lr 1e-4 --wandb_run mbt --L 9
+python MBT/mbt_train.py \
+  --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
+  --split random \
+  --modalities V T FT G GF \
+  --sigma 0.5 \
+  --n_iters 600 \
+  --anneal_iter 300 \
+  --batch_size 4 \
+  --grad_accum 8 \
+  --lr 1e-4 \
+  --wandb_run mbt \
+  --L 9
