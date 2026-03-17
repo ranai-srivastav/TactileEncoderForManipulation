@@ -310,9 +310,13 @@ class PoseItDataset(Dataset):
 
         self.samples = []
         skipped = 0
-        for d in dirs:
-            if not d.is_dir():
-                continue
+        all_dirs = [d for d in dirs if d.is_dir()]
+        n_dirs = len(all_dirs)
+        print(f"[dataloader] Scanning {n_dirs} episode folders  [L={L}, F1={F1}, F2={F2}]")
+        for i, d in enumerate(all_dirs):
+            if i > 0 and i % 50 == 0:
+                print(f"[dataloader] {i}/{n_dirs} folders scanned  "
+                      f"({len(self.samples)} loaded, {skipped} skipped so far)")
             try:
                 s = _build_sample(d)
                 if s is not None:
@@ -323,7 +327,7 @@ class PoseItDataset(Dataset):
                 print(f"[WARN] Skipping {d.name}: {e}")
                 skipped += 1
 
-        print(f"Loaded {len(self.samples)} samples ({skipped} skipped)  "
+        print(f"[dataloader] Done. {len(self.samples)} samples loaded, {skipped} skipped  "
               f"[L={L}, F1={F1}, F2={F2}, phase='{phase}']")
 
     def __len__(self) -> int:

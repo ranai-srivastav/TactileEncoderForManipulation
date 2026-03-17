@@ -35,7 +35,7 @@
 #SBATCH --error=logs/sweep_%A_%a.err
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SWEEP_ID="uwa7au73"   # e.g. "abc123de"
+SWEEP_ID="uwa7au73"   # e.g. "uwa7au73"
 ENTITY="mrsd-smores"
 PROJECT="TEMU"
 
