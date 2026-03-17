@@ -70,7 +70,7 @@ Key behaviors:
 ### model.py — `GraspStabilityLSTM`
 
 ```
-ResNet50 (frozen, 2048-d) × 2   ← tactile_encoder + rgb_encoder
+ResNet50 (frozen by default, 2048-d) × 2   ← tactile_encoder + rgb_encoder
 Per second t:
   tac_emb = tactile_encoder(tac[:,t])  → (B, F1*2048)
   rgb_emb = rgb_encoder(rgb[:,t])      → (B, F1*2048)
@@ -80,27 +80,33 @@ Per second t:
 
 sequence of L steps → N-layer GRU (bidirectional or unidirectional — controlled by args)
   → cat[forward at t=T-1, backward at t=0] → (B, hidden_dim*2)   [if bidirectional]
-  → FC(hidden*2→64) → ReLU → Dropout → FC(64→1) → (B, 1) logit
-
-Loss: BCEWithLogitsLoss (with pos_weight = n_neg/n_pos from train split)
-Predict: logit > 0 → slip/drop
+  → FC(hidden*2→64) → ReLU → Dropout → FC(64→n_outputs)
+    n_outputs=1: (B,1) logit → BCEWithLogitsLoss; predict: logit > 0
+    n_outputs=2: (B,2) logits → CrossEntropyLoss; predict: argmax
 ```
 
 Constructor args:
 ```python
 GraspStabilityLSTM(
-    frames_per_sec=1,      # F1 — image frames per second
-    ft_dim=6,              # FT_DIM = _dl.F2 * 6  (recomputed after CLI override)
-    gripper_dim=2,         # GR_DIM = _dl.F2 * 2  (recomputed after CLI override)
-    hidden_dim=256,        # --hidden_dim
-    lstm_layers=2,         # --lstm_layers
-    bidirectional=True,    # True unless --unidirectional
-    dropout=0.1,           # --dropout
-    freeze_resnet=True,
-    modalities=None,       # set of {'V','T','FT','G','GF'}; None = all active
+    frames_per_sec=1,             # F1 — image frames per second
+    ft_dim=6,                     # FT_DIM = _dl.F2 * 6  (recomputed after CLI override)
+    gripper_dim=2,                # GR_DIM = _dl.F2 * 2  (recomputed after CLI override)
+    hidden_dim=256,               # --hidden_dim
+    lstm_layers=2,                # --lstm_layers
+    bidirectional=True,           # True unless --unidirectional
+    dropout=0.1,                  # --dropout
+    freeze_resnet_rgb=True,       # 'resnet_rgb'     in --freeze
+    freeze_resnet_tactile=True,   # 'resnet_tactile' in --freeze
+    freeze_projection=False,      # 'projection'     in --freeze
+    freeze_gru=False,             # 'gru'            in --freeze
+    freeze_classifier=False,      # 'classifier'     in --freeze
+    n_outputs=1,                  # --n_outputs (1=BCE, 2=CE)
+    modalities=None,              # set of {'V','T','FT','G','GF'}; None = all active
 )
 ```
 Note: uses `nn.GRU` internally despite the class name `GraspStabilityLSTM`.
+`model.n_outputs` stored for use in `evaluate()` to select prediction path.
+`train()` override keeps frozen encoders in `eval()` mode so their BN stats do not drift.
 
 Modality masking: disabled modalities zeroed before any encoder (in `forward`).
 Keys: `V`=RGB, `T`=tactile, `FT`=force-torque, `G`=gripper, `GF`=gripper_force.
@@ -109,33 +115,44 @@ Keys: `V`=RGB, `T`=tactile, `FT`=force-torque, `G`=gripper, `GF`=gripper_force.
 
 Key CLI args:
 ```
---root_dir        path to dataset (default ./data)
---split           object | pose | random
---test_objects    used with --split object
---test_poses      used with --split pose
---sigma           DRS target S≠/S= ratio (default 0.5)
---drs_iter        iteration at which DRS activates (default 400; decoupled from LR anneal)
---anneal_iter     iteration at which LR is stepped down via StepLR (default 300)
---batch_size      default 32
---lr              default 0.01 (SGD with momentum=0.9)
---weight_decay    default 0.01
---dropout         default 0.1
---hidden_dim      default 256
---lstm_layers     default 2
---unidirectional  flag: use unidirectional GRU (default: bidirectional)
---n_iters         total training iterations
---num_workers     default 4
---modalities      e.g. --modalities V T FT  (subset to activate)
---L               max seconds per episode (default 20)
---F1              image frames per second (default 1; sets dataloader.F1)
---F2              sensor readings per second (default 1; sets dataloader.F2)
---subsample       fraction of dataset to load (e.g. 0.01 for quick tests)
---wandb_project   W&B project name (default "TEMU"; set to None to disable)
---wandb_run       W&B run name (optional)
---wandb_entity    W&B entity/team (default "mrsd-smores")
---overfit         flag: use 1 sample for train/val/test — sanity-check mode
---model_save_path path for best checkpoint (default "trained_models/best_model.pt");
-                  `model_latest.pt` is saved in the same directory
+--root_dir          path to dataset (default ./data)
+--split             object | pose | random
+--test_objects      used with --split object
+--test_poses        used with --split pose
+--sigma             DRS target S≠/S= ratio (default 0.5)
+--drs_iter          iteration at which DRS activates (default 400; decoupled from LR anneal)
+--anneal_iter       iteration at which StepLR steps down (default 300; only for --lr_scheduler step)
+--batch_size        default 32
+--lr                default 0.01
+--weight_decay      default 0.01
+--dropout           default 0.1
+--hidden_dim        default 256
+--lstm_layers       default 2
+--unidirectional    flag: use unidirectional GRU (default: bidirectional)
+--n_iters           total training iterations
+--num_workers       default 4
+--modalities        e.g. --modalities V T FT  (subset to activate)
+--L                 max seconds per episode (default 20)
+--F1                image frames per second (default 1; sets dataloader.F1)
+--F2                sensor readings per second (default 1; sets dataloader.F2)
+--subsample         fraction of dataset to load (e.g. 0.01 for quick tests)
+--wandb_project     W&B project name (default "TEMU"; set to None to disable)
+--wandb_run         W&B run name (optional)
+--wandb_entity      W&B entity/team (default "mrsd-smores")
+--overfit           flag: use 1 sample for train/val/test — sanity-check mode
+--model_save_path   path for best checkpoint (default "trained_models/best_model.pt");
+                    `model_latest.pt` is saved in the same directory
+# --- sweep / optimizer ---
+--optimizer         sgd (momentum=0.9) | adamw  (default: sgd)
+--lr_scheduler      step | cosine_warm | none  (default: step)
+--cosine_t0         T_0 for CosineAnnealingWarmRestarts (default 100)
+--cosine_t_mult     T_mult (default 2)
+# --- architecture ---
+--n_outputs         1 (BCE) | 2 (CrossEntropy)  (default: 1)
+--freeze            list of components to freeze (default: resnet_rgb resnet_tactile)
+                    choices: resnet_rgb, resnet_tactile, projection, gru, classifier
+                    pass --freeze with no args to train everything end-to-end
+--clip_grad_norm    max gradient norm (default 1.0; 0 = disabled)
 ```
 
 Execution flow:
@@ -143,17 +160,24 @@ Execution flow:
 2. Load dataset, optionally subsample (`max(4, int(N * subsample))` samples)
 3. If `--overfit`: shrink to 1 sample, use it for train/val/test, disable DRS and LR anneal
    Else: split → `print_dataset_stats` (per-phase pass/fail/unknown for all/train/val/test)
-4. Compute `pos_weight = n_neg / n_pos` from train split labels; pass to `BCEWithLogitsLoss`
+4. Compute `pos_weight = n_neg / n_pos` from train split labels
 5. Create `DRSSampler` (inactive until `drs_iter`)
-6. Build model, criterion=`BCEWithLogitsLoss(pos_weight=pos_weight)`, optimizer=SGD, scheduler=StepLR(step_size=1, gamma=0.1)
-7. Training loop: every 10 iters — evaluate, log metrics to console + W&B, then:
+6. Build model, criterion (BCE or CE), optimizer (SGD or AdamW), scheduler (StepLR/CosineWarm/None)
+7. W&B `config.update` — adds derived stats: `n_params_total`, `n_params_trainable`, `loss_fn`,
+   `optimizer_type`, `scheduler_type`, `modalities_str`, `n_active_modalities`, freeze flags,
+   `n_train/val/test`, `n_pos_train`, `n_neg_train`, `pos_weight_value`, `class_balance_train`
+8. Training loop: every 10 iters — evaluate, log metrics to console + W&B, then:
    - Save `best_model.pt` when `val_f1 > best_val_f1` (no DRS gate)
    - Save rolling `model_latest.pt` in same dir (delete previous before writing)
    - `model.train()` called at top of while loop and after each evaluate block
-8. Test evaluation: loads **both** `best_model.pt` and `model_latest.pt`, reports metrics for each;
-   missing checkpoints print `[WARN]` and are skipped (no crash)
+9. Test evaluation: loads **both** `best_model.pt` and `model_latest.pt`, reports metrics for each;
+   missing checkpoints print `[WARN]` and are skipped. After `best_model` eval, runs modality
+   ablation (drop one modality at a time) and logs F1 drop per modality.
 
-`evaluate()` returns: `(loss, acc, precision, recall, f1)` — binary classification metrics.
+`evaluate()` returns 8-tuple: `(loss, acc, precision, recall, f1, tpr, tnr, pos_pred_rate)`
+- `tpr` = sensitivity (recall on positives)
+- `tnr` = specificity (recall on negatives)
+- `ppr` = positive prediction rate (near-0 means model collapsed to predicting all-negative)
 
 `batch_to_device(batch, device)`:
 - Unpacks 7-tuple from default PyTorch collate
@@ -192,8 +216,8 @@ F1 = _dl.F1; F2 = _dl.F2; FT_DIM = _dl.F2 * 6; GR_DIM = _dl.F2 * 2
 | File | Status | Notes |
 |------|--------|-------|
 | `dataloader.py` | ✅ Current | All bugs fixed; `uniform_random_split` guards empty splits |
-| `model.py` | ✅ Current | ResNet50, modality masking, flat concat, GRU (bidirectional/unidirectional selectable); correct BiLSTM readout |
-| `train.py` | ✅ Current | SGD + StepLR; pos_weight; DRS decoupled from LR anneal; dual test eval; all CLI args propagate correctly |
+| `model.py` | ✅ Current | ResNet50, modality masking, flat concat, GRU; per-component freeze (5 components); n_outputs (1=BCE, 2=CE) |
+| `train.py` | ✅ Current | Sweep-ready: optimizer (SGD/AdamW), scheduler (step/cosine_warm/none), n_outputs, `--freeze` list, rich W&B logging, modality ablation at test |
 | `sampler.py` | ✅ Current | DRS fixed: `replace` guard, `sigma < r` check |
 | `test.ipynb` | ✅ Current | F1_CFG/F2_CFG/HIDDEN_DIM in Section 0; proper override in Section 1; frames_per_sec=F1 throughout |
 | `README.md` | ⚠ Stale | See TODO.md #6 |
@@ -228,6 +252,16 @@ python train.py --split random --anneal_iter 300 --drs_iter 400 --n_iters 600 \
     --L 20 --modalities V T FT G GF \
     --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight
 
+# AdamW + cosine warm restart sweep candidate
+python train.py --split random --optimizer adamw --lr 3e-4 \
+    --lr_scheduler cosine_warm --cosine_t0 100 --cosine_t_mult 2 \
+    --n_iters 600 --modalities V T FT G GF \
+    --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight
+
+# Vision-only ablation (sweep modality interactions)
+python train.py --split random --modalities V --n_iters 600 \
+    --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight
+
 # Dataloader smoke test
 python dataloader.py /ocean/projects/cis260031p/shared/dataset/Gelsight
 
@@ -242,8 +276,9 @@ python visualize_sampler.py --root /ocean/projects/cis260031p/shared/dataset/Gel
 
 - **ResNet50** chosen over ResNet18 for vision backbone
 - **Flat concat** for FT/gripper (no small MLP encoders) — matches `parth_dev` style
-- **BCEWithLogitsLoss + pos_weight** — pos_weight = n_neg/n_pos computed from train split each run
-- **SGD + StepLR** (step at `anneal_iter`, gamma=0.1); **DRS decoupled** — activates at `drs_iter` (default 400, after LR drop at 300)
+- **Loss function** selectable: BCE (n_outputs=1) or CrossEntropy (n_outputs=2); both use pos_weight = n_neg/n_pos
+- **Optimizer** selectable: SGD (momentum=0.9) or AdamW via `--optimizer`
+- **Scheduler** selectable: StepLR (step at `anneal_iter`, gamma=0.1), CosineAnnealingWarmRestarts (stepped every iter), or none; **DRS decoupled** — activates at `drs_iter` (default 400)
 - **GRU** used internally (class still named `GraspStabilityLSTM`); `lstm_layers` and `bidirectional` are constructor args
 - **BiLSTM readout**: `cat[lstm_out[:,-1,:h], lstm_out[:,0,h:]]` — forward at T + backward at 0
 - **L enforced in dataloader** (not in model.forward) — `_build_sample` drops sequences shorter than L; clips longer ones to `seconds[-L:]` (last L seconds, closest to stability event)

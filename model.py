@@ -1,5 +1,3 @@
-from itertools import chain
-
 import torch
 import torch.nn as nn
 from torchvision.models import resnet50, ResNet50_Weights
@@ -47,7 +45,12 @@ class GraspStabilityLSTM(nn.Module):
         lstm_layers: int = 2,
         bidirectional: bool = True,
         dropout: float = 0.1,
-        freeze_resnet: bool = True,
+        freeze_resnet_rgb: bool = True,      # freeze RGB ResNet50
+        freeze_resnet_tactile: bool = True,  # freeze tactile ResNet50
+        freeze_projection: bool = False,     # freeze per-second projection MLP
+        freeze_gru: bool = False,            # freeze GRU
+        freeze_classifier: bool = False,     # freeze final classifier MLP
+        n_outputs: int = 1,        # 1 = BCEWithLogitsLoss head; 2 = CrossEntropyLoss head
         modalities=None,           # collection of {'V','T','FT','G','GF'}; None = all
     ):
         super().__init__()
@@ -56,6 +59,7 @@ class GraspStabilityLSTM(nn.Module):
         self.gripper_dim    = gripper_dim
         self.modalities     = set(modalities or ['V', 'T', 'FT', 'G', 'GF'])
         self.bidirectional  = bidirectional
+        self.n_outputs      = n_outputs
 
         # --- vision encoders (ResNet50, FC stripped → 2048-d) ---
         self.rgb_encoder        = resnet50(weights=ResNet50_Weights.DEFAULT)
@@ -63,12 +67,15 @@ class GraspStabilityLSTM(nn.Module):
         self.tactile_encoder    = resnet50(weights=ResNet50_Weights.DEFAULT)
         self.tactile_encoder.fc = nn.Identity()  # type: ignore[assignment]
 
-        if freeze_resnet:
-            for p in chain(self.rgb_encoder.parameters(),
-                           self.tactile_encoder.parameters()):
+        if freeze_resnet_rgb:
+            for p in self.rgb_encoder.parameters():
+                p.requires_grad = False
+        if freeze_resnet_tactile:
+            for p in self.tactile_encoder.parameters():
                 p.requires_grad = False
 
         # --- per-second fusion projection ---
+        # (freeze_projection applied after construction)
         # concat: [tac_emb (F1*2048), rgb_emb (F1*2048), ft (FT_DIM), grip (GR_DIM), gf (1)]
         pre_lstm_dim = frames_per_sec * self.RESNET_EMB * 2 + ft_dim + gripper_dim + 1
         self.projection = nn.Sequential(
@@ -90,6 +97,13 @@ class GraspStabilityLSTM(nn.Module):
             bidirectional=bidirectional,
             dropout=dropout if lstm_layers > 1 else 0.0,
         )
+        if freeze_projection:
+            for p in self.projection.parameters():
+                p.requires_grad = False
+
+        if freeze_gru:
+            for p in self.lstm.parameters():
+                p.requires_grad = False
 
         # --- classifier (hidden_dim * 2 if bidirectional else hidden_dim) ---
         classifier_in = hidden_dim * 2 if bidirectional else hidden_dim
@@ -97,13 +111,19 @@ class GraspStabilityLSTM(nn.Module):
             nn.Linear(classifier_in, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(64, 1),
+            nn.Linear(64, n_outputs),  # 1 = BCE logit; 2 = CE logits
         )
+        if freeze_classifier:
+            for p in self.classifier.parameters():
+                p.requires_grad = False
 
     def train(self, mode=True):
         super().train(mode)
-        self.rgb_encoder.eval()
-        self.tactile_encoder.eval()
+        # Keep frozen encoders in eval mode — their BN stats should not drift
+        if not any(p.requires_grad for p in self.rgb_encoder.parameters()):
+            self.rgb_encoder.eval()
+        if not any(p.requires_grad for p in self.tactile_encoder.parameters()):
+            self.tactile_encoder.eval()
         return self
 
     def forward(self, tactile, rgb, ft, gripper, gripper_force):

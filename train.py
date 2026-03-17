@@ -125,6 +125,29 @@ def parse_args():
     p.add_argument('--overfit', action='store_true',
                    help='Use a single sample for train/val/test to sanity-check the model.')
     p.add_argument("--model_save_path", type=str, default="trained_models/best_model.pt")
+
+    # --- optimizer / scheduler ---
+    p.add_argument('--optimizer',     default='sgd', choices=['sgd', 'adamw'],
+                   help='Optimizer: sgd (momentum=0.9) or adamw')
+    p.add_argument('--lr_scheduler',  default='step', choices=['step', 'cosine_warm', 'none'],
+                   help='LR schedule: step (StepLR at anneal_iter), cosine_warm '
+                        '(CosineAnnealingWarmRestarts every iter), none')
+    p.add_argument('--cosine_t0',     type=int, default=100,
+                   help='T_0 for CosineAnnealingWarmRestarts (iters per first cycle)')
+    p.add_argument('--cosine_t_mult', type=int, default=2,
+                   help='T_mult for CosineAnnealingWarmRestarts (cycle length multiplier)')
+
+    # --- architecture extras ---
+    p.add_argument('--n_outputs',      type=int, default=1, choices=[1, 2],
+                   help='Output head size: 1=BCEWithLogitsLoss, 2=CrossEntropyLoss')
+    p.add_argument('--freeze',         nargs='*',
+                   choices=['resnet_rgb', 'resnet_tactile', 'projection', 'gru', 'classifier'],
+                   default=['resnet_rgb', 'resnet_tactile'],
+                   help='Components to freeze. Default: both ResNets. '
+                        'Pass --freeze with no args to train everything. '
+                        'Example: --freeze resnet_rgb resnet_tactile gru')
+    p.add_argument('--clip_grad_norm', type=float, default=1.0,
+                   help='Max gradient norm for clipping (0 = disabled)')
     return p.parse_args()
 
 
@@ -163,27 +186,59 @@ def batch_to_device(batch, device):
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
+    """
+    Returns 8-tuple:
+        (loss, acc, precision, recall, f1, tpr, tnr, pos_pred_rate)
+
+    tpr  = TP / (TP+FN)  — recall on positives (sensitivity)
+    tnr  = TN / (TN+FP)  — recall on negatives (specificity)
+    ppr  = (TP+FP) / N   — fraction of predictions that are positive
+                           (near-0 means model collapsed to predicting all-negative)
+    """
     model.eval()
     total_loss = 0.0
     tp, fp, fn, n = 0, 0, 0, 0
     for batch in loader:
         tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
-        logits = model(tac, rgb, ft, grip, gf).squeeze(1)   # (B,)
-        total_loss += criterion(logits, label.float()).item() * len(label)
-        preds  = logits > 0
+        logits = model(tac, rgb, ft, grip, gf)
+        if model.n_outputs == 1:
+            logits = logits.squeeze(1)                 # (B,)
+            total_loss += criterion(logits, label.float()).item() * len(label)
+            preds = logits > 0
+        else:
+            total_loss += criterion(logits, label.long()).item() * len(label)
+            preds = logits.argmax(1).bool()
         actual = label.bool()
         tp += (preds &  actual).sum().item()
         fp += (preds & ~actual).sum().item()
         fn += (~preds & actual).sum().item()
         n  += len(label)
     if n == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
-    acc       = (tp + (n - tp - fp - fn)) / n
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    tn        = n - tp - fp - fn
+    acc       = (tp + tn) / n
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1        = (2 * precision * recall / (precision + recall)
                  if (precision + recall) > 0 else 0.0)
-    return total_loss / n, acc, precision, recall, f1
+    tpr       = recall                                 # same as recall
+    tnr       = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    ppr       = (tp + fp) / n                         # positive prediction rate
+    return total_loss / n, acc, precision, recall, f1, tpr, tnr, ppr
+
+
+@torch.no_grad()
+def _ablation_eval(model, loader, criterion, device, active_modalities):
+    """Zero one modality at a time. Returns {modality: f1} for each active modality."""
+    original = model.modalities.copy()
+    results = {}
+    for ablate in sorted(active_modalities):
+        model.modalities = original - {ablate}
+        model.eval()
+        *_, f1, _, _, _ = evaluate(model, loader, criterion, device)
+        results[ablate] = f1
+    model.modalities = original
+    return results
 
 
 def main():
@@ -255,6 +310,7 @@ def main():
     print(f"pos_weight={pos_weight.item():.3f} (n_pos={n_pos}, n_neg={n_neg})")
 
     # Model
+    freeze_set = set(args.freeze or [])
     model = GraspStabilityLSTM(
         frames_per_sec=args.F1,
         ft_dim=FT_DIM,
@@ -263,17 +319,66 @@ def main():
         lstm_layers=args.lstm_layers,
         bidirectional=not args.unidirectional,
         dropout=args.dropout,
+        freeze_resnet_rgb=     ('resnet_rgb'      in freeze_set),
+        freeze_resnet_tactile= ('resnet_tactile'  in freeze_set),
+        freeze_projection=     ('projection'      in freeze_set),
+        freeze_gru=            ('gru'             in freeze_set),
+        freeze_classifier=     ('classifier'      in freeze_set),
+        n_outputs=args.n_outputs,
         modalities=args.modalities,
     ).to(device)
 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.SGD(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        momentum=0.9,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.1)
+    # Loss — BCE for single logit, weighted CE for two logits
+    if args.n_outputs == 1:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:
+        ce_weight = torch.tensor([1.0, pos_weight.item()], dtype=torch.float32).to(device)
+        criterion = nn.CrossEntropyLoss(weight=ce_weight)
+
+    # Optimizer
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    if args.optimizer == 'sgd':
+        optimizer = torch.optim.SGD(
+            trainable_params, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+    else:  # adamw
+        optimizer = torch.optim.AdamW(
+            trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+
+    # LR scheduler
+    if args.lr_scheduler == 'step':
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.1)
+    elif args.lr_scheduler == 'cosine_warm':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=args.cosine_t0, T_mult=args.cosine_t_mult)
+    else:
+        scheduler = None
+
+    # W&B: log derived model + data stats not captured in args
+    if use_wandb:
+        n_params_total     = sum(p.numel() for p in model.parameters())
+        n_params_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        wandb.config.update({
+            'n_params_total':       n_params_total,
+            'n_params_trainable':   n_params_trainable,
+            'loss_fn':              'BCE' if args.n_outputs == 1 else 'CrossEntropy',
+            'optimizer_type':       args.optimizer,
+            'scheduler_type':       args.lr_scheduler,
+            'modalities_str':       '+'.join(sorted(args.modalities)),
+            'n_active_modalities':  len(args.modalities),
+            'freeze_components':        sorted(freeze_set),
+            'freeze_resnet_rgb':        'resnet_rgb'     in freeze_set,
+            'freeze_resnet_tactile':    'resnet_tactile' in freeze_set,
+            'freeze_projection':        'projection'     in freeze_set,
+            'freeze_gru':               'gru'            in freeze_set,
+            'freeze_classifier':        'classifier'     in freeze_set,
+            'n_train':              len(train_set),
+            'n_val':                len(val_set),
+            'n_test':               len(test_set),
+            'n_pos_train':          n_pos,
+            'n_neg_train':          n_neg,
+            'pos_weight_value':     pos_weight.item(),
+            'class_balance_train':  n_pos / max(len(train_labels), 1),
+        }, allow_val_change=True)
 
     # checkpoint paths
     save_dir    = os.path.dirname(args.model_save_path) or '.'
@@ -291,10 +396,12 @@ def main():
             if iteration >= args.n_iters:
                 break
 
-            # LR anneal at anneal_iter (paper: 10x drop at iter 300)
-            if iteration == args.anneal_iter:
-                scheduler.step()
-                print(f"[iter {iteration}] LR annealed to {scheduler.get_last_lr()}")
+            # LR anneal / schedule
+            if args.lr_scheduler == 'step' and iteration == args.anneal_iter:
+                scheduler.step()  # type: ignore[union-attr]
+                print(f"[iter {iteration}] LR annealed to {optimizer.param_groups[0]['lr']:.2e}")
+            elif args.lr_scheduler == 'cosine_warm' and scheduler is not None:
+                scheduler.step(iteration)
             # DRS activates at drs_iter (decoupled; can be later to avoid overcorrection)
             if iteration == args.drs_iter:
                 sampler.activate()
@@ -303,31 +410,52 @@ def main():
             tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
 
             optimizer.zero_grad()
-            logits = model(tac, rgb, ft, grip, gf).squeeze(1)  # (B,)
-            loss   = criterion(logits, label.float())
+            logits = model(tac, rgb, ft, grip, gf)
+            if args.n_outputs == 1:
+                loss = criterion(logits.squeeze(1), label.float())
+            else:
+                loss = criterion(logits, label.long())
             loss.backward()
+
+            # Gradient clipping + norm logging
+            if args.clip_grad_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.clip_grad_norm).item()
+            else:
+                grad_norm = sum(
+                    p.grad.norm().item() ** 2
+                    for p in model.parameters() if p.grad is not None
+                ) ** 0.5
+
             optimizer.step()
 
             if iteration % 10 == 0 or iteration == args.n_iters - 1:
-                val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
+                val_loss, val_acc, val_prec, val_rec, val_f1, val_tpr, val_tnr, val_ppr = evaluate(
                     model, val_loader, criterion, device)
+                current_lr = optimizer.param_groups[0]['lr']
                 print(f"[iter {iteration:4d}] "
                       f"train_loss={loss.item():.4f}  "
                       f"val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%  "
                       f"prec={val_prec:.3f}  rec={val_rec:.3f}  f1={val_f1:.3f}  "
+                      f"tpr={val_tpr:.3f}  tnr={val_tnr:.3f}  ppr={val_ppr:.3f}  "
                       f"DRS={'on' if sampler.is_active else 'off'}")
 
                 if use_wandb:
                     wandb.log({
-                        'iter':           iteration,
-                        'train/loss':     loss.item(),
-                        'val/loss':       val_loss,
-                        'val/acc':        val_acc,
-                        'val/precision':  val_prec,
-                        'val/recall':     val_rec,
-                        'val/f1':         val_f1,
-                        'drs_active':     int(sampler.is_active),
-                        'lr':             scheduler.get_last_lr()[0],
+                        'iter':                   iteration,
+                        'train/loss':             loss.item(),
+                        'train/grad_norm':        grad_norm,
+                        'train/batch_size_actual': len(label),
+                        'val/loss':               val_loss,
+                        'val/acc':                val_acc,
+                        'val/precision':          val_prec,
+                        'val/recall':             val_rec,
+                        'val/f1':                 val_f1,
+                        'val/tpr':                val_tpr,
+                        'val/tnr':                val_tnr,
+                        'val/pos_pred_rate':      val_ppr,
+                        'drs_active':             int(sampler.is_active),
+                        'lr':                     current_lr,
                     }, step=iteration)
 
                 if val_f1 > best_val_f1:
@@ -350,28 +478,46 @@ def main():
 
     # test — evaluate both best_model.pt and model_latest.pt
     print("\n=== Test evaluation ===")
+    best_test_f1 = None
     for ckpt_label, ckpt_path in [("best_model", args.model_save_path), ("model_latest", latest_path)]:
         if not os.path.exists(ckpt_path):
             print(f"[WARN] {ckpt_path} not found — skipping")
             continue
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
-        test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(
+        test_loss, test_acc, test_prec, test_rec, test_f1, test_tpr, test_tnr, test_ppr = evaluate(
             model, test_loader, criterion, device)
         print(f"[{ckpt_label}] loss={test_loss:.4f}  acc={test_acc*100:.2f}%  "
-              f"prec={test_prec:.3f}  rec={test_rec:.3f}  f1={test_f1:.3f}")
+              f"prec={test_prec:.3f}  rec={test_rec:.3f}  f1={test_f1:.3f}  "
+              f"tpr={test_tpr:.3f}  tnr={test_tnr:.3f}  ppr={test_ppr:.3f}")
         if use_wandb:
-            wandb.log({
-                f'test_{ckpt_label}/loss':      test_loss,
-                f'test_{ckpt_label}/acc':       test_acc,
-                f'test_{ckpt_label}/precision': test_prec,
-                f'test_{ckpt_label}/recall':    test_rec,
-                f'test_{ckpt_label}/f1':        test_f1,
-            }, step=args.n_iters - 1)
-            wandb.run.summary.update({
-                f'test_{ckpt_label}/loss': test_loss, f'test_{ckpt_label}/acc': test_acc,
-                f'test_{ckpt_label}/precision': test_prec,
-                f'test_{ckpt_label}/recall': test_rec, f'test_{ckpt_label}/f1': test_f1,
-            })
+            summary = {
+                f'test_{ckpt_label}/loss':         test_loss,
+                f'test_{ckpt_label}/acc':          test_acc,
+                f'test_{ckpt_label}/precision':    test_prec,
+                f'test_{ckpt_label}/recall':       test_rec,
+                f'test_{ckpt_label}/f1':           test_f1,
+                f'test_{ckpt_label}/tpr':          test_tpr,
+                f'test_{ckpt_label}/tnr':          test_tnr,
+                f'test_{ckpt_label}/pos_pred_rate': test_ppr,
+            }
+            wandb.log(summary, step=args.n_iters - 1)
+            wandb.run.summary.update(summary)
+
+        # Modality ablation on best_model checkpoint
+        if ckpt_label == "best_model" and len(args.modalities) > 1:
+            print(f"\n  [ablation on {ckpt_label}]")
+            ablation = _ablation_eval(model, test_loader, criterion, device, set(args.modalities))
+            for mod, abl_f1 in ablation.items():
+                drop = test_f1 - abl_f1
+                print(f"    drop_{mod}: f1={abl_f1:.3f}  Δf1={-drop:+.3f}")
+            if use_wandb:
+                abl_log = {}
+                for mod, abl_f1 in ablation.items():
+                    abl_log[f'test_best/ablation_no_{mod}'] = abl_f1
+                    abl_log[f'test_best/ablation_drop_{mod}'] = test_f1 - abl_f1
+                wandb.log(abl_log, step=args.n_iters - 1)
+                wandb.run.summary.update(abl_log)
+            best_test_f1 = test_f1
 
     if use_wandb:
         wandb.finish()
