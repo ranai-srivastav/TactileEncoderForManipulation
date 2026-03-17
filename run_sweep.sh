@@ -27,7 +27,8 @@
 #SBATCH --gres=gpu:v100-32:1      # 1 V100-32GB per agent
 #SBATCH --ntasks-per-node=1       # 1 process per job (not MPI)
 #SBATCH --cpus-per-task=5         # 4 dataloader workers + 1 main
-#SBATCH --time=02:30:00           # 2.5 h wall time (n_iters=1200 ≈ 2 h)
+#SBATCH --time=40:00:00           # ~40 h = 19 runs × 2 h each (96 configs ÷ 5 agents)
+                                  # max for gpushared QOS is 2 days (48 h)
 #SBATCH --array=0-4               # ← 5 parallel agents; increase if cluster has headroom
 #SBATCH -A cis260031p             # your allocation
 #SBATCH --output=logs/sweep_%A_%a.out
