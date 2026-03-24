@@ -184,13 +184,14 @@ def _list_image_files(folder: Path) -> List[Tuple[int, int, Path]]:
     return triples
 
 
-def _load_image(path: Optional[Path]) -> torch.Tensor:
+def _load_image(path: Optional[Path], transform=None) -> torch.Tensor:
     if path is None or not path.exists():
         return torch.zeros(3, *IMAGE_SIZE)
-    return IMG_TRANSFORM(Image.open(path).convert('RGB'))
+    t = transform if transform is not None else IMG_TRANSFORM
+    return t(Image.open(path).convert('RGB'))
 
 
-def _build_sample(sample_dir: Path) -> Optional[dict]:
+def _build_sample(sample_dir: Path, rgb_transform=None) -> Optional[dict]:
     meta   = _parse_folder_name(sample_dir.name)
     stages = _read_stages(sample_dir / 'stages.csv')
     labels = _read_labels(sample_dir / 'label.csv')
@@ -211,9 +212,14 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
     # T consecutive seconds: [t_grasp, t_grasp+1, ..., t_stability-1]
     seconds = list(range(t_grasp, t_stability))
     if L is not None:
+        # Fixed-length mode: clip to last L seconds, drop if too short
         if len(seconds) < L:
             return None          # too short — drop
         seconds = seconds[-L:]   # keep last L seconds (closest to stability)
+    else:
+        # Variable-length mode: keep full range, drop very short sequences
+        if len(seconds) < 3:
+            return None          # min 3 seconds
     if not seconds:
         return None
 
@@ -232,9 +238,9 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
     for ts, _, p in rgb_files:
         rgb_by_sec.setdefault(ts, []).append(p)
 
-    # GelSight baseline: first frame of the first second
+    # GelSight baseline: first frame of the first second (always ImageNet transform)
     baseline_paths = gel_by_sec.get(t_grasp, [])
-    baseline = _load_image(baseline_paths[0] if baseline_paths else None)
+    baseline = _load_image(baseline_paths[0] if baseline_paths else None, IMG_TRANSFORM)
 
     ft_seq      = []
     gr_seq      = []
@@ -268,7 +274,7 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
             print(f"[WARN] {sample_dir.name}: only {len(gel_by_sec.get(sec, []))} GelSight frames "
                   f"in second {sec}, need F1={F1}. Skipping sample.")
             return None
-        gel_frames = torch.stack([_load_image(p) - baseline for p in gel_paths])
+        gel_frames = torch.stack([_load_image(p, IMG_TRANSFORM) - baseline for p in gel_paths])
         tactile_seq.append(gel_frames)                          # (F1, 3, H, W)
 
         # RGB: F1 frames from this second
@@ -277,7 +283,8 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
             print(f"[WARN] {sample_dir.name}: only {len(rgb_by_sec.get(sec, []))} RGB frames "
                   f"in second {sec}, need F1={F1}. Skipping sample.")
             return None
-        rgb_frames = torch.stack([_load_image(p) for p in rgb_paths])
+        rgb_t = rgb_transform if rgb_transform is not None else IMG_TRANSFORM
+        rgb_frames = torch.stack([_load_image(p, rgb_t) for p in rgb_paths])
         rgb_seq.append(rgb_frames)                              # (F1, 3, H, W)
 
     return {
@@ -297,24 +304,75 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Standardization (FT, gripper, gripper_force) — From PoseIt paper
+# ---------------------------------------------------------------------------
+
+def compute_sensor_stats(dataset: "PoseItDataset", indices: List[int]) -> dict:
+    """
+    Compute mean and std for ft, gripper, gripper_force over the given indices.
+    Returns dict with ft_mean, ft_std, gr_mean, gr_std, gf_mean, gf_std (tensors).
+    Use training indices only; apply same stats to val/test.
+    """
+    ft_list, gr_list, gf_list = [], [], []
+    for i in indices:
+        s = dataset.samples[i]
+        ft_list.append(s['ft'])
+        gr_list.append(s['gripper'])
+        gf_list.append(s['gripper_force'])
+    ft_all = torch.cat(ft_list, dim=0)   # (N*T, F2*6)
+    gr_all = torch.cat(gr_list, dim=0)   # (N*T, F2*2)
+    gf_all = torch.stack(gf_list, dim=0) # (N, 1)
+
+    ft_mean = ft_all.mean(dim=0)
+    ft_std = ft_all.std(dim=0)
+    ft_std[ft_std < 1e-6] = 1.0
+
+    gr_mean = gr_all.mean(dim=0)
+    gr_std = gr_all.std(dim=0)
+    gr_std[gr_std < 1e-6] = 1.0
+
+    gf_mean = gf_all.mean(dim=0)
+    gf_std = gf_all.std(dim=0)
+    gf_std[gf_std < 1e-6] = 1.0
+
+    return {
+        'ft_mean': ft_mean, 'ft_std': ft_std,
+        'gr_mean': gr_mean, 'gr_std': gr_std,
+        'gf_mean': gf_mean, 'gf_std': gf_std,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
 class PoseItDataset(Dataset):
     def __init__(self,
                  root_dir: Optional[str] = None,
-                 sample_dirs: Optional[List[str]] = None):
+                 sample_dirs: Optional[List[str]] = None,
+                 sensor_stats: Optional[dict] = None,
+                 rgb_preprocess: str = 'imagenet'):
+        """
+        Args:
+            rgb_preprocess: 'imagenet' (default) or 'clip'. Use 'clip' for CLIP+T3 model.
+        """
         assert root_dir or sample_dirs, "Provide root_dir or sample_dirs"
         dirs = [Path(d) for d in sample_dirs] if sample_dirs \
                else sorted(Path(root_dir).iterdir())
 
+        rgb_transform = None
+        if rgb_preprocess == 'clip':
+            from encoders import get_clip_preprocess
+            rgb_transform = get_clip_preprocess()
+
+        self.sensor_stats = sensor_stats  # ft/gr/gf mean & std for standardization
         self.samples = []
         skipped = 0
         for d in dirs:
             if not d.is_dir():
                 continue
             try:
-                s = _build_sample(d)
+                s = _build_sample(d, rgb_transform=rgb_transform)
                 if s is not None:
                     self.samples.append(s)
                 else:
@@ -324,21 +382,36 @@ class PoseItDataset(Dataset):
                 skipped += 1
 
         print(f"Loaded {len(self.samples)} samples ({skipped} skipped)  "
-              f"[L={L}, F1={F1}, F2={F2}, phase='{phase}']")
+              f"[L={L}, F1={F1}, F2={F2}, phase='{phase}', rgb_preprocess='{rgb_preprocess}']")
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def set_sensor_stats(self, stats: Optional[dict]) -> None:
+        """Set sensor standardization stats (from compute_sensor_stats). Use train stats for all splits."""
+        self.sensor_stats = stats
+
     def __getitem__(self, idx):
         s = self.samples[idx]
+        tac = s['tactile']
+        rgb = s['rgb']
+        ft = s['ft']
+        grip = s['gripper']
+        gf = s['gripper_force']
+
+        if self.sensor_stats is not None:
+            ft = (ft - self.sensor_stats['ft_mean']) / self.sensor_stats['ft_std']
+            grip = (grip - self.sensor_stats['gr_mean']) / self.sensor_stats['gr_std']
+            gf = (gf - self.sensor_stats['gf_mean']) / self.sensor_stats['gf_std']
+
         return (
-            s['tactile'],        # (T, F1, 3, H, W)
-            s['rgb'],            # (T, F1, 3, H, W)
-            s['ft'],             # (T, F2*6)
-            s['gripper'],        # (T, F2*2)
-            s['gripper_force'],  # (1,)
-            s['label'],          # scalar
-            s['pose_label'],     # scalar
+            tac,                 # (T, F1, 3, H, W)
+            rgb,                 # (T, F1, 3, H, W)
+            ft,                  # (T, F2*6)
+            grip,                # (T, F2*2)
+            gf,                  # (1,)
+            s['label'],
+            s['pose_label'],
         )
 
 
