@@ -1,0 +1,6 @@
+# Dependencies for CLIP + T3 encoder (--model clipt3)
+# Install in conda env: pip install -r requirements_clipt3.txt
+
+open_clip_torch>=2.20.0
+huggingface_hub>=0.20.0
+timm>=0.9.0

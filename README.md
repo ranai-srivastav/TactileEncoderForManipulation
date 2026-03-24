@@ -24,6 +24,17 @@ conda activate /ocean/projects/cis260031p/shared/temu_conda
 493 episodes, 26 object types, force levels F5 / F40 / F80.
 Folder format: `<object>_<timestamp>_F<force>_pose<idx>`
 
+### CLIP + T3 encoders (`--model clipt3`)
+
+Uses CLIP ViT-L/14 (LAION-2B, 768-d) for RGB and T3 large (304M, 1024-d) for tactile:
+
+```bash
+pip install -r requirements_clipt3.txt
+python scripts/download_pretrained.py --shared_dir /ocean/projects/cis260031p/shared
+```
+
+Then train with `--model clipt3`. Pretrained weights go to `shared/pretrained/` and `shared/.cache/huggingface/`.
+
 ---
 
 ## File Overview
