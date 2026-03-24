@@ -35,6 +35,16 @@ python scripts/download_pretrained.py --shared_dir /ocean/projects/cis260031p/sh
 
 Then train with `--model clipt3`. Pretrained weights go to `shared/pretrained/` and `shared/.cache/huggingface/`.
 
+**Evaluate a saved checkpoint** (same flags as training for data/model):
+
+```bash
+python scripts/eval_test.py -c trained_models/clipt3_5k_best.pt --model clipt3 \
+  --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
+  --variable_length --standardize_sensors --modalities V T FT G GF --split random
+```
+
+Use `--which val` or `--which test` for a single split. For `--split random`, add `--seed N` only if training used the same `numpy` seed.
+
 ---
 
 ## File Overview
