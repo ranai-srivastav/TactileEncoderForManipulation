@@ -150,6 +150,9 @@ def evaluate_gradcam(model: GraspClassifier, dataset: PoseItDataset,
     wrapper = SingleFrameWrapper(model).to(device)
     wrapper.eval()
     target_layer = wrapper.model.backbone.layer4[-1]
+    # GradCAM needs gradients through the target layer even when backbone is frozen
+    for p in wrapper.model.backbone.layer4.parameters():
+        p.requires_grad_(True)
 
     rng = np.random.default_rng(42)
     chosen = rng.choice(indices, size=min(n_samples, len(indices)), replace=False)
