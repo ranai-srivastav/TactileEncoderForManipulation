@@ -30,7 +30,7 @@ from dataloader import (PoseItDataset, split_by_object, split_by_pose,
                         uniform_random_split, F2, FT_DIM, GR_DIM)
 from sampler import DRSSampler
 from model import GraspStabilityLSTM
-
+from utils import compute_confidence_scores, compute_discrepancy_ratios
 
 def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
     """Print per-phase label distribution for the loaded dataset and each split.
@@ -94,7 +94,7 @@ def parse_args():
     p.add_argument('--test_poses',   nargs='+', type=int, default=[1, 2, 3, 4, 5])
     p.add_argument('--sigma',        type=float, default=0.5,
                    help='DRS target S≠/S= ratio. 0.5 = gentler resampling')
-    p.add_argument('--drs_iter',     type=int,   default=400,
+    p.add_argument('--drs_iter',     type=int,   default=9999,
                    help='Iteration at which DRS activates (separate from LR anneal)')
     p.add_argument('--batch_size',   type=int,   default=32)
     p.add_argument('--lr',           type=float, default=0.01)
@@ -168,7 +168,8 @@ def evaluate(model, loader, criterion, device):
     tp, fp, fn, n = 0, 0, 0, 0
     for batch in loader:
         tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
-        logits = model(tac, rgb, ft, grip, gf).squeeze(1)   # (B,)
+        logits, _, _, _ = model(tac, rgb, ft, grip, gf)
+        logits = logits.squeeze(1)
         total_loss += criterion(logits, label.float()).item() * len(label)
         preds  = logits > 0
         actual = label.bool()
@@ -206,6 +207,7 @@ def main():
         wandb.define_metric("val/*", step_metric="iter")
         wandb.define_metric("lr", step_metric="iter")
         wandb.define_metric("drs_active", step_metric="iter")
+        wandb.define_metric("ogm/*", step_metric="iter")
     elif args.wandb_project is not None:
         print("[WARN] wandb not installed — W&B logging disabled.")
 
@@ -301,12 +303,19 @@ def main():
             tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
 
             optimizer.zero_grad()
-            logits = model(tac, rgb, ft, grip, gf).squeeze(1)  # (B,)
+            # logits = model(tac, rgb, ft, grip, gf).squeeze(1)  # (B,)
+            logits, logit_tac, logit_rgb, logit_prop = model(tac, rgb, ft, grip, gf)
+            logits = logits.squeeze(1)
             loss   = criterion(logits, label.float())
             loss.backward()
             optimizer.step()
 
             if iteration % 10 == 0 or iteration == args.n_iters - 1:
+                
+                # OGM confidence monitoring
+                s_tac, s_rgb, s_prop = compute_confidence_scores(logit_tac, logit_rgb, logit_prop, label)
+                rho_tac, rho_rgb, rho_prop = compute_discrepancy_ratios(s_tac, s_rgb, s_prop)
+                
                 val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
                     model, val_loader, criterion, device)
                 print(f"[iter {iteration:4d}] "
@@ -326,6 +335,13 @@ def main():
                         'val/f1':         val_f1,
                         'drs_active':     int(sampler.is_active),
                         'lr':             scheduler.get_last_lr()[0],
+                        # OGM diagnostic
+                        'ogm/conf_tac':   s_tac.mean().item(),
+                        'ogm/conf_rgb':   s_rgb.mean().item(),
+                        'ogm/conf_prop':  s_prop.mean().item(),
+                        'ogm/rho_tac':    rho_tac,
+                        'ogm/rho_rgb':    rho_rgb,
+                        'ogm/rho_prop':   rho_prop,
                     }, step=iteration)
 
                 if val_f1 > best_val_f1:

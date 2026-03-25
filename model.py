@@ -80,6 +80,19 @@ class GraspStabilityLSTM(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
         )
+        
+        # --- per-modality heads for OGM confidence score monitoring ---
+        tac_in = frames_per_sec * self.RESNET_EMB
+        rgb_in = frames_per_sec * self.RESNET_EMB
+        prop_in = ft_dim + gripper_dim + 1
+        
+        self.proj_tac = nn.Linear(tac_in, hidden_dim)
+        self.proj_rgb = nn.Linear(rgb_in, hidden_dim)
+        self.proj_prop = nn.Linear(prop_in, hidden_dim)
+        
+        self.head_tac = nn.Linear(hidden_dim, 1)
+        self.head_rgb = nn.Linear(hidden_dim, 1)
+        self.head_prop = nn.Linear(hidden_dim, 1)
 
         # --- 2-layer LSTM/GRU (bidirectional or unidirectional) ---
         self.lstm = nn.GRU(
@@ -139,6 +152,20 @@ class GraspStabilityLSTM(nn.Module):
 
         # --- ft / gripper already flat per second; broadcast static force ---
         gf = gripper_force.unsqueeze(1).expand(B, T, 1)   # (B, T, 1)
+        
+        # --- per-modality confidence scores for OGM diagnostic ---
+        with torch.no_grad():
+            prop = torch.cat([ft, gripper, gf], dim=-1)
+            
+            logit_tac = self.head_tac(
+                torch.relu(self.proj_tac(tac_emb)).mean(dim=1)
+            )
+            logit_rgb = self.head_rgb(
+                torch.relu(self.proj_rgb(rgb_emb)).mean(dim=1)
+            )
+            logit_prop = self.head_prop(
+                torch.relu(self.proj_prop(prop)).mean(dim=1)
+            )
 
         # --- fuse all modalities per second, project to hidden_dim ---
         fused     = torch.cat([tac_emb, rgb_emb, ft, gripper, gf], dim=-1)  # (B, T, pre_lstm_dim)
@@ -152,4 +179,5 @@ class GraspStabilityLSTM(nn.Module):
             last = torch.cat([lstm_out[:, -1, :h], lstm_out[:, 0, h:]], dim=-1)
         else:
             last = lstm_out[:, -1, :]   # (B, hidden_dim)
-        return self.classifier(last)
+            
+        return self.classifier(last), logit_tac, logit_rgb, logit_prop
