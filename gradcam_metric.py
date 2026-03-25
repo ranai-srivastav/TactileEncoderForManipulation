@@ -97,7 +97,7 @@ def deletion_auc(wrapper: SingleFrameWrapper, frame_tensor: torch.Tensor,
             conf = torch.softmax(logit, dim=1)[0, target_class].item()
             confidences.append(conf)
 
-    return float(np.trapz(confidences, dx=1.0 / steps))
+    return float(np.trapezoid(confidences, dx=1.0 / steps))
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ def insertion_auc(wrapper: SingleFrameWrapper, frame_tensor: torch.Tensor,
             conf = torch.softmax(logit, dim=1)[0, target_class].item()
             confidences.append(conf)
 
-    return float(np.trapz(confidences, dx=1.0 / steps))
+    return float(np.trapezoid(confidences, dx=1.0 / steps))
 
 
 # ---------------------------------------------------------------------------
