@@ -17,9 +17,14 @@ class OpenCLIPVisionEncoder(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        # The training run used the OpenAI CLIP tower, but we only need the
-        # architecture shape here because the checkpoint provides all weights.
-        self.visual = open_clip.create_model("ViT-B-32", pretrained=None).visual
+        # Match the OpenAI CLIP ViT-B/32 architecture used in the run while
+        # letting the checkpoint provide the actual weights.
+        self.visual = open_clip.create_model(
+            "ViT-B-32",
+            pretrained=None,
+            load_weights=False,
+            force_quick_gelu=True,
+        ).visual
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.visual(x)
@@ -37,11 +42,11 @@ class TactileViTSmallEncoder(nn.Module):
         self.encoder.pos_embed = backbone.pos_embed
         self.encoder.patch_embed = backbone.patch_embed
         self.encoder.pos_drop = backbone.pos_drop
+        self.encoder.blocks = nn.Sequential(*list(backbone.blocks[:3]))
 
         self.trunk = nn.Module()
-        self.trunk.blocks = backbone.blocks
+        self.trunk.blocks = nn.Sequential(*list(backbone.blocks[3:]))
         self.trunk.norm = backbone.norm
-        self.trunk.norm_pre = getattr(backbone, "norm_pre", nn.Identity())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.encoder.patch_embed(x)
@@ -49,7 +54,8 @@ class TactileViTSmallEncoder(nn.Module):
         x = torch.cat((cls, x), dim=1)
         x = x + self.encoder.pos_embed
         x = self.encoder.pos_drop(x)
-        x = self.trunk.norm_pre(x)
+        for block in self.encoder.blocks:
+            x = block(x)
         for block in self.trunk.blocks:
             x = block(x)
         x = self.trunk.norm(x)
@@ -91,7 +97,9 @@ class CLIPT3(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.lstm = nn.LSTM(
+        # Kept under the historical attribute name `lstm` to match the
+        # checkpoint key layout even though the temporal model is a GRU.
+        self.lstm = nn.GRU(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=lstm_layers,
@@ -163,7 +171,7 @@ class CLIPT3(nn.Module):
             batch_first=True,
             enforce_sorted=False,
         )
-        _, (hidden, _) = self.lstm(packed)
+        _, hidden = self.lstm(packed)
 
         if self.bidirectional:
             last = torch.cat([hidden[-2], hidden[-1]], dim=-1)
