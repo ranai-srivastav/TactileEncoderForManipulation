@@ -160,13 +160,6 @@ class GraspStabilityLSTM(nn.Module):
         gf     = gripper_force.unsqueeze(1).expand(B, T, 1)
         gf_emb = self.gf_proj(gf)                                 # (B, T, 32)
 
-        # Zero out disabled modalities (after projection)
-        if 'V'  not in self.modalities: v_emb  = v_emb  * 0.0
-        if 'T'  not in self.modalities: t_emb  = t_emb  * 0.0
-        if 'FT' not in self.modalities: ft_emb = ft_emb * 0.0
-        if 'G'  not in self.modalities: g_emb  = g_emb  * 0.0
-        if 'GF' not in self.modalities: gf_emb = gf_emb * 0.0
-
         # --- fuse projected modalities, then project to hidden_dim ---
         fused     = torch.cat([v_emb, t_emb, ft_emb, g_emb, gf_emb], dim=-1)  # (B, T, 1248)
         projected = self.projection(fused)                                       # (B, T, hidden_dim)
@@ -300,17 +293,6 @@ class GraspStabilityLSTM_CLIP_T3(nn.Module):
         g_emb = self.g_proj(gripper)
         gf = gripper_force.unsqueeze(1).expand(B, T, 1)
         gf_emb = self.gf_proj(gf)
-
-        if 'V' not in self.modalities:
-            v_emb = v_emb * 0.0
-        if 'T' not in self.modalities:
-            t_emb = t_emb * 0.0
-        if 'FT' not in self.modalities:
-            ft_emb = ft_emb * 0.0
-        if 'G' not in self.modalities:
-            g_emb = g_emb * 0.0
-        if 'GF' not in self.modalities:
-            gf_emb = gf_emb * 0.0
 
         fused = torch.cat([v_emb, t_emb, ft_emb, g_emb, gf_emb], dim=-1)
         projected = self.projection(fused)
