@@ -12,8 +12,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-# T3 model: "large" (304M) is best; encoder config inferred from checkpoint
-T3_MODEL = "large"
+# T3 weights layout on disk / HF: models/t3_large/{encoders,trunk.pth} (see scripts/download_pretrained.py)
+T3_MODEL = "t3_large"
 T3_BASE_CONFIG = {
     "patch_size": 16,
     "embed_dim": 1024,  # t3_large; overridden by checkpoint inference
