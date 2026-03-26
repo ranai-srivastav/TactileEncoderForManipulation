@@ -32,6 +32,16 @@ def _get_pretrained_dir() -> str:
     return os.environ.get("TEMU_PRETRAINED_DIR", default)
 
 
+def _torch_load_checkpoint(path: str, map_location="cpu"):
+    """Load a checkpoint file; prefer ``weights_only=True`` on PyTorch 2.x."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+    except Exception:
+        return torch.load(path, map_location=map_location)
+
+
 # ---------------------------------------------------------------------------
 # CLIP RGB Encoder
 # ---------------------------------------------------------------------------
@@ -52,9 +62,13 @@ class CLIPRGBEncoder(nn.Module):
         except ImportError:
             raise ImportError("Install open_clip: pip install open_clip_torch")
 
-        model, _, _ = open_clip.create_model_and_transforms(
-            "ViT-L-14", pretrained=pretrained
-        )
+        # Prefer create_model: same weights as create_model_and_transforms, no unused preprocess objects.
+        if hasattr(open_clip, "create_model"):
+            model = open_clip.create_model("ViT-L-14", pretrained=pretrained)
+        else:
+            model, _, _ = open_clip.create_model_and_transforms(
+                "ViT-L-14", pretrained=pretrained
+            )
         self.visual = model.visual
         if freeze:
             for p in self.visual.parameters():
@@ -63,11 +77,16 @@ class CLIPRGBEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, 3, H, W) — RGB images, CLIP preprocess (224x224)
+            x: (B, 3, H, W) — RGB images after CLIP preprocessing (224×224).
         Returns:
-            (B, 512) — image features
+            (B, EMB_DIM) image features — ViT-L/14 uses 768-D (must match ``GraspStabilityLSTM_CLIP_T3.CLIP_EMB``).
         """
-        return self.visual(x)
+        out = self.visual(x)
+        assert out.shape[-1] == self.EMB_DIM, (
+            f"CLIP visual dim {out.shape[-1]} != EMB_DIM {self.EMB_DIM}; "
+            "update CLIP_EMB / EMB_DIM if using a different backbone."
+        )
+        return out
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -77,11 +96,12 @@ class CLIPRGBEncoder(nn.Module):
 
 
 def get_clip_preprocess():
-    """Return CLIP preprocess transform for RGB images (no model download)."""
+    """Return CLIP-style preprocessing aligned with OpenCLIP ViT-L/14 (no model download)."""
     from torchvision import transforms
-    # CLIP ViT-L/14 standard normalization (same as ViT-B-32)
+    from torchvision.transforms import InterpolationMode
+
     return transforms.Compose([
-        transforms.Resize(224),
+        transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize(
@@ -135,7 +155,7 @@ class T3TactileEncoder(nn.Module):
         # Infer config from encoder checkpoint
         enc_ckpt = None
         if os.path.exists(encoder_path):
-            enc_ckpt = torch.load(encoder_path, map_location="cpu")
+            enc_ckpt = _torch_load_checkpoint(encoder_path, map_location="cpu")
             embed_dim = enc_ckpt["patch_embed.proj.weight"].shape[0]
             encoder_depth = max(
                 (int(k.split(".")[1]) for k in enc_ckpt if k.startswith("blocks.")),
@@ -148,7 +168,7 @@ class T3TactileEncoder(nn.Module):
             if os.path.exists(fallback_path):
                 print(f"[T3] {encoder_domain} not found, using {fallback}")
                 encoder_path = fallback_path
-                enc_ckpt = torch.load(encoder_path, map_location="cpu")
+                enc_ckpt = _torch_load_checkpoint(encoder_path, map_location="cpu")
                 embed_dim = enc_ckpt["patch_embed.proj.weight"].shape[0]
                 encoder_depth = max(
                     (int(k.split(".")[1]) for k in enc_ckpt if k.startswith("blocks.")),
@@ -176,7 +196,7 @@ class T3TactileEncoder(nn.Module):
             print(f"[T3] No encoder weights at {encoder_path}, using random init")
 
         if os.path.exists(trunk_path):
-            trunk_ckpt = torch.load(trunk_path, map_location="cpu")
+            trunk_ckpt = _torch_load_checkpoint(trunk_path, map_location="cpu")
             trunk_depth = max(
                 (int(k.split(".")[1]) for k in trunk_ckpt if k.startswith("blocks.")),
                 default=5,
@@ -196,9 +216,9 @@ class T3TactileEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, 3, H, W) — tactile images, ImageNet normalize, 224x224
+            x: (B, 3, H, W) — tactile images, ImageNet normalize, 224×224.
         Returns:
-            (B, embed_dim) — tactile features (384 or 768)
+            (B, embed_dim) tactile features (``embed_dim`` is set from the checkpoint; T3 large is typically 1024).
         """
         enc = self.encoder(x)  # (B, 1+N, D)
         out = self.trunk(enc)  # (B, D)
@@ -299,7 +319,7 @@ def _load_t3_encoder(encoder, path_or_ckpt, cfg: dict):
     if isinstance(path_or_ckpt, dict):
         ckpt = path_or_ckpt
     elif os.path.exists(path_or_ckpt):
-        ckpt = torch.load(path_or_ckpt, map_location="cpu")
+        ckpt = _torch_load_checkpoint(path_or_ckpt, map_location="cpu")
     else:
         return
     patch_embed = encoder.patch_embed
@@ -323,4 +343,13 @@ def _load_t3_encoder(encoder, path_or_ckpt, cfg: dict):
             )
             pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
             ckpt["pos_embed"] = torch.cat((extra, pos_tokens), dim=1)
-    encoder.load_state_dict(ckpt, strict=False)
+    incomp = encoder.load_state_dict(ckpt, strict=False)
+    if incomp.missing_keys or incomp.unexpected_keys:
+        print(
+            f"[T3] encoder load_state_dict (strict=False): "
+            f"{len(incomp.missing_keys)} missing, {len(incomp.unexpected_keys)} unexpected keys"
+        )
+        if incomp.missing_keys:
+            print(f"[T3]   missing (first 5): {incomp.missing_keys[:5]}")
+        if incomp.unexpected_keys:
+            print(f"[T3]   unexpected (first 5): {incomp.unexpected_keys[:5]}")

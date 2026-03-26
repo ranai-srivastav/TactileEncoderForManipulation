@@ -194,7 +194,8 @@ class GraspStabilityLSTM(nn.Module):
 class GraspStabilityLSTM_CLIP_T3(nn.Module):
     """
     Same as GraspStabilityLSTM but uses CLIP (ViT-L/14) for RGB and T3 large for tactile.
-    CLIP outputs 768-d per image; T3 large outputs 1024-d per image.
+    CLIP outputs 768-d per image (``CLIP_EMB``). Tactile width is ``tactile_encoder.embed_dim``
+    (from the T3 checkpoint; large is typically 1024-d).
     """
 
     CLIP_EMB = 768
