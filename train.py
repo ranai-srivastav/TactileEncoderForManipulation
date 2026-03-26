@@ -112,11 +112,14 @@ def parse_args():
     p.add_argument('--modalities',   nargs='+',  default=['V', 'T', 'FT', 'G', 'GF'],
                    help='Active modalities: V T FT G GF')
     p.add_argument('--L',            type=int,   default=20,
-                   help='Max seconds per episode (clips longer sequences). Ignored if --variable_length.')
-    p.add_argument('--variable_length', action='store_true',
-                   help='Use variable-length sequences (no L clipping) and collate_variable_length.')
-    p.add_argument('--standardize_sensors', action='store_true',
-                   help='Standardize FT, gripper, gripper_force to mean=0, std=1 (PoseIt).')
+                   help='Max seconds per episode in fixed-length mode (used only with --fixed_length).')
+    p.add_argument('--fixed_length', action='store_true', default=False,
+                   help='Clip sequences to L seconds and use default collate. '
+                        'Default: variable-length sequences and collate_variable_length.')
+    p.add_argument('--no_standardize_sensors', dest='standardize_sensors', action='store_false',
+                   default=True,
+                   help='Disable sensor standardisation (FT, gripper, gripper_force). '
+                        'Default: standardise using train-split mean and std (PoseIt).')
     p.add_argument('--subsample',    type=float, default=1.0,
                    help='Fraction of dataset to use (e.g. 0.01 for 1%%)')
     p.add_argument('--wandb_project', type=str, default="TEMU",
@@ -204,6 +207,12 @@ def evaluate(model, loader, criterion, device):
 
 def main():
     args   = parse_args()
+    # Variable-length batches by default; --fixed_length opts into L-second clipping.
+    if args.fixed_length:
+        args.variable_length = False
+    else:
+        args.variable_length = True
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 

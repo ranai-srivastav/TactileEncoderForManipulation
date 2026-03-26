@@ -9,7 +9,7 @@ the split to match).
 Examples:
   python scripts/eval_test.py --checkpoint trained_models/clipt3_5k_best.pt \\
     --model clipt3 --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \\
-    --variable_length --standardize_sensors --modalities V T FT G GF --split random
+    --modalities V T FT G GF --split random
 
   python scripts/eval_test.py -c trained_models/best_model.pt --model resnet \\
     --root_dir ... --split object --test_objects mug bowl
@@ -55,8 +55,19 @@ def parse_args():
     p.add_argument("--F1", type=int, default=1)
     p.add_argument("--F2", type=int, default=1)
     p.add_argument("--L", type=int, default=20)
-    p.add_argument("--variable_length", action="store_true")
-    p.add_argument("--standardize_sensors", action="store_true")
+    p.add_argument(
+        "--fixed_length",
+        action="store_true",
+        default=False,
+        help="Clip to L seconds (default: variable-length, same as train.py).",
+    )
+    p.add_argument(
+        "--no_standardize_sensors",
+        dest="standardize_sensors",
+        action="store_false",
+        default=True,
+        help="Disable sensor standardisation (default: match train.py, standardise).",
+    )
     p.add_argument("--subsample", type=float, default=1.0)
     p.add_argument("--modalities", nargs="+", default=["V", "T", "FT", "G", "GF"])
     p.add_argument("--unidirectional", action="store_true")
@@ -76,6 +87,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.variable_length = not args.fixed_length
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
     if not os.path.isfile(args.checkpoint):
