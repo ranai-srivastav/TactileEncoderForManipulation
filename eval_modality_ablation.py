@@ -9,6 +9,7 @@ from typing import Iterable
 
 import torch
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
 import dataloader_clipt3 as dl
 from clipt3_model import ALL_MODALITIES, CLIPT3
@@ -105,12 +106,16 @@ def make_split(dataset: dl.PoseItDatasetCLIPT3, config: dict, seed: int):
     return dl.uniform_random_split(dataset, seed=seed)
 
 
-def compute_sensor_stats(dataset: dl.PoseItDatasetCLIPT3, indices: Iterable[int]) -> SensorStats:
+def compute_sensor_stats(
+    dataset: dl.PoseItDatasetCLIPT3,
+    indices: Iterable[int],
+    desc: str = "Sensor stats",
+) -> SensorStats:
     index_list = list(indices)
     ft_rows = []
     gr_rows = []
     gf_rows = []
-    for index in index_list:
+    for index in tqdm(index_list, desc=desc, unit="sample"):
         ft, gripper, gripper_force = dataset.sensor_sample(index)
         ft_rows.append(ft)
         gr_rows.append(gripper)
@@ -156,11 +161,12 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     stats: SensorStats | None,
+    desc: str,
 ) -> dict[str, float]:
     model.eval()
     tp = fp = fn = tn = 0
 
-    for batch in loader:
+    for batch in tqdm(loader, desc=desc, unit="batch"):
         tactile, rgb, ft, gripper, gripper_force, label, _pose_label, lengths = batch
         tactile = tactile.to(device)
         rgb = rgb.to(device)
@@ -250,6 +256,16 @@ def markdown_table(rows: list[dict[str, object]]) -> str:
     return "\n".join([header, divider, *body])
 
 
+def print_metrics_row(setting: str, metrics: dict[str, float], active_modalities: list[str]) -> None:
+    active = " ".join(active_modalities)
+    print(
+        f"[{setting}] active={active} "
+        f"acc={metrics['accuracy']:.4f} "
+        f"prec={metrics['precision']:.4f} "
+        f"rec={metrics['recall']:.4f}"
+    )
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -305,7 +321,7 @@ def main() -> None:
 
     if args.include_all_modalities_row:
         model.set_modalities(config.get("modalities", list(ALL_MODALITIES)))
-        baseline = evaluate(model, test_loader, device, stats)
+        baseline = evaluate(model, test_loader, device, stats, desc="Evaluating all-modalities")
         rows.append(
             {
                 "setting": "all-modalities",
@@ -313,10 +329,11 @@ def main() -> None:
                 **baseline,
             }
         )
+        print_metrics_row("all-modalities", baseline, list(config.get("modalities", list(ALL_MODALITIES))))
 
-    for setting, active_modalities in modality_sets(args.evaluation_mode):
+    for setting, active_modalities in tqdm(modality_sets(args.evaluation_mode), desc="Ablations", unit="setting"):
         model.set_modalities(active_modalities)
-        metrics = evaluate(model, test_loader, device, stats)
+        metrics = evaluate(model, test_loader, device, stats, desc=f"Evaluating {setting}")
         rows.append(
             {
                 "setting": setting,
@@ -324,6 +341,7 @@ def main() -> None:
                 **metrics,
             }
         )
+        print_metrics_row(setting, metrics, active_modalities)
 
     logged_metrics = parse_logged_test_metrics(output_log)
     report = {

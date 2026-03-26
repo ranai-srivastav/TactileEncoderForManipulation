@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 from torchvision import transforms
 
 LABEL_MAP = {"pass": 0, "slip": 1, "drop": 1}
@@ -270,7 +271,7 @@ class PoseItDatasetCLIPT3(Dataset):
 
         self.samples = []
         skipped = 0
-        for directory in directories:
+        for directory in tqdm(directories, desc="Indexing CLIPT3 dataset", unit="entry"):
             if not directory.is_dir():
                 continue
             try:
