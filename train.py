@@ -30,7 +30,7 @@ from dataloader import (PoseItDataset, split_by_object, split_by_pose,
                         uniform_random_split, F2, FT_DIM, GR_DIM)
 from sampler import DRSSampler
 from model import GraspStabilityLSTM
-from utils import compute_confidence_scores, compute_discrepancy_ratios
+from utils import compute_confidence_scores, compute_discrepancy_ratios, compute_ogm_coefficients
 
 def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
     """Print per-phase label distribution for the loaded dataset and each split.
@@ -97,7 +97,7 @@ def parse_args():
     p.add_argument('--drs_iter',     type=int,   default=9999,
                    help='Iteration at which DRS activates (separate from LR anneal)')
     p.add_argument('--batch_size',   type=int,   default=32)
-    p.add_argument('--lr',           type=float, default=0.01)
+    p.add_argument('--lr',           type=float, default=0.005)
     p.add_argument('--weight_decay', type=float, default=0.01)
     p.add_argument('--dropout',      type=float, default=0.1)
     p.add_argument('--hidden_dim',   type=int,   default=256)
@@ -125,6 +125,12 @@ def parse_args():
     p.add_argument('--overfit', action='store_true',
                    help='Use a single sample for train/val/test to sanity-check the model.')
     p.add_argument("--model_save_path", type=str, default="trained_models/best_model.pt")
+    p.add_argument('--ogm', type=int, default=0, choices=[0, 1],
+                   help='Enable OGM gradient modulation (0=off, 1=on)')
+    p.add_argument('--ogm_alpha', type=float, default=0.5,
+                   help='OGM alpha hyperparameter controlling modulation strength')
+    p.add_argument('--aux_loss_weight', type=float, default=0.1,
+                   help='Weight for per-modality auxiliary losses')
     return p.parse_args()
 
 
@@ -264,6 +270,7 @@ def main():
         bidirectional=not args.unidirectional,
         dropout=args.dropout,
         modalities=args.modalities,
+        use_ogm=args.ogm == 1,
     ).to(device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -307,15 +314,30 @@ def main():
             logits, logit_tac, logit_rgb, logit_prop = model(tac, rgb, ft, grip, gf)
             logits = logits.squeeze(1)
             loss   = criterion(logits, label.float())
+            
+            if args.ogm == 1:
+                if logit_tac is not None:
+                    loss = loss + args.aux_loss_weight * criterion(logit_tac.squeeze(1), label.float())
+                if logit_rgb is not None:
+                    loss = loss + args.aux_loss_weight * criterion(logit_rgb.squeeze(1), label.float())
+                if logit_prop is not None:
+                    loss = loss + args.aux_loss_weight * criterion(logit_prop.squeeze(1), label.float())
+            
             loss.backward()
-            optimizer.step()
-
+            
+            # OGM confidence monitoring
             if iteration % 10 == 0 or iteration == args.n_iters - 1:
-                
-                # OGM confidence monitoring
                 s_tac, s_rgb, s_prop = compute_confidence_scores(logit_tac, logit_rgb, logit_prop, label)
                 rho_tac, rho_rgb, rho_prop = compute_discrepancy_ratios(s_tac, s_rgb, s_prop)
-                
+
+                # OGM gradient modulation
+                if args.ogm == 1:
+                    k_tac, k_rgb, k_prop = compute_ogm_coefficients(rho_tac, rho_rgb, rho_prop, args.ogm_alpha)
+                    model.apply_ogm(k_tac, k_rgb, k_prop)
+            
+            optimizer.step()
+
+            if iteration % 10 == 0 or iteration == args.n_iters - 1:                
                 val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
                     model, val_loader, criterion, device)
                 print(f"[iter {iteration:4d}] "
@@ -336,9 +358,9 @@ def main():
                         'drs_active':     int(sampler.is_active),
                         'lr':             scheduler.get_last_lr()[0],
                         # OGM diagnostic
-                        'ogm/conf_tac':   s_tac.mean().item(),
-                        'ogm/conf_rgb':   s_rgb.mean().item(),
-                        'ogm/conf_prop':  s_prop.mean().item(),
+                        'ogm/conf_tac':   s_tac.mean().item() if s_tac  is not None else 0.0,
+                        'ogm/conf_rgb':   s_rgb.mean().item() if s_rgb  is not None else 0.0,
+                        'ogm/conf_prop':  s_prop.mean().item() if s_prop is not None else 0.0,
                         'ogm/rho_tac':    rho_tac,
                         'ogm/rho_rgb':    rho_rgb,
                         'ogm/rho_prop':   rho_prop,

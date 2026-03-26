@@ -49,8 +49,10 @@ class GraspStabilityLSTM(nn.Module):
         dropout: float = 0.1,
         freeze_resnet: bool = True,
         modalities=None,           # collection of {'V','T','FT','G','GF'}; None = all
+        use_ogm: bool = False
     ):
         super().__init__()
+        self.use_ogm = use_ogm
         self.frames_per_sec = frames_per_sec
         self.ft_dim         = ft_dim
         self.gripper_dim    = gripper_dim
@@ -154,18 +156,29 @@ class GraspStabilityLSTM(nn.Module):
         gf = gripper_force.unsqueeze(1).expand(B, T, 1)   # (B, T, 1)
         
         # --- per-modality confidence scores for OGM diagnostic ---
-        with torch.no_grad():
-            prop = torch.cat([ft, gripper, gf], dim=-1)
-            
+        prop = torch.cat([ft, gripper, gf], dim=-1)
+        
+        if self.use_ogm:            
             logit_tac = self.head_tac(
                 torch.relu(self.proj_tac(tac_emb)).mean(dim=1)
-            )
+            ) if 'T' in self.modalities else None
             logit_rgb = self.head_rgb(
                 torch.relu(self.proj_rgb(rgb_emb)).mean(dim=1)
-            )
+            ) if 'V' in self.modalities else None
             logit_prop = self.head_prop(
                 torch.relu(self.proj_prop(prop)).mean(dim=1)
-            )
+            ) if any(m in self.modalities for m in ['FT', 'G', 'GF']) else None
+        else:
+            with torch.no_grad():
+                logit_tac = self.head_tac(
+                    torch.relu(self.proj_tac(tac_emb)).mean(dim=1)
+                ) if 'T' in self.modalities else None
+                logit_rgb = self.head_rgb(
+                    torch.relu(self.proj_rgb(rgb_emb)).mean(dim=1)
+                ) if 'V' in self.modalities else None
+                logit_prop = self.head_prop(
+                    torch.relu(self.proj_prop(prop)).mean(dim=1)
+                ) if any(m in self.modalities for m in ['FT', 'G', 'GF']) else None
 
         # --- fuse all modalities per second, project to hidden_dim ---
         fused     = torch.cat([tac_emb, rgb_emb, ft, gripper, gf], dim=-1)  # (B, T, pre_lstm_dim)
@@ -181,3 +194,33 @@ class GraspStabilityLSTM(nn.Module):
             last = lstm_out[:, -1, :]   # (B, hidden_dim)
             
         return self.classifier(last), logit_tac, logit_rgb, logit_prop
+    
+    def apply_ogm(self, k_tac, k_rgb, k_prop):
+        """
+        Scale gradients of each modality's projection head by k^u.
+        Called after loss.backward(), before optimizer.step().
+        """
+        if k_tac != 1.0:
+            for p in self.proj_tac.parameters():
+                if p.grad is not None:
+                    p.grad *= k_tac
+            for p in self.head_tac.parameters():
+                if p.grad is not None:
+                    p.grad *= k_tac
+
+        if k_rgb != 1.0:
+            for p in self.proj_rgb.parameters():
+                if p.grad is not None:
+                    p.grad *= k_rgb
+            for p in self.head_rgb.parameters():
+                if p.grad is not None:
+                    p.grad *= k_rgb
+
+        if k_prop != 1.0:
+            for p in self.proj_prop.parameters():
+                if p.grad is not None:
+                    p.grad *= k_prop
+            for p in self.head_prop.parameters():
+                if p.grad is not None:
+                    p.grad *= k_prop
+
