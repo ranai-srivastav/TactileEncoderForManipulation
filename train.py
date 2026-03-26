@@ -220,6 +220,7 @@ def main():
         wandb.define_metric("iter")
         wandb.define_metric("train/*", step_metric="iter")
         wandb.define_metric("val/*", step_metric="iter")
+        wandb.define_metric("test/*", step_metric="iter")
         wandb.define_metric("lr", step_metric="iter")
         wandb.define_metric("drs_active", step_metric="iter")
     elif args.wandb_project is not None:
@@ -356,23 +357,32 @@ def main():
             if iteration % 10 == 0 or iteration == args.n_iters - 1:
                 val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
                     model, val_loader, criterion, device)
+                test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(
+                    model, test_loader, criterion, device)
                 print(f"[iter {iteration:4d}] "
                       f"train_loss={loss.item():.4f}  "
                       f"val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%  "
                       f"prec={val_prec:.3f}  rec={val_rec:.3f}  f1={val_f1:.3f}  "
+                      f"test_acc={test_acc*100:.2f}%  "
+                      f"test_prec={test_prec:.3f}  test_rec={test_rec:.3f}  test_f1={test_f1:.3f}  "
                       f"DRS={'on' if sampler.is_active else 'off'}")
 
                 if use_wandb:
                     wandb.log({
-                        'iter':           iteration,
-                        'train/loss':     loss.item(),
-                        'val/loss':       val_loss,
-                        'val/acc':        val_acc,
-                        'val/precision':  val_prec,
-                        'val/recall':     val_rec,
-                        'val/f1':         val_f1,
-                        'drs_active':     int(sampler.is_active),
-                        'lr':             scheduler.get_last_lr()[0],
+                        'iter':             iteration,
+                        'train/loss':       loss.item(),
+                        'val/loss':         val_loss,
+                        'val/acc':          val_acc,
+                        'val/precision':    val_prec,
+                        'val/recall':       val_rec,
+                        'val/f1':           val_f1,
+                        'test/loss':        test_loss,
+                        'test/acc':         test_acc,
+                        'test/precision':   test_prec,
+                        'test/recall':      test_rec,
+                        'test/f1':          test_f1,
+                        'drs_active':       int(sampler.is_active),
+                        'lr':               scheduler.get_last_lr()[0],
                     }, step=iteration)
 
                 if val_f1 > best_val_f1:
@@ -402,13 +412,16 @@ def main():
           f"prec={test_prec:.3f}  rec={test_rec:.3f}  f1={test_f1:.3f}")
 
     if use_wandb:
+        # Final test uses best-val checkpoint; log at n_iters so it is distinct from the
+        # last training-step test (which used the model at that iteration).
         wandb.log({
-            'test/loss':      test_loss,
-            'test/acc':       test_acc,
-            'test/precision': test_prec,
-            'test/recall':    test_rec,
-            'test/f1':        test_f1,
-        }, step=args.n_iters - 1)
+            'iter':             args.n_iters,
+            'test/loss':        test_loss,
+            'test/acc':         test_acc,
+            'test/precision':   test_prec,
+            'test/recall':      test_rec,
+            'test/f1':          test_f1,
+        }, step=args.n_iters)
         wandb.run.summary.update({
             'test/loss': test_loss, 'test/acc': test_acc,
             'test/precision': test_prec, 'test/recall': test_rec, 'test/f1': test_f1,
