@@ -148,7 +148,7 @@ def _load_image(path: Optional[Path], *, clip_rgb: bool) -> torch.Tensor:
     return transform(image)
 
 
-def _build_sample(sample_dir: Path) -> Optional[dict]:
+def _index_sample(sample_dir: Path) -> Optional[dict]:
     meta = _parse_folder_name(sample_dir.name)
     stages = _read_stages(sample_dir / "stages.csv")
     labels = _read_labels(sample_dir / "label.csv")
@@ -189,45 +189,28 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
         rgb_by_second.setdefault(ts, []).append(path)
 
     baseline_candidates = tactile_by_second.get(t_grasp, [])
-    baseline = _load_image(baseline_candidates[0] if baseline_candidates else None, clip_rgb=False)
+    baseline_path = baseline_candidates[0] if baseline_candidates else None
 
-    ft_seq = []
-    gr_seq = []
-    tactile_seq = []
-    rgb_seq = []
-
+    # Validate that every required bucket is sampleable before keeping the sample.
     for second in seconds:
-        ft_bucket = ft_values[ft_ts == second]
-        ft_row = _sample_bucket(ft_bucket, n_cols=6, count=F2)
-        if ft_row is None:
+        if _sample_bucket(ft_values[ft_ts == second], n_cols=6, count=F2) is None:
             return None
-        ft_seq.append(ft_row)
-
-        gr_bucket = gr_values[gr_ts == second]
-        gr_row = _sample_bucket(gr_bucket, n_cols=2, count=F2)
-        if gr_row is None:
+        if _sample_bucket(gr_values[gr_ts == second], n_cols=2, count=F2) is None:
             return None
-        gr_seq.append(gr_row)
-
-        tactile_paths = _sample_image_bucket(tactile_by_second.get(second, []), count=F1)
-        if tactile_paths is None:
+        if _sample_image_bucket(tactile_by_second.get(second, []), count=F1) is None:
             return None
-        tactile_frames = torch.stack(
-            [_load_image(path, clip_rgb=False) - baseline for path in tactile_paths]
-        )
-        tactile_seq.append(tactile_frames)
-
-        rgb_paths = _sample_image_bucket(rgb_by_second.get(second, []), count=F1)
-        if rgb_paths is None:
+        if _sample_image_bucket(rgb_by_second.get(second, []), count=F1) is None:
             return None
-        rgb_frames = torch.stack([_load_image(path, clip_rgb=True) for path in rgb_paths])
-        rgb_seq.append(rgb_frames)
 
     return {
-        "tactile": torch.stack(tactile_seq),
-        "rgb": torch.stack(rgb_seq),
-        "ft": torch.tensor(np.stack(ft_seq), dtype=torch.float32),
-        "gripper": torch.tensor(np.stack(gr_seq), dtype=torch.float32),
+        "seconds": seconds,
+        "ft_ts": ft_ts,
+        "ft_values": ft_values,
+        "gr_ts": gr_ts,
+        "gr_values": gr_values,
+        "tactile_by_second": tactile_by_second,
+        "rgb_by_second": rgb_by_second,
+        "baseline_path": baseline_path,
         "gripper_force": torch.tensor([meta["force"]], dtype=torch.float32),
         "label": torch.tensor(LABEL_MAP[shake_label], dtype=torch.long),
         "pose_label": torch.tensor(LABEL_MAP[pose_label], dtype=torch.long),
@@ -237,6 +220,43 @@ def _build_sample(sample_dir: Path) -> Optional[dict]:
         "force": meta["force"],
         "sample_dir": str(sample_dir),
     }
+
+
+def _materialize_sample(indexed_sample: dict, *, load_images: bool) -> dict:
+    baseline = _load_image(indexed_sample["baseline_path"], clip_rgb=False)
+    ft_seq = []
+    gr_seq = []
+    tactile_seq = []
+    rgb_seq = []
+
+    for second in indexed_sample["seconds"]:
+        ft_bucket = indexed_sample["ft_values"][indexed_sample["ft_ts"] == second]
+        gr_bucket = indexed_sample["gr_values"][indexed_sample["gr_ts"] == second]
+        ft_seq.append(_sample_bucket(ft_bucket, n_cols=6, count=F2))
+        gr_seq.append(_sample_bucket(gr_bucket, n_cols=2, count=F2))
+
+        if load_images:
+            tactile_paths = _sample_image_bucket(indexed_sample["tactile_by_second"].get(second, []), count=F1)
+            tactile_frames = torch.stack(
+                [_load_image(path, clip_rgb=False) - baseline for path in tactile_paths]
+            )
+            tactile_seq.append(tactile_frames)
+
+            rgb_paths = _sample_image_bucket(indexed_sample["rgb_by_second"].get(second, []), count=F1)
+            rgb_frames = torch.stack([_load_image(path, clip_rgb=True) for path in rgb_paths])
+            rgb_seq.append(rgb_frames)
+
+    sample = {
+        "ft": torch.tensor(np.stack(ft_seq), dtype=torch.float32),
+        "gripper": torch.tensor(np.stack(gr_seq), dtype=torch.float32),
+        "gripper_force": indexed_sample["gripper_force"],
+        "label": indexed_sample["label"],
+        "pose_label": indexed_sample["pose_label"],
+    }
+    if load_images:
+        sample["tactile"] = torch.stack(tactile_seq)
+        sample["rgb"] = torch.stack(rgb_seq)
+    return sample
 
 
 class PoseItDatasetCLIPT3(Dataset):
@@ -254,7 +274,7 @@ class PoseItDatasetCLIPT3(Dataset):
             if not directory.is_dir():
                 continue
             try:
-                sample = _build_sample(directory)
+                sample = _index_sample(directory)
             except Exception as exc:  # pragma: no cover - debug path
                 print(f"[WARN] Skipping {directory.name}: {exc}")
                 skipped += 1
@@ -273,7 +293,7 @@ class PoseItDatasetCLIPT3(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index: int):
-        sample = self.samples[index]
+        sample = _materialize_sample(self.samples[index], load_images=True)
         return (
             sample["tactile"],
             sample["rgb"],
@@ -283,6 +303,10 @@ class PoseItDatasetCLIPT3(Dataset):
             sample["label"],
             sample["pose_label"],
         )
+
+    def sensor_sample(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sample = _materialize_sample(self.samples[index], load_images=False)
+        return sample["ft"], sample["gripper"], sample["gripper_force"]
 
 
 def split_by_object(

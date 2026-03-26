@@ -107,9 +107,18 @@ def make_split(dataset: dl.PoseItDatasetCLIPT3, config: dict, seed: int):
 
 def compute_sensor_stats(dataset: dl.PoseItDatasetCLIPT3, indices: Iterable[int]) -> SensorStats:
     index_list = list(indices)
-    ft = torch.cat([dataset.samples[index]["ft"] for index in index_list], dim=0)
-    gr = torch.cat([dataset.samples[index]["gripper"] for index in index_list], dim=0)
-    gf = torch.cat([dataset.samples[index]["gripper_force"] for index in index_list], dim=0)
+    ft_rows = []
+    gr_rows = []
+    gf_rows = []
+    for index in index_list:
+        ft, gripper, gripper_force = dataset.sensor_sample(index)
+        ft_rows.append(ft)
+        gr_rows.append(gripper)
+        gf_rows.append(gripper_force)
+
+    ft = torch.cat(ft_rows, dim=0)
+    gr = torch.cat(gr_rows, dim=0)
+    gf = torch.cat(gf_rows, dim=0)
 
     def _stats(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mean = values.mean(dim=0)
