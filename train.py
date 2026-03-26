@@ -27,9 +27,10 @@ except ImportError:
 
 import dataloader as _dl
 from dataloader import (PoseItDataset, split_by_object, split_by_pose,
-                        uniform_random_split, F2, FT_DIM, GR_DIM)
+                        uniform_random_split, collate_variable_length,
+                        compute_sensor_stats, F2, FT_DIM, GR_DIM)
 from sampler import DRSSampler
-from model import GraspStabilityLSTM
+from model import GraspStabilityLSTM, GraspStabilityLSTM_CLIP_T3
 
 
 def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
@@ -100,7 +101,7 @@ def parse_args():
     p.add_argument('--lr',           type=float, default=0.01)
     p.add_argument('--weight_decay', type=float, default=0.01)
     p.add_argument('--dropout',      type=float, default=0.1)
-    p.add_argument('--hidden_dim',   type=int,   default=256)
+    p.add_argument('--hidden_dim',   type=int,   default=512)
     p.add_argument('--lstm_layers',  type=int,   default=2,
                    help='Number of LSTM layers (default: 2)')
     p.add_argument('--n_iters',      type=int,   default=600)
@@ -111,7 +112,11 @@ def parse_args():
     p.add_argument('--modalities',   nargs='+',  default=['V', 'T', 'FT', 'G', 'GF'],
                    help='Active modalities: V T FT G GF')
     p.add_argument('--L',            type=int,   default=20,
-                   help='Max seconds per episode (clips longer sequences)')
+                   help='Max seconds per episode (clips longer sequences). Ignored if --variable_length.')
+    p.add_argument('--variable_length', action='store_true',
+                   help='Use variable-length sequences (no L clipping) and collate_variable_length.')
+    p.add_argument('--standardize_sensors', action='store_true',
+                   help='Standardize FT, gripper, gripper_force to mean=0, std=1 (PoseIt).')
     p.add_argument('--subsample',    type=float, default=1.0,
                    help='Fraction of dataset to use (e.g. 0.01 for 1%%)')
     p.add_argument('--wandb_project', type=str, default="TEMU",
@@ -124,6 +129,12 @@ def parse_args():
                    help='Use unidirectional LSTM (default: bidirectional)')
     p.add_argument('--overfit', action='store_true',
                    help='Use a single sample for train/val/test to sanity-check the model.')
+    p.add_argument('--model', default='resnet', choices=['resnet', 'clipt3'],
+                   help='Model architecture: resnet (ResNet50) or clipt3 (CLIP + T3)')
+    p.add_argument('--t3_encoder_domain', default='gs_black',
+                   help='T3 encoder domain: gs_black or gs_tag (for clipt3)')
+    p.add_argument('--pretrained_dir', default='/ocean/projects/cis260031p/shared/pretrained',
+                   help='Directory for T3 pretrained weights (for clipt3)')
     p.add_argument("--model_save_path", type=str, default="trained_models/best_model.pt")
     return p.parse_args()
 
@@ -137,18 +148,23 @@ def make_split(dataset, args):
         return uniform_random_split(dataset)
 
 
-def make_loader(subset, sampler=None, batch_size=32, num_workers=4, shuffle=False):
+def make_loader(subset, sampler=None, batch_size=32, num_workers=4, shuffle=False,
+                collate_fn=None):
     if sampler is not None:
         # batch_sampler controls both batching and shuffling — don't pass batch_size/shuffle
         return DataLoader(subset.dataset, batch_sampler=sampler,
-                          num_workers=num_workers)
+                          num_workers=num_workers, collate_fn=collate_fn)
     return DataLoader(subset, batch_size=batch_size, shuffle=shuffle,
-                      num_workers=num_workers)
+                      num_workers=num_workers, collate_fn=collate_fn)
 
 
 def batch_to_device(batch, device):
-    tac, rgb, ft, grip, gf, label, pose_label = batch
-    lengths = [tac.shape[1]] * tac.shape[0]  # uniform T since L is fixed
+    if len(batch) == 8:
+        # From collate_variable_length
+        tac, rgb, ft, grip, gf, label, pose_label, lengths = batch
+    else:
+        tac, rgb, ft, grip, gf, label, pose_label = batch
+        lengths = torch.tensor([tac.shape[1]] * tac.shape[0], dtype=torch.long)
     return (
         tac.to(device),
         rgb.to(device),
@@ -168,7 +184,7 @@ def evaluate(model, loader, criterion, device):
     tp, fp, fn, n = 0, 0, 0, 0
     for batch in loader:
         tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
-        logits = model(tac, rgb, ft, grip, gf).squeeze(1)   # (B,)
+        logits = model(tac, rgb, ft, grip, gf, lengths).squeeze(1)   # (B,)
         total_loss += criterion(logits, label.float()).item() * len(label)
         preds  = logits > 0
         actual = label.bool()
@@ -210,12 +226,19 @@ def main():
         print("[WARN] wandb not installed — W&B logging disabled.")
 
     # set episode length cap before dataset construction
-    _dl.L = args.L
+    _dl.L = None if args.variable_length else args.L
     _dl.F1 = args.F1
     _dl.F2 = args.F2
 
+    # Set HF cache for CLIP/T3 when using clipt3
+    if args.model == 'clipt3':
+        cache_dir = os.path.join(os.path.dirname(args.pretrained_dir), '.cache', 'huggingface')
+        os.environ.setdefault('HF_HOME', cache_dir)
+        os.environ.setdefault('TEMU_PRETRAINED_DIR', args.pretrained_dir)
+
     # dataset
-    ds = PoseItDataset(root_dir=args.root_dir)
+    rgb_preprocess = 'clip' if args.model == 'clipt3' else 'imagenet'
+    ds = PoseItDataset(root_dir=args.root_dir, rgb_preprocess=rgb_preprocess)
     if args.subsample < 1.0:
         import random
         k = max(4, int(len(ds.samples) * args.subsample))
@@ -233,6 +256,12 @@ def main():
         print(f"Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
         print_dataset_stats(ds, train_set, val_set, test_set)
 
+    # Sensor standardization (FT, gripper, gripper_force) — PoseIt paper
+    if args.standardize_sensors:
+        sensor_stats = compute_sensor_stats(ds, train_set.indices)
+        ds.set_sensor_stats(sensor_stats)
+        print("Sensor standardization enabled (ft, gripper, gripper_force)")
+
     # deferred sampling
     sampler = DRSSampler(
         dataset=ds,
@@ -241,9 +270,13 @@ def main():
         indices=train_set.indices,
     )
 
-    train_loader = make_loader(train_set, sampler=sampler, num_workers=args.num_workers)
-    val_loader   = make_loader(val_set,   batch_size=args.batch_size, num_workers=args.num_workers)
-    test_loader  = make_loader(test_set,  batch_size=args.batch_size, num_workers=args.num_workers)
+    collate_fn = collate_variable_length if args.variable_length else None
+    train_loader = make_loader(train_set, sampler=sampler, num_workers=args.num_workers,
+                              collate_fn=collate_fn)
+    val_loader   = make_loader(val_set,   batch_size=args.batch_size, num_workers=args.num_workers,
+                              collate_fn=collate_fn)
+    test_loader  = make_loader(test_set,  batch_size=args.batch_size, num_workers=args.num_workers,
+                              collate_fn=collate_fn)
 
     # pos_weight: upweight minority (unstable) to avoid predicting only majority class
     train_labels = [ds.samples[i]['label'].item() for i in train_set.indices]
@@ -253,16 +286,30 @@ def main():
     print(f"pos_weight={pos_weight.item():.3f} (n_pos={n_pos}, n_neg={n_neg})")
 
     # Model
-    model = GraspStabilityLSTM(
-        frames_per_sec=F2,
-        ft_dim=FT_DIM,
-        gripper_dim=GR_DIM,
-        hidden_dim=args.hidden_dim,
-        lstm_layers=args.lstm_layers,
-        bidirectional=not args.unidirectional,
-        dropout=args.dropout,
-        modalities=args.modalities,
-    ).to(device)
+    if args.model == 'clipt3':
+        model = GraspStabilityLSTM_CLIP_T3(
+            frames_per_sec=F2,
+            ft_dim=FT_DIM,
+            gripper_dim=GR_DIM,
+            hidden_dim=args.hidden_dim,
+            lstm_layers=args.lstm_layers,
+            bidirectional=not args.unidirectional,
+            dropout=args.dropout,
+            modalities=args.modalities,
+            pretrained_dir=args.pretrained_dir,
+            t3_encoder_domain=args.t3_encoder_domain,
+        ).to(device)
+    else:
+        model = GraspStabilityLSTM(
+            frames_per_sec=F2,
+            ft_dim=FT_DIM,
+            gripper_dim=GR_DIM,
+            hidden_dim=args.hidden_dim,
+            lstm_layers=args.lstm_layers,
+            bidirectional=not args.unidirectional,
+            dropout=args.dropout,
+            modalities=args.modalities,
+        ).to(device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.SGD(
@@ -301,7 +348,7 @@ def main():
             tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
 
             optimizer.zero_grad()
-            logits = model(tac, rgb, ft, grip, gf).squeeze(1)  # (B,)
+            logits = model(tac, rgb, ft, grip, gf, lengths).squeeze(1)  # (B,)
             loss   = criterion(logits, label.float())
             loss.backward()
             optimizer.step()
