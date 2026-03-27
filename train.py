@@ -10,6 +10,11 @@ python train.py --split pose --test_poses 1 2 3 4 5 --sigma 1.0
 
 # random
 python train.py --split random --anneal_iter 300 --n_iters 600
+
+# Full resume (model + optimizer + scheduler + iteration + DRS + best_val_f1):
+#   python train.py ... --resume trained_models/training_state.pt
+#   python train.py ... --resume trained_models/best_training_state.pt   # last best-val snapshot
+# Warm-start weights only (plain .pt, iter 0): --resume path/to/best_model.pt --resume_best_f1 0.67
 """
 
 import argparse
@@ -141,6 +146,19 @@ def parse_args():
     p.add_argument('--pretrained_dir', default='/ocean/projects/cis260031p/shared/pretrained',
                    help='Directory for T3 pretrained weights (for clipt3)')
     p.add_argument("--model_save_path", type=str, default="trained_models/best_model.pt")
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="training_state.pt or best_training_state.pt: full resume (iter, optimizer, LR, DRS). "
+             "Plain state_dict .pt (e.g. old best_model.pt): weights only, iter 0 — use --resume_best_f1.",
+    )
+    p.add_argument(
+        "--resume_best_f1",
+        type=float,
+        default=None,
+        help="Only for plain-weight resume: previous best val F1. Default 0.0.",
+    )
     return p.parse_args()
 
 
@@ -205,6 +223,77 @@ def evaluate(model, loader, criterion, device):
     f1        = (2 * precision * recall / (precision + recall)
                  if (precision + recall) > 0 else 0.0)
     return total_loss / n, acc, precision, recall, f1
+
+
+def _torch_load(path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def _load_model_weights(path, model, device):
+    """Load only model weights (plain state_dict or dict with 'model' key)."""
+    ckpt = _torch_load(path, device)
+    if isinstance(ckpt, dict) and 'model' in ckpt:
+        model.load_state_dict(ckpt['model'], strict=True)
+    else:
+        model.load_state_dict(ckpt, strict=True)
+
+
+def _is_full_training_checkpoint(ckpt) -> bool:
+    return (
+        isinstance(ckpt, dict)
+        and 'model' in ckpt
+        and 'optimizer' in ckpt
+        and 'next_iteration' in ckpt
+    )
+
+
+def _save_training_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    iteration,
+    best_val_f1,
+    drs_active,
+    args,
+):
+    """Full state for --resume. next_iteration = first iteration index to run on resume."""
+    payload = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'next_iteration': iteration + 1,
+        'best_val_f1': best_val_f1,
+        'drs_active': bool(drs_active),
+        'config': vars(args).copy(),
+    }
+    torch.save(payload, path)
+
+
+def _apply_full_resume(ckpt, model, optimizer, scheduler, sampler, args):
+    """Restore training loop state. Returns (next_iteration, best_val_f1)."""
+    model.load_state_dict(ckpt['model'], strict=True)
+    optimizer.load_state_dict(ckpt['optimizer'])
+    scheduler.load_state_dict(ckpt['scheduler'])
+    next_it = int(ckpt['next_iteration'])
+    best = float(ckpt.get('best_val_f1', 0.0))
+    if ckpt.get('drs_active', False):
+        sampler.activate()
+    saved = ckpt.get('config') or {}
+    for key in ('model', 'split', 'modalities', 'hidden_dim', 'lstm_layers'):
+        if key in saved and key in vars(args) and saved[key] != getattr(args, key):
+            print(
+                f"[resume][WARN] CLI {key}={getattr(args, key)!r} differs from "
+                f"checkpoint {key}={saved[key]!r}"
+            )
+    print(
+        f"[resume] Full state: next_iteration={next_it}  best_val_f1={best:.4f}  "
+        f"drs_active={sampler.is_active}"
+    )
+    return next_it, best
 
 
 def main():
@@ -335,13 +424,30 @@ def main():
 
     # checkpoint paths
     save_dir    = os.path.dirname(args.model_save_path) or '.'
-    latest_path = os.path.join(save_dir, 'model_latest.pt')
+    training_state_path = os.path.join(save_dir, 'training_state.pt')
+    best_training_state_path = os.path.join(save_dir, 'best_training_state.pt')
     os.makedirs(save_dir, exist_ok=True)
 
-    # training loop
-    best_val_f1 = 0.0
-    iteration   = 0
+    if args.resume:
+        if not os.path.isfile(args.resume):
+            raise FileNotFoundError(args.resume)
+        ckpt = _torch_load(args.resume, device)
+        if _is_full_training_checkpoint(ckpt):
+            iteration, best_val_f1 = _apply_full_resume(
+                ckpt, model, optimizer, scheduler, sampler, args)
+        else:
+            _load_model_weights(args.resume, model, device)
+            best_val_f1 = args.resume_best_f1 if args.resume_best_f1 is not None else 0.0
+            iteration = 0
+            print(
+                f"[resume] Plain weights only from {args.resume!r}  "
+                f"initial best_val_f1={best_val_f1:.4f}  (iteration=0, fresh optimizer/scheduler)"
+            )
+    else:
+        best_val_f1 = 0.0
+        iteration = 0
 
+    # training loop
     while iteration < args.n_iters:
         model.train()
 
@@ -391,16 +497,37 @@ def main():
 
                 if val_f1 > best_val_f1:
                     best_val_f1 = val_f1
+                    # Plain state_dict — compatible with scripts/eval_test.py
                     torch.save(model.state_dict(), args.model_save_path)
+                    _save_training_checkpoint(
+                        best_training_state_path,
+                        model,
+                        optimizer,
+                        scheduler,
+                        iteration,
+                        best_val_f1,
+                        sampler.is_active,
+                        args,
+                    )
 
-                # Rolling latest checkpoint — delete previous, save current
-                if os.path.exists(latest_path):
-                    os.remove(latest_path)
-                torch.save(model.state_dict(), latest_path)
+                # Always: full state for crash recovery / --resume
+                if os.path.exists(training_state_path):
+                    os.remove(training_state_path)
+                _save_training_checkpoint(
+                    training_state_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    iteration,
+                    best_val_f1,
+                    sampler.is_active,
+                    args,
+                )
 
-                # Upload both checkpoints to W&B
                 if use_wandb:
-                    wandb.save(latest_path, base_path=save_dir)
+                    wandb.save(training_state_path, base_path=save_dir)
+                    if os.path.exists(best_training_state_path):
+                        wandb.save(best_training_state_path, base_path=save_dir)
                     if os.path.exists(args.model_save_path):
                         wandb.save(args.model_save_path, base_path=save_dir)
 

@@ -163,7 +163,12 @@ def main():
             modalities=args.modalities,
         ).to(device)
 
-    state = torch.load(args.checkpoint, map_location=device)
+    try:
+        state = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    except TypeError:
+        state = torch.load(args.checkpoint, map_location=device)
+    if isinstance(state, dict) and 'model' in state:
+        state = state['model']
     model.load_state_dict(state, strict=True)
     print(f"Loaded checkpoint: {args.checkpoint}")
 
