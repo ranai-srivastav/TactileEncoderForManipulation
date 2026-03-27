@@ -97,7 +97,7 @@ class GraspStabilityLSTM(nn.Module):
         self.head_prop = nn.Linear(hidden_dim, 1)
 
         # --- 2-layer LSTM/GRU (bidirectional or unidirectional) ---
-        self.lstm = nn.GRU(
+        self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=lstm_layers,
