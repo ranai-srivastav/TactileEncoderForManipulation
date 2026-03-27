@@ -1,11 +1,11 @@
 """
-GradCAM-based Deletion/Insertion AUC evaluation for GraspClassifier (unimodal_2d.py).
+GradCAM-based Deletion/Insertion AUC evaluation for GraspStabilityLSTM (model.py).
 
 Usage:
     python gradcam_metric.py \
         --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
         --modality rgb \
-        --checkpoint trained_models/best_2d.pt \
+        --checkpoint trained_models/best_model.pt \
         --steps 10 \
         --n_samples 50 \
         --vis_dir gradcam_vis
@@ -32,46 +32,74 @@ import torch.nn as nn
 
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'unimodal'))
 
 import dataloader as _dl
 from dataloader import PoseItDataset, split_by_object
-from unimodal_2d import GraspClassifier
+from model import GraspStabilityLSTM
 
 
 # ---------------------------------------------------------------------------
-# Wrapper: lets GradCAM feed (B, 3, H, W) into a model expecting (B,T,F1,3,H,W)
+# Wrapper: lets GradCAM feed (1, 3, H, W) into a model expecting full sequences
 # ---------------------------------------------------------------------------
 
-class SingleFrameWrapper(nn.Module):
-    def __init__(self, model: GraspClassifier):
+class LSTMFrameWrapper(nn.Module):
+    """
+    Holds a full sequence context; substitutes a single frame at timestep t
+    so GradCAM can treat the model as a function of that one frame.
+    """
+    def __init__(self, model: GraspStabilityLSTM,
+                 full_tactile, full_rgb, ft, gripper, gripper_force,
+                 t: int, modality: str = 'tactile'):
         super().__init__()
-        self.model = model
+        self.model           = model
+        self.full_tactile    = full_tactile    # (1, T, F1, 3, H, W)
+        self.full_rgb        = full_rgb        # (1, T, F1, 3, H, W)
+        self.ft              = ft              # (1, T, FT_DIM)
+        self.gripper         = gripper         # (1, T, GR_DIM)
+        self.gripper_force   = gripper_force   # (1, 1)
+        self.t               = t
+        self.modality        = modality
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        # img: (B, 3, H, W)
-        B = img.shape[0]
-        imgs = img.unsqueeze(1).unsqueeze(1)                        # (B, 1, 1, 3, H, W)
-        lengths = torch.ones(B, dtype=torch.long, device=img.device)
-        return self.model(imgs, lengths)                            # (B, 2)
+        # img: (1, 3, H, W) — the frame being probed by GradCAM
+        tac = self.full_tactile.clone()
+        rgb = self.full_rgb.clone()
+        if self.modality == 'tactile':
+            tac[:, self.t, 0] = img
+        else:
+            rgb[:, self.t, 0] = img
+        return self.model(tac, rgb, self.ft, self.gripper, self.gripper_force)  # (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Confidence helper (BCEWithLogitsLoss: single logit output)
+# ---------------------------------------------------------------------------
+
+def _conf(logit: torch.Tensor, target_class: int) -> float:
+    """Convert raw BCEWithLogits logit (1,1) to P(target_class)."""
+    p = torch.sigmoid(logit)[0, 0].item()
+    return p if target_class == 1 else 1.0 - p
 
 
 # ---------------------------------------------------------------------------
 # GradCAM heatmap for a single frame
 # ---------------------------------------------------------------------------
 
-def gradcam_heatmap(wrapper: SingleFrameWrapper, frame_tensor: torch.Tensor,
+def gradcam_heatmap(wrapper: LSTMFrameWrapper, frame_tensor: torch.Tensor,
                     target_layer, target_class: int) -> np.ndarray:
     """
     frame_tensor: (1, 3, H, W) float32 on the correct device
     Returns: (H, W) numpy array in [0, 1]
+
+    For class 1 (slip/drop): maximize logit.
+    For class 0 (pass): maximize −logit (= minimize logit).
     """
+    sign = 1.0 if target_class == 1 else -1.0
+    targets = [lambda out, s=sign: s * out[0, 0]]
     with GradCAM(model=wrapper, target_layers=[target_layer]) as cam:
-        targets = [ClassifierOutputTarget(target_class)]
-        heatmap = cam(input_tensor=frame_tensor, targets=targets)   # (1, H, W)
+        heatmap = cam(input_tensor=frame_tensor, targets=targets)  # (1, H, W)
     return heatmap[0]                                               # (H, W)
 
 
@@ -79,7 +107,7 @@ def gradcam_heatmap(wrapper: SingleFrameWrapper, frame_tensor: torch.Tensor,
 # Deletion AUC
 # ---------------------------------------------------------------------------
 
-def deletion_auc(wrapper: SingleFrameWrapper, frame_tensor: torch.Tensor,
+def deletion_auc(wrapper: LSTMFrameWrapper, frame_tensor: torch.Tensor,
                  heatmap: np.ndarray, steps: int, target_class: int):
     """
     Progressively zero out the most important pixels (by heatmap rank).
@@ -100,8 +128,7 @@ def deletion_auc(wrapper: SingleFrameWrapper, frame_tensor: torch.Tensor,
                 mask2d = torch.from_numpy(mask.reshape(H, W)).to(frame_tensor.device)
                 masked[:, :, mask2d == 1] = 0.0
             logit = wrapper(masked)
-            conf = torch.softmax(logit, dim=1)[0, target_class].item()
-            confidences.append(conf)
+            confidences.append(_conf(logit, target_class))
 
     return float(np.trapezoid(confidences, dx=1.0 / steps)), confidences
 
@@ -110,7 +137,7 @@ def deletion_auc(wrapper: SingleFrameWrapper, frame_tensor: torch.Tensor,
 # Insertion AUC
 # ---------------------------------------------------------------------------
 
-def insertion_auc(wrapper: SingleFrameWrapper, frame_tensor: torch.Tensor,
+def insertion_auc(wrapper: LSTMFrameWrapper, frame_tensor: torch.Tensor,
                   frame_np: np.ndarray, heatmap: np.ndarray,
                   steps: int, target_class: int):
     """
@@ -135,8 +162,7 @@ def insertion_auc(wrapper: SingleFrameWrapper, frame_tensor: torch.Tensor,
                 mask2d = torch.from_numpy(mask.reshape(H, W)).to(frame_tensor.device)
                 revealed[:, :, mask2d == 1] = frame_tensor[:, :, mask2d == 1]
             logit = wrapper(revealed)
-            conf = torch.softmax(logit, dim=1)[0, target_class].item()
-            confidences.append(conf)
+            confidences.append(_conf(logit, target_class))
 
     return float(np.trapezoid(confidences, dx=1.0 / steps)), confidences
 
@@ -186,8 +212,8 @@ def save_curves_plot(all_del_curves: list, all_ins_curves: list,
 
     _, ax = plt.subplots(figsize=(6, 4))
     for arr, color, label in [
-        (del_arr, 'tomato',      'Deletion (↓ better)'),
-        (ins_arr, 'steelblue',   'Insertion (↑ better)'),
+        (del_arr, 'tomato',    'Deletion (↓ better)'),
+        (ins_arr, 'steelblue', 'Insertion (↑ better)'),
     ]:
         mean = arr.mean(axis=0)
         std  = arr.std(axis=0)
@@ -209,7 +235,7 @@ def save_curves_plot(all_del_curves: list, all_ins_curves: list,
 # Evaluate over a dataset split
 # ---------------------------------------------------------------------------
 
-def evaluate_gradcam(model: GraspClassifier, dataset: PoseItDataset,
+def evaluate_gradcam(model: GraspStabilityLSTM, dataset: PoseItDataset,
                      indices, modality: str, steps: int,
                      n_samples: int, n_vis: int, vis_dir: str, device: str):
     """
@@ -217,11 +243,13 @@ def evaluate_gradcam(model: GraspClassifier, dataset: PoseItDataset,
     Saves GradCAM overlay grid and curve plot to vis_dir.
     Returns mean deletion AUC, mean insertion AUC, mean delta.
     """
-    wrapper = SingleFrameWrapper(model).to(device)
-    wrapper.eval()
-    target_layer = wrapper.model.backbone.layer4[-1]
-    # GradCAM needs gradients through the target layer even when backbone is frozen
-    for p in wrapper.model.backbone.layer4.parameters():
+    model.eval()
+
+    # Target layer: layer4[-1] of the relevant ResNet encoder
+    encoder = model.tactile_encoder if modality == 'tactile' else model.rgb_encoder
+    target_layer = encoder.layer4[-1]
+    # Unfreeze layer4 so GradCAM can compute gradients through it
+    for p in target_layer.parameters():
         p.requires_grad_(True)
 
     rng = np.random.default_rng(42)
@@ -229,26 +257,36 @@ def evaluate_gradcam(model: GraspClassifier, dataset: PoseItDataset,
 
     del_aucs, ins_aucs = [], []
     all_del_curves, all_ins_curves = [], []
-    vis_items = []  # collect first n_vis samples for the overlay grid
+    vis_items = []
 
     for idx in chosen:
         sample = dataset[idx]
         # 7-tuple: (tactile, rgb, ft, gripper, gripper_force, label, pose_label)
-        tactile, rgb, _, _, _, label, _ = sample
-        imgs = tactile if modality == 'tactile' else rgb  # (T, F1, 3, H, W)
+        tactile, rgb, ft, gripper, gripper_force, label, _ = sample
         target_class = int(label.item())
 
-        T = imgs.shape[0]
+        # Add batch dim and move to device
+        tac = tactile.unsqueeze(0).to(device)       # (1, T, F1, 3, H, W)
+        rgb_ = rgb.unsqueeze(0).to(device)          # (1, T, F1, 3, H, W)
+        ft_  = ft.unsqueeze(0).to(device)           # (1, T, FT_DIM)
+        grip = gripper.unsqueeze(0).to(device)      # (1, T, GR_DIM)
+        gf   = gripper_force.unsqueeze(0).to(device)  # (1, 1)
+
+        T = tac.shape[1]
         frame_del_aucs, frame_ins_aucs = [], []
-        # Use middle frame for the overlay grid
         mid_t = T // 2
         mid_heatmap = None
         mid_frame_np = None
 
+        imgs = tac if modality == 'tactile' else rgb_
+
         for t in range(T):
-            frame_np = imgs[t, 0].permute(1, 2, 0).numpy().astype(np.float32)
+            frame_np = imgs[0, t, 0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
             frame_np = np.clip(frame_np, 0.0, 1.0)
             frame_tensor = torch.from_numpy(frame_np).permute(2, 0, 1).unsqueeze(0).to(device)
+
+            wrapper = LSTMFrameWrapper(model, tac, rgb_, ft_, grip, gf, t, modality)
+            wrapper.eval()
 
             heatmap = gradcam_heatmap(wrapper, frame_tensor, target_layer, target_class)
 
@@ -281,7 +319,6 @@ def evaluate_gradcam(model: GraspClassifier, dataset: PoseItDataset,
                 'ins_auc':  sample_ins,
             })
 
-    # Save visualizations
     if vis_dir:
         os.makedirs(vis_dir, exist_ok=True)
         save_overlay_grid(vis_items,
@@ -302,16 +339,21 @@ def evaluate_gradcam(model: GraspClassifier, dataset: PoseItDataset,
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--root_dir',    required=True)
-    p.add_argument('--modality',    default='rgb', choices=['rgb', 'tactile'])
+    p.add_argument('--modality',    default='tactile', choices=['rgb', 'tactile'])
     p.add_argument('--checkpoint',  required=True,
-                   help='Path to best_2d.pt checkpoint')
-    p.add_argument('--split',       default='object',
+                   help='Path to best_model.pt checkpoint')
+    p.add_argument('--split',       default='random',
                    choices=['object', 'pose', 'random'])
     p.add_argument('--test_objects', nargs='+',
                    default=['mug', 'bowl', 'flashlight'])
-    p.add_argument('--L',           type=int, default=3)
+    p.add_argument('--L',           type=int, default=20)
     p.add_argument('--F1',          type=int, default=1)
     p.add_argument('--F2',          type=int, default=1)
+    p.add_argument('--hidden_dim',  type=int, default=256)
+    p.add_argument('--lstm_layers', type=int, default=2)
+    p.add_argument('--dropout',     type=float, default=0.1)
+    p.add_argument('--modalities',  nargs='+', default=None,
+                   help='Active modalities, e.g. --modalities V T FT (default: all)')
     p.add_argument('--steps',       type=int, default=10,
                    help='Number of masking steps for deletion/insertion curves')
     p.add_argument('--n_samples',   type=int, default=50,
@@ -320,7 +362,6 @@ def parse_args():
                    help='Number of samples to include in the overlay grid')
     p.add_argument('--vis_dir',     type=str, default='gradcam_vis',
                    help='Directory to save visualizations (set to "" to skip)')
-    p.add_argument('--freeze_backbone', action='store_true', default=True)
     return p.parse_args()
 
 
@@ -337,14 +378,26 @@ def main():
 
     if args.split == 'object':
         _, _, test_set = split_by_object(ds, test_objects=args.test_objects)
+    elif args.split == 'pose':
+        from dataloader import split_by_pose
+        _, _, test_set = split_by_pose(ds)
     else:
         from dataloader import uniform_random_split
         _, _, test_set = uniform_random_split(ds)
 
-    model = GraspClassifier(freeze_backbone=args.freeze_backbone).to(device)
+    model = GraspStabilityLSTM(
+        frames_per_sec=args.F1,
+        ft_dim=_dl.FT_DIM,
+        gripper_dim=_dl.GR_DIM,
+        hidden_dim=args.hidden_dim,
+        lstm_layers=args.lstm_layers,
+        dropout=args.dropout,
+        freeze_resnet=True,
+        modalities=args.modalities,
+    ).to(device)
+
     assert os.path.exists(args.checkpoint), f"Checkpoint not found: {args.checkpoint}"
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
-    model.eval()
     print(f"Loaded checkpoint: {args.checkpoint}")
     print(f"Evaluating {min(args.n_samples, len(test_set.indices))} test samples...\n")
 
