@@ -1,25 +1,25 @@
 """
-GradCAM-based Deletion/Insertion AUC evaluation for GraspStabilityLSTM (model.py).
+GradCAM-based Insertion AUC evaluation for GraspStabilityLSTM (model.py).
 
-Computes GradCAM heatmaps from BOTH vision encoders (tactile + RGB) and performs
-deletion/insertion by masking both modalities simultaneously.
+Reports per-modality Insertion AUC (tactile, RGB, or both separately).
 
 Usage:
+    # Both modalities
     python gradcam_metric.py \
         --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
         --checkpoint trained_models/best_model.pt \
-        --steps 10 \
-        --n_samples 50 \
-        --vis_dir gradcam_vis
+        --gradcam_mode both --L 5 --modalities V T
+
+    # Single modality
+    python gradcam_metric.py \
+        --root_dir ... --checkpoint ... --gradcam_mode rgb --L 5 --modalities V
 
 Metrics:
-    Deletion AUC  — lower is better  (masking important pixels collapses confidence)
     Insertion AUC — higher is better (revealing important pixels restores confidence)
-    Delta = Insertion - Deletion     — higher is better, primary reported number
 
 Outputs (saved to --vis_dir):
-    gradcam_grid.png   — grid of [tactile | tac overlay | rgb | rgb overlay] per sample
-    curves.png         — mean ± std deletion/insertion confidence curves
+    gradcam_grid.png   — overlay grid per sample
+    curves.png         — mean ± std insertion confidence curves
 """
 
 import argparse
@@ -72,7 +72,11 @@ class LSTMFrameWrapper(nn.Module):
             tac[:, self.t, 0] = img
         else:
             rgb[:, self.t, 0] = img
-        return self.model(tac, rgb, self.ft, self.gripper, self.gripper_force)  # (1, 1)
+        # cuDNN RNN backward requires training mode
+        self.model.lstm.train()
+        out = self.model(tac, rgb, self.ft, self.gripper, self.gripper_force)  # (1, 1)
+        self.model.lstm.eval()
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +98,6 @@ def gradcam_heatmap(wrapper: LSTMFrameWrapper, frame_tensor: torch.Tensor,
     """
     frame_tensor: (1, 3, H, W) float32 on the correct device
     Returns: (H, W) numpy array in [0, 1]
-
-    For class 1 (slip/drop): maximize logit.
-    For class 0 (pass): maximize −logit (= minimize logit).
     """
     sign = 1.0 if target_class == 1 else -1.0
     targets = [lambda out, s=sign: s * out.flatten()[0]]
@@ -106,104 +107,50 @@ def gradcam_heatmap(wrapper: LSTMFrameWrapper, frame_tensor: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# Multimodal Deletion AUC
+# Single-modality Insertion AUC
 # ---------------------------------------------------------------------------
 
-def deletion_auc(model: GraspStabilityLSTM,
-                 tac: torch.Tensor, rgb: torch.Tensor,
-                 ft: torch.Tensor, gripper: torch.Tensor, gripper_force: torch.Tensor,
-                 t: int,
-                 tac_heatmap: np.ndarray, rgb_heatmap: np.ndarray,
-                 steps: int, target_class: int):
+def insertion_auc_single(model: GraspStabilityLSTM,
+                         tac: torch.Tensor, rgb: torch.Tensor,
+                         ft: torch.Tensor, gripper: torch.Tensor, gripper_force: torch.Tensor,
+                         t: int, heatmap: np.ndarray, frame_np: np.ndarray,
+                         modality: str, steps: int, target_class: int):
     """
-    Progressively zero out the most important pixels in BOTH modalities
-    (each ranked by its own heatmap) simultaneously.
+    Blur→reveal for a single modality while keeping the other unchanged.
     Returns: (auc float, confidences list of length steps+1)
     """
-    H, W = tac_heatmap.shape
-    tac_order = tac_heatmap.flatten().argsort()[::-1]
-    rgb_order = rgb_heatmap.flatten().argsort()[::-1]
-    n_pixels = tac_order.size
-
-    confidences = []
-    with torch.no_grad():
-        for step in range(steps + 1):
-            k = int(step / steps * n_pixels)
-            masked_tac = tac.clone()
-            masked_rgb = rgb.clone()
-            if k > 0:
-                # Tactile mask
-                tac_mask = np.zeros(n_pixels, dtype=np.float32)
-                tac_mask[tac_order[:k]] = 1.0
-                tac_mask2d = torch.from_numpy(tac_mask.reshape(H, W)).to(tac.device)
-                masked_tac[:, t, 0, :, tac_mask2d == 1] = 0.0
-
-                # RGB mask
-                rgb_mask = np.zeros(n_pixels, dtype=np.float32)
-                rgb_mask[rgb_order[:k]] = 1.0
-                rgb_mask2d = torch.from_numpy(rgb_mask.reshape(H, W)).to(rgb.device)
-                masked_rgb[:, t, 0, :, rgb_mask2d == 1] = 0.0
-
-            logit = model(masked_tac, masked_rgb, ft, gripper, gripper_force)
-            confidences.append(_conf(logit, target_class))
-
-    return float(np.trapezoid(confidences, dx=1.0 / steps)), confidences
-
-
-# ---------------------------------------------------------------------------
-# Multimodal Insertion AUC
-# ---------------------------------------------------------------------------
-
-def insertion_auc(model: GraspStabilityLSTM,
-                  tac: torch.Tensor, rgb: torch.Tensor,
-                  ft: torch.Tensor, gripper: torch.Tensor, gripper_force: torch.Tensor,
-                  t: int,
-                  tac_heatmap: np.ndarray, rgb_heatmap: np.ndarray,
-                  tac_frame_np: np.ndarray, rgb_frame_np: np.ndarray,
-                  steps: int, target_class: int):
-    """
-    Start from blurred baselines for both modalities; progressively reveal
-    the most important pixels in each (ranked by respective heatmaps).
-    Returns: (auc float, confidences list of length steps+1)
-    """
-    H, W = tac_heatmap.shape
-    tac_order = tac_heatmap.flatten().argsort()[::-1]
-    rgb_order = rgb_heatmap.flatten().argsort()[::-1]
-    n_pixels = tac_order.size
+    H, W = heatmap.shape
+    order = heatmap.flatten().argsort()[::-1]
+    n_pixels = order.size
     device = tac.device
 
-    # Build blurred baselines
-    tac_blurred_np = cv2.GaussianBlur(tac_frame_np, (51, 51), 0)
-    rgb_blurred_np = cv2.GaussianBlur(rgb_frame_np, (51, 51), 0)
+    blurred_np = cv2.GaussianBlur(frame_np, (51, 51), 0)
 
-    # Create baseline sequences (clone full sequence, replace frame t with blurred)
-    tac_baseline = tac.clone()
-    tac_baseline[:, t, 0] = torch.from_numpy(tac_blurred_np).permute(2, 0, 1).to(device)
-    rgb_baseline = rgb.clone()
-    rgb_baseline[:, t, 0] = torch.from_numpy(rgb_blurred_np).permute(2, 0, 1).to(device)
-
-    # Original frame tensors for revealing
-    tac_orig = tac[:, t, 0]  # (1, 3, H, W)
-    rgb_orig = rgb[:, t, 0]
+    # Clone full sequences; replace frame t with blurred for the target modality
+    tac_seq = tac.clone()
+    rgb_seq = rgb.clone()
+    if modality == 'tactile':
+        tac_seq[:, t, 0] = torch.from_numpy(blurred_np).permute(2, 0, 1).to(device)
+        orig = tac[:, t, 0]  # (1, 3, H, W)
+    else:
+        rgb_seq[:, t, 0] = torch.from_numpy(blurred_np).permute(2, 0, 1).to(device)
+        orig = rgb[:, t, 0]
 
     confidences = []
     with torch.no_grad():
         for step in range(steps + 1):
             k = int(step / steps * n_pixels)
-            revealed_tac = tac_baseline.clone()
-            revealed_rgb = rgb_baseline.clone()
+            rev_tac = tac_seq.clone()
+            rev_rgb = rgb_seq.clone()
             if k > 0:
-                tac_mask = np.zeros(n_pixels, dtype=np.float32)
-                tac_mask[tac_order[:k]] = 1.0
-                tac_mask2d = torch.from_numpy(tac_mask.reshape(H, W)).to(device)
-                revealed_tac[:, t, 0, :, tac_mask2d == 1] = tac_orig[:, :, tac_mask2d == 1]
-
-                rgb_mask = np.zeros(n_pixels, dtype=np.float32)
-                rgb_mask[rgb_order[:k]] = 1.0
-                rgb_mask2d = torch.from_numpy(rgb_mask.reshape(H, W)).to(device)
-                revealed_rgb[:, t, 0, :, rgb_mask2d == 1] = rgb_orig[:, :, rgb_mask2d == 1]
-
-            logit = model(revealed_tac, revealed_rgb, ft, gripper, gripper_force)
+                mask = np.zeros(n_pixels, dtype=np.float32)
+                mask[order[:k]] = 1.0
+                mask2d = torch.from_numpy(mask.reshape(H, W)).to(device)
+                if modality == 'tactile':
+                    rev_tac[:, t, 0, :, mask2d == 1] = orig[:, :, mask2d == 1]
+                else:
+                    rev_rgb[:, t, 0, :, mask2d == 1] = orig[:, :, mask2d == 1]
+            logit = model(rev_tac, rev_rgb, ft, gripper, gripper_force)
             confidences.append(_conf(logit, target_class))
 
     return float(np.trapezoid(confidences, dx=1.0 / steps)), confidences
@@ -213,38 +160,57 @@ def insertion_auc(model: GraspStabilityLSTM,
 # Visualizations
 # ---------------------------------------------------------------------------
 
-def save_overlay_grid(vis_items: list, save_path: str):
+def save_overlay_grid(vis_items: list, gradcam_mode: str, save_path: str):
     """
-    vis_items: list of dicts with keys:
-        idx, label, tac_frame_np, rgb_frame_np, tac_heatmap, rgb_heatmap, del_auc, ins_auc
-    Saves a grid: each row = one sample, cols = [tactile | tac overlay | rgb | rgb overlay]
+    Saves a grid of GradCAM overlays. Columns adapt to gradcam_mode.
     """
     n = len(vis_items)
-    _, axes = plt.subplots(n, 4, figsize=(12, 3 * n))
+    if gradcam_mode == 'both':
+        ncols = 4  # tac | tac overlay | rgb | rgb overlay
+    else:
+        ncols = 2  # original | overlay
+
+    _, axes = plt.subplots(n, ncols, figsize=(3 * ncols, 3 * n))
     if n == 1:
         axes = axes[np.newaxis, :]
 
     for row, item in enumerate(vis_items):
-        tac_overlay = show_cam_on_image(item['tac_frame_np'], item['tac_heatmap'], use_rgb=True)
-        rgb_overlay = show_cam_on_image(item['rgb_frame_np'], item['rgb_heatmap'], use_rgb=True)
         label_str = 'slip/drop' if item['label'] == 1 else 'pass'
 
-        axes[row, 0].imshow(item['tac_frame_np'])
-        axes[row, 0].set_title(f"Tactile | sample {item['idx']} | {label_str}", fontsize=8)
-        axes[row, 0].axis('off')
+        if gradcam_mode == 'both':
+            tac_overlay = show_cam_on_image(item['tac_frame_np'], item['tac_heatmap'], use_rgb=True)
+            rgb_overlay = show_cam_on_image(item['rgb_frame_np'], item['rgb_heatmap'], use_rgb=True)
 
-        axes[row, 1].imshow(tac_overlay)
-        axes[row, 1].set_title(f"Tactile GradCAM", fontsize=8)
-        axes[row, 1].axis('off')
+            axes[row, 0].imshow(item['tac_frame_np'])
+            axes[row, 0].set_title(f"Tactile | {item['idx']} | {label_str}", fontsize=8)
+            axes[row, 0].axis('off')
+            axes[row, 1].imshow(tac_overlay)
+            axes[row, 1].set_title(f"Tac ins={item['tac_ins']:.3f}", fontsize=8)
+            axes[row, 1].axis('off')
+            axes[row, 2].imshow(item['rgb_frame_np'])
+            axes[row, 2].set_title(f"RGB | {item['idx']} | {label_str}", fontsize=8)
+            axes[row, 2].axis('off')
+            axes[row, 3].imshow(rgb_overlay)
+            axes[row, 3].set_title(f"RGB ins={item['rgb_ins']:.3f}", fontsize=8)
+            axes[row, 3].axis('off')
 
-        axes[row, 2].imshow(item['rgb_frame_np'])
-        axes[row, 2].set_title(f"RGB | sample {item['idx']} | {label_str}", fontsize=8)
-        axes[row, 2].axis('off')
+        elif gradcam_mode == 'tactile':
+            overlay = show_cam_on_image(item['tac_frame_np'], item['tac_heatmap'], use_rgb=True)
+            axes[row, 0].imshow(item['tac_frame_np'])
+            axes[row, 0].set_title(f"Tactile | {item['idx']} | {label_str}", fontsize=8)
+            axes[row, 0].axis('off')
+            axes[row, 1].imshow(overlay)
+            axes[row, 1].set_title(f"Tac ins={item['tac_ins']:.3f}", fontsize=8)
+            axes[row, 1].axis('off')
 
-        axes[row, 3].imshow(rgb_overlay)
-        axes[row, 3].set_title(
-            f"RGB GradCAM  del={item['del_auc']:.3f}  ins={item['ins_auc']:.3f}", fontsize=8)
-        axes[row, 3].axis('off')
+        else:  # rgb
+            overlay = show_cam_on_image(item['rgb_frame_np'], item['rgb_heatmap'], use_rgb=True)
+            axes[row, 0].imshow(item['rgb_frame_np'])
+            axes[row, 0].set_title(f"RGB | {item['idx']} | {label_str}", fontsize=8)
+            axes[row, 0].axis('off')
+            axes[row, 1].imshow(overlay)
+            axes[row, 1].set_title(f"RGB ins={item['rgb_ins']:.3f}", fontsize=8)
+            axes[row, 1].axis('off')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=120, bbox_inches='tight')
@@ -252,29 +218,25 @@ def save_overlay_grid(vis_items: list, save_path: str):
     print(f"  Saved overlay grid → {save_path}")
 
 
-def save_curves_plot(all_del_curves: list, all_ins_curves: list,
-                     steps: int, save_path: str):
+def save_curves_plot(curves_by_label: dict, steps: int, save_path: str):
     """
-    all_del_curves / all_ins_curves: list of lists, each of length steps+1
-    Plots mean ± std for deletion and insertion curves.
+    curves_by_label: {'Tactile': [...], 'RGB': [...]} — each value is list of curves
     """
     xs = np.linspace(0, 1, steps + 1)
-    del_arr = np.array(all_del_curves)   # (N, steps+1)
-    ins_arr = np.array(all_ins_curves)
+    colors = {'Tactile': 'darkorange', 'RGB': 'steelblue'}
 
     _, ax = plt.subplots(figsize=(6, 4))
-    for arr, color, label in [
-        (del_arr, 'tomato',    'Deletion (↓ better)'),
-        (ins_arr, 'steelblue', 'Insertion (↑ better)'),
-    ]:
+    for label, curves in curves_by_label.items():
+        arr = np.array(curves)
         mean = arr.mean(axis=0)
         std  = arr.std(axis=0)
-        ax.plot(xs, mean, color=color, label=label, linewidth=2)
-        ax.fill_between(xs, mean - std, mean + std, color=color, alpha=0.2)
+        c = colors.get(label, 'gray')
+        ax.plot(xs, mean, color=c, label=f'{label} Insertion', linewidth=2)
+        ax.fill_between(xs, mean - std, mean + std, color=c, alpha=0.2)
 
-    ax.set_xlabel('Fraction of pixels masked / revealed')
+    ax.set_xlabel('Fraction of pixels revealed')
     ax.set_ylabel('Model confidence (target class)')
-    ax.set_title('Multimodal Deletion / Insertion curves (mean ± std)')
+    ax.set_title('Insertion AUC curves (mean ± std)')
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -288,126 +250,123 @@ def save_curves_plot(all_del_curves: list, all_ins_curves: list,
 # ---------------------------------------------------------------------------
 
 def evaluate_gradcam(model: GraspStabilityLSTM, dataset: PoseItDataset,
-                     indices, steps: int,
+                     indices, gradcam_mode: str, steps: int,
                      n_samples: int, n_vis: int, vis_dir: str, device: str):
     """
-    Runs multimodal deletion/insertion AUC on n_samples from the given index set.
-    Computes GradCAM heatmaps from both tactile and RGB encoders, then masks
-    both modalities simultaneously for deletion/insertion.
-    Returns mean deletion AUC, mean insertion AUC, mean delta.
+    Runs per-modality Insertion AUC on n_samples from the given index set.
+    gradcam_mode: 'rgb', 'tactile', or 'both'
+    Returns dict with keys like 'tac_ins', 'rgb_ins' (whichever are active).
     """
     model.eval()
 
-    # Target layers: layer4[-1] of both ResNet encoders
-    tac_target_layer = model.tactile_encoder.layer4[-1]
-    rgb_target_layer = model.rgb_encoder.layer4[-1]
-    # Unfreeze layer4 so GradCAM can compute gradients through them
-    for p in tac_target_layer.parameters():
-        p.requires_grad_(True)
-    for p in rgb_target_layer.parameters():
-        p.requires_grad_(True)
+    do_tac = gradcam_mode in ('tactile', 'both')
+    do_rgb = gradcam_mode in ('rgb', 'both')
+
+    # Unfreeze target layers for GradCAM gradient computation
+    if do_tac:
+        tac_target_layer = model.tactile_encoder.layer4[-1]
+        for p in tac_target_layer.parameters():
+            p.requires_grad_(True)
+    if do_rgb:
+        rgb_target_layer = model.rgb_encoder.layer4[-1]
+        for p in rgb_target_layer.parameters():
+            p.requires_grad_(True)
 
     rng = np.random.default_rng(42)
     chosen = rng.choice(indices, size=min(n_samples, len(indices)), replace=False)
 
-    del_aucs, ins_aucs = [], []
-    all_del_curves, all_ins_curves = [], []
+    tac_ins_aucs, rgb_ins_aucs = [], []
+    tac_curves, rgb_curves = [], []
     vis_items = []
 
     for idx in chosen:
         sample = dataset[idx]
-        # 7-tuple: (tactile, rgb, ft, gripper, gripper_force, label, pose_label)
         tactile, rgb, ft, gripper, gripper_force, label, _ = sample
         target_class = int(label.item())
 
-        # Add batch dim and move to device
-        tac = tactile.unsqueeze(0).to(device)       # (1, T, F1, 3, H, W)
-        rgb_ = rgb.unsqueeze(0).to(device)           # (1, T, F1, 3, H, W)
-        ft_  = ft.unsqueeze(0).to(device)            # (1, T, FT_DIM)
-        grip = gripper.unsqueeze(0).to(device)       # (1, T, GR_DIM)
-        gf   = gripper_force.unsqueeze(0).to(device) # (1, 1)
+        tac = tactile.unsqueeze(0).to(device)
+        rgb_ = rgb.unsqueeze(0).to(device)
+        ft_  = ft.unsqueeze(0).to(device)
+        grip = gripper.unsqueeze(0).to(device)
+        gf   = gripper_force.unsqueeze(0).to(device)
 
         T = tac.shape[1]
-        frame_del_aucs, frame_ins_aucs = [], []
         mid_t = T // 2
-        mid_tac_heatmap = None
-        mid_rgb_heatmap = None
-        mid_tac_frame_np = None
-        mid_rgb_frame_np = None
+        sample_tac_ins, sample_rgb_ins = [], []
+        mid_vis = {}
 
         for t in range(T):
-            # Extract frame numpy arrays for both modalities
-            tac_frame_np = tac[0, t, 0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
-            tac_frame_np = np.clip(tac_frame_np, 0.0, 1.0)
-            tac_frame_tensor = torch.from_numpy(tac_frame_np).permute(2, 0, 1).unsqueeze(0).to(device)
+            if do_tac:
+                tac_frame_np = tac[0, t, 0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+                tac_frame_np = np.clip(tac_frame_np, 0.0, 1.0)
+                tac_frame_tensor = torch.from_numpy(tac_frame_np).permute(2, 0, 1).unsqueeze(0).to(device)
 
-            rgb_frame_np = rgb_[0, t, 0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
-            rgb_frame_np = np.clip(rgb_frame_np, 0.0, 1.0)
-            rgb_frame_tensor = torch.from_numpy(rgb_frame_np).permute(2, 0, 1).unsqueeze(0).to(device)
+                tac_wrapper = LSTMFrameWrapper(model, tac, rgb_, ft_, grip, gf, t, 'tactile')
+                tac_wrapper.eval()
+                tac_heatmap = gradcam_heatmap(tac_wrapper, tac_frame_tensor, tac_target_layer, target_class)
 
-            # GradCAM heatmap from tactile encoder
-            tac_wrapper = LSTMFrameWrapper(model, tac, rgb_, ft_, grip, gf, t, 'tactile')
-            tac_wrapper.eval()
-            tac_heatmap = gradcam_heatmap(tac_wrapper, tac_frame_tensor, tac_target_layer, target_class)
+                ti, ti_curve = insertion_auc_single(
+                    model, tac, rgb_, ft_, grip, gf, t,
+                    tac_heatmap, tac_frame_np, 'tactile', steps, target_class)
+                sample_tac_ins.append(ti)
+                tac_curves.append(ti_curve)
 
-            # GradCAM heatmap from RGB encoder
-            rgb_wrapper = LSTMFrameWrapper(model, tac, rgb_, ft_, grip, gf, t, 'rgb')
-            rgb_wrapper.eval()
-            rgb_heatmap = gradcam_heatmap(rgb_wrapper, rgb_frame_tensor, rgb_target_layer, target_class)
+                if t == mid_t:
+                    mid_vis['tac_frame_np'] = tac_frame_np
+                    mid_vis['tac_heatmap']  = tac_heatmap
 
-            # Multimodal deletion/insertion: mask both modalities simultaneously
-            d, d_curve = deletion_auc(
-                model, tac, rgb_, ft_, grip, gf, t,
-                tac_heatmap, rgb_heatmap,
-                steps, target_class)
-            i, i_curve = insertion_auc(
-                model, tac, rgb_, ft_, grip, gf, t,
-                tac_heatmap, rgb_heatmap,
-                tac_frame_np, rgb_frame_np,
-                steps, target_class)
+            if do_rgb:
+                rgb_frame_np = rgb_[0, t, 0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+                rgb_frame_np = np.clip(rgb_frame_np, 0.0, 1.0)
+                rgb_frame_tensor = torch.from_numpy(rgb_frame_np).permute(2, 0, 1).unsqueeze(0).to(device)
 
-            frame_del_aucs.append(d)
-            frame_ins_aucs.append(i)
-            all_del_curves.append(d_curve)
-            all_ins_curves.append(i_curve)
+                rgb_wrapper = LSTMFrameWrapper(model, tac, rgb_, ft_, grip, gf, t, 'rgb')
+                rgb_wrapper.eval()
+                rgb_heatmap = gradcam_heatmap(rgb_wrapper, rgb_frame_tensor, rgb_target_layer, target_class)
 
-            if t == mid_t:
-                mid_tac_heatmap  = tac_heatmap
-                mid_rgb_heatmap  = rgb_heatmap
-                mid_tac_frame_np = tac_frame_np
-                mid_rgb_frame_np = rgb_frame_np
+                ri, ri_curve = insertion_auc_single(
+                    model, tac, rgb_, ft_, grip, gf, t,
+                    rgb_heatmap, rgb_frame_np, 'rgb', steps, target_class)
+                sample_rgb_ins.append(ri)
+                rgb_curves.append(ri_curve)
 
-        sample_del = float(np.mean(frame_del_aucs))
-        sample_ins = float(np.mean(frame_ins_aucs))
-        del_aucs.append(sample_del)
-        ins_aucs.append(sample_ins)
-        print(f"  sample {idx:4d} | label={target_class} | "
-              f"del={sample_del:.3f}  ins={sample_ins:.3f}  "
-              f"delta={sample_ins - sample_del:.3f}")
+                if t == mid_t:
+                    mid_vis['rgb_frame_np'] = rgb_frame_np
+                    mid_vis['rgb_heatmap']  = rgb_heatmap
+
+        # Per-sample means
+        s_tac = float(np.mean(sample_tac_ins)) if sample_tac_ins else 0.0
+        s_rgb = float(np.mean(sample_rgb_ins)) if sample_rgb_ins else 0.0
+        if do_tac: tac_ins_aucs.append(s_tac)
+        if do_rgb: rgb_ins_aucs.append(s_rgb)
+
+        parts = [f"sample {idx:4d} | label={target_class}"]
+        if do_tac: parts.append(f"tac_ins={s_tac:.3f}")
+        if do_rgb: parts.append(f"rgb_ins={s_rgb:.3f}")
+        print("  " + "  ".join(parts))
 
         if len(vis_items) < n_vis:
-            vis_items.append({
-                'idx':          idx,
-                'label':        target_class,
-                'tac_frame_np': mid_tac_frame_np,
-                'rgb_frame_np': mid_rgb_frame_np,
-                'tac_heatmap':  mid_tac_heatmap,
-                'rgb_heatmap':  mid_rgb_heatmap,
-                'del_auc':      sample_del,
-                'ins_auc':      sample_ins,
-            })
+            vis_item = {'idx': idx, 'label': target_class,
+                        'tac_ins': s_tac, 'rgb_ins': s_rgb}
+            vis_item.update(mid_vis)
+            vis_items.append(vis_item)
 
-    if vis_dir:
+    # Save visualizations
+    if vis_dir and vis_items:
         os.makedirs(vis_dir, exist_ok=True)
-        save_overlay_grid(vis_items,
+        save_overlay_grid(vis_items, gradcam_mode,
                           os.path.join(vis_dir, 'gradcam_grid.png'))
-        save_curves_plot(all_del_curves, all_ins_curves, steps,
-                         os.path.join(vis_dir, 'curves.png'))
+        curves_dict = {}
+        if tac_curves: curves_dict['Tactile'] = tac_curves
+        if rgb_curves: curves_dict['RGB'] = rgb_curves
+        if curves_dict:
+            save_curves_plot(curves_dict, steps,
+                             os.path.join(vis_dir, 'curves.png'))
 
-    mean_del   = float(np.mean(del_aucs))
-    mean_ins   = float(np.mean(ins_aucs))
-    mean_delta = mean_ins - mean_del
-    return mean_del, mean_ins, mean_delta
+    results = {}
+    if do_tac: results['tac_ins'] = float(np.mean(tac_ins_aucs))
+    if do_rgb: results['rgb_ins'] = float(np.mean(rgb_ins_aucs))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +378,9 @@ def parse_args():
     p.add_argument('--root_dir',    required=True)
     p.add_argument('--checkpoint',  required=True,
                    help='Path to best_model.pt checkpoint')
+    p.add_argument('--gradcam_mode', default='both',
+                   choices=['rgb', 'tactile', 'both'],
+                   help='Which modality to compute GradCAM for')
     p.add_argument('--split',       default='random',
                    choices=['object', 'pose', 'random'])
     p.add_argument('--test_objects', nargs='+',
@@ -432,7 +394,7 @@ def parse_args():
     p.add_argument('--modalities',  nargs='+', default=None,
                    help='Active modalities, e.g. --modalities V T FT (default: all)')
     p.add_argument('--steps',       type=int, default=10,
-                   help='Number of masking steps for deletion/insertion curves')
+                   help='Number of masking steps for insertion curves')
     p.add_argument('--n_samples',   type=int, default=50,
                    help='Number of test samples to evaluate')
     p.add_argument('--n_vis',       type=int, default=8,
@@ -445,7 +407,7 @@ def parse_args():
 def main():
     args = parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}  steps: {args.steps}  (multimodal: tactile + RGB)")
+    print(f"Device: {device}  steps: {args.steps}  gradcam_mode: {args.gradcam_mode}")
 
     _dl.L  = args.L
     _dl.F1 = args.F1
@@ -478,15 +440,16 @@ def main():
     print(f"Loaded checkpoint: {args.checkpoint}")
     print(f"Evaluating {min(args.n_samples, len(test_set.indices))} test samples...\n")
 
-    mean_del, mean_ins, mean_delta = evaluate_gradcam(
-        model, ds, test_set.indices,
+    results = evaluate_gradcam(
+        model, ds, test_set.indices, args.gradcam_mode,
         args.steps, args.n_samples, args.n_vis,
         args.vis_dir or None, device)
 
     print(f"\n{'='*50}")
-    print(f"Deletion  AUC (↓ better): {mean_del:.4f}")
-    print(f"Insertion AUC (↑ better): {mean_ins:.4f}")
-    print(f"Delta = Ins - Del (↑ better): {mean_delta:.4f}")
+    if 'tac_ins' in results:
+        print(f"Tactile Insertion AUC (↑ better): {results['tac_ins']:.4f}")
+    if 'rgb_ins' in results:
+        print(f"RGB     Insertion AUC (↑ better): {results['rgb_ins']:.4f}")
     print(f"{'='*50}")
 
 

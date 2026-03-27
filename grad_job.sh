@@ -24,8 +24,17 @@ python train.py --root_dir $ROOT \
   --model_save_path $CKPT \
   --wandb_run "pfs-${MOD_FLAG}"
 
+# Determine gradcam_mode from modalities
+case "$MODALITIES" in
+  *V*T*|*T*V*) GCAM_MODE=both ;;
+  *V*)         GCAM_MODE=rgb ;;
+  *T*)         GCAM_MODE=tactile ;;
+  *)           GCAM_MODE=both ;;
+esac
+
 python gradcam_metric.py --root_dir $ROOT \
   --checkpoint $CKPT \
   --modalities $MODALITIES \
+  --gradcam_mode $GCAM_MODE \
   --steps 10 --n_samples 50 --L $L \
   --vis_dir $VIS_DIR
