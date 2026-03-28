@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument(
+        "--evaluation-mode",
+        choices=["single_active", "single_hidden"],
+        default="single_active",
+        help="Evaluate either one active modality at a time or one hidden modality at a time.",
+    )
+    parser.add_argument(
         "--inactive-fill",
         choices=["zero", "mean"],
         default="zero",
@@ -242,6 +248,15 @@ def markdown_table(rows: list[dict[str, object]]) -> str:
     return "\n".join([header, divider, *body])
 
 
+def modality_sets(mode: str, requested_modalities: list[str]) -> list[tuple[str, list[str]]]:
+    if mode == "single_hidden":
+        return [
+            (f"hide-{modality}", [candidate for candidate in requested_modalities if candidate != modality])
+            for modality in requested_modalities
+        ]
+    return [(f"{modality}-only", [modality]) for modality in requested_modalities]
+
+
 def print_metrics_row(setting: str, metrics: dict[str, float], active_modalities: list[str]) -> None:
     active = " ".join(active_modalities)
     print(
@@ -328,9 +343,10 @@ def main() -> None:
     model.set_ablation_fill_values(fill_values)
     print("Checkpoint loaded.")
 
-    active_sets = [("all-modalities", requested_modalities)] + [
-        (f"{modality}-only", [modality]) for modality in requested_modalities
-    ]
+    active_sets = [("all-modalities", requested_modalities)] + modality_sets(
+        args.evaluation_mode,
+        requested_modalities,
+    )
 
     rows = []
     print("Evaluating over the full loaded dataset, not the original random split.")
@@ -358,6 +374,7 @@ def main() -> None:
                 "checkpoint_path": str(checkpoint_path),
                 "dataset_root": args.root_dir,
                 "dataset_size": len(dataset),
+                "evaluation_mode": args.evaluation_mode,
                 "inactive_fill": args.inactive_fill,
                 "config": json_safe(config),
                 "wandb_summary": json_safe(summary),
