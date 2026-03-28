@@ -6,3 +6,7 @@ wandb/
 __pycache__/
 *.pt
 *.pdf
+figures/
+plot_test_metrics.py
+plot_training_curves.py
+plot_rho_bars.py

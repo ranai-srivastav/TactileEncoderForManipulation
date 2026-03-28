@@ -169,7 +169,7 @@ def main():
         state = torch.load(args.checkpoint, map_location=device)
     if isinstance(state, dict) and 'model' in state:
         state = state['model']
-    model.load_state_dict(state, strict=True)
+    model.load_state_dict(state, strict=False)
     print(f"Loaded checkpoint: {args.checkpoint}")
 
     if args.which in ("val", "both"):
