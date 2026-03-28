@@ -157,22 +157,32 @@ def json_safe(value):
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    print(f"Device: {device}")
 
     run_path = resolve_run_path(args.wandb_run, args.wandb_entity, args.wandb_project)
+    print(f"Resolving W&B run: {run_path}")
     config, summary, checkpoint_path = download_run_assets(
         run_path,
         args.download_dir,
         args.checkpoint_name,
     )
+    print(f"Downloaded checkpoint: {checkpoint_path}")
 
     frames_per_sec, ft_dim, gr_dim = configure_dataloader(config)
+    print(
+        f"Configured loader: L={dl.L}, F1={dl.F1}, F2={dl.F2}, "
+        f"ft_dim={ft_dim}, gripper_dim={gr_dim}"
+    )
+    print("Building full dataset...")
     dataset = dl.PoseItDataset(root_dir=args.root_dir)
     print(f"Loaded dataset for full evaluation: {len(dataset)} samples")
 
     batch_size = args.batch_size or int(config.get("batch_size", 32))
     num_workers = args.num_workers or int(config.get("num_workers", 4))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    print(f"DataLoader ready: batch_size={batch_size}, num_workers={num_workers}")
 
+    print("Constructing model...")
     model = GraspStabilityLSTM(
         frames_per_sec=frames_per_sec,
         ft_dim=ft_dim,
@@ -185,8 +195,10 @@ def main() -> None:
         use_ogm=bool(config.get("ogm", 0)),
         resnet_weights=None,
     ).to(device)
+    print("Loading checkpoint into model...")
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
+    print("Checkpoint loaded.")
 
     requested_modalities = list(config.get("modalities", list(ALL_ACTIVE)))
     active_sets = [
