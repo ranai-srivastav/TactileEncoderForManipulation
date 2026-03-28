@@ -39,6 +39,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
 from torchvision import transforms
 
 # Experiment means one object with one pose for one force level, e.g. "flashlight_1612558475_F80_pose8".
@@ -310,7 +311,7 @@ class PoseItDataset(Dataset):
 
         self.samples = []
         skipped = 0
-        for d in dirs:
+        for d in tqdm(dirs, desc="Indexing PoseIt dataset", unit="entry"):
             if not d.is_dir():
                 continue
             try:

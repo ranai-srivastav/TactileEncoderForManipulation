@@ -49,7 +49,8 @@ class GraspStabilityLSTM(nn.Module):
         dropout: float = 0.1,
         freeze_resnet: bool = True,
         modalities=None,           # collection of {'V','T','FT','G','GF'}; None = all
-        use_ogm: bool = False
+        use_ogm: bool = False,
+        resnet_weights=ResNet50_Weights.DEFAULT,
     ):
         super().__init__()
         self.use_ogm = use_ogm
@@ -60,9 +61,9 @@ class GraspStabilityLSTM(nn.Module):
         self.bidirectional  = bidirectional
 
         # --- vision encoders (ResNet50, FC stripped → 2048-d) ---
-        self.rgb_encoder        = resnet50(weights=ResNet50_Weights.DEFAULT)
+        self.rgb_encoder        = resnet50(weights=resnet_weights)
         self.rgb_encoder.fc     = nn.Identity()  # type: ignore[assignment]
-        self.tactile_encoder    = resnet50(weights=ResNet50_Weights.DEFAULT)
+        self.tactile_encoder    = resnet50(weights=resnet_weights)
         self.tactile_encoder.fc = nn.Identity()  # type: ignore[assignment]
 
         if freeze_resnet:
@@ -223,4 +224,3 @@ class GraspStabilityLSTM(nn.Module):
             for p in self.head_prop.parameters():
                 if p.grad is not None:
                     p.grad *= k_prop
-
