@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--inactive-fill",
+        choices=["zero", "mean"],
+        default="zero",
+        help="Fill inactive modalities with zeros or full-dataset means in model-input space.",
+    )
     return parser.parse_args()
 
 
@@ -101,6 +107,59 @@ def standardize_batch(
     return ft, gripper, gripper_force
 
 
+def compute_input_fill_values(
+    dataset: dl.PoseItDatasetResNetVarLen,
+    sensor_stats: dict[str, torch.Tensor] | None,
+    *,
+    desc: str = "Input means over full dataset",
+) -> dict[str, torch.Tensor]:
+    tactile_sum = None
+    rgb_sum = None
+    ft_sum = None
+    gr_sum = None
+    gf_sum = None
+    tactile_count = 0
+    rgb_count = 0
+    ft_count = 0
+    gr_count = 0
+    gf_count = 0
+
+    for index in tqdm(range(len(dataset)), desc=desc, unit="sample"):
+        tactile, rgb, ft, gripper, gripper_force, _label, _pose_label = dataset[index]
+        tactile_sum = tactile.sum(dim=(0, 1)) if tactile_sum is None else tactile_sum + tactile.sum(dim=(0, 1))
+        rgb_sum = rgb.sum(dim=(0, 1)) if rgb_sum is None else rgb_sum + rgb.sum(dim=(0, 1))
+        ft_sum = ft.sum(dim=0) if ft_sum is None else ft_sum + ft.sum(dim=0)
+        gr_sum = gripper.sum(dim=0) if gr_sum is None else gr_sum + gripper.sum(dim=0)
+        time_steps = tactile.shape[0]
+        tactile_count += tactile.shape[0] * tactile.shape[1]
+        rgb_count += rgb.shape[0] * rgb.shape[1]
+        ft_count += ft.shape[0]
+        gr_count += gripper.shape[0]
+        gf_sum = gripper_force * time_steps if gf_sum is None else gf_sum + gripper_force * time_steps
+        gf_count += time_steps
+
+    assert tactile_sum is not None
+    assert rgb_sum is not None
+    assert ft_sum is not None
+    assert gr_sum is not None
+    assert gf_sum is not None
+
+    fill_values = {
+        "T": tactile_sum / tactile_count,
+        "V": rgb_sum / rgb_count,
+        "FT": ft_sum / ft_count,
+        "G": gr_sum / gr_count,
+        "GF": gf_sum / gf_count,
+    }
+
+    if sensor_stats is not None:
+        fill_values["FT"] = (fill_values["FT"] - sensor_stats["ft_mean"]) / sensor_stats["ft_std"]
+        fill_values["G"] = (fill_values["G"] - sensor_stats["gr_mean"]) / sensor_stats["gr_std"]
+        fill_values["GF"] = (fill_values["GF"] - sensor_stats["gf_mean"]) / sensor_stats["gf_std"]
+
+    return fill_values
+
+
 @torch.no_grad()
 def evaluate(
     model: GraspStabilityLSTMVarLen,
@@ -135,6 +194,10 @@ def evaluate(
         tn += int((~prediction & ~actual).sum().item())
 
     total = tp + fp + fn + tn
+    pred_positive = tp + fp
+    pred_negative = tn + fn
+    actual_positive = tp + fn
+    actual_negative = tn + fp
     accuracy = (tp + tn) / total if total else 0.0
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
@@ -142,20 +205,38 @@ def evaluate(
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
+        "pred_positive_count": float(pred_positive),
+        "pred_negative_count": float(pred_negative),
+        "pred_positive_pct": (pred_positive / total) if total else 0.0,
+        "pred_negative_pct": (pred_negative / total) if total else 0.0,
+        "actual_positive_count": float(actual_positive),
+        "actual_negative_count": float(actual_negative),
         "tp": float(tp),
         "fp": float(fp),
         "fn": float(fn),
         "tn": float(tn),
         "n": float(total),
+        "confusion_matrix": {
+            "tn": float(tn),
+            "fp": float(fp),
+            "fn": float(fn),
+            "tp": float(tp),
+        },
     }
 
 
 def markdown_table(rows: list[dict[str, object]]) -> str:
-    header = "| Setting | Active Modalities | Accuracy | Precision | Recall |"
-    divider = "| --- | --- | ---: | ---: | ---: |"
+    header = (
+        "| Setting | Active Modalities | Accuracy | Precision | Recall | "
+        "Pred 1 | Pred 0 | Pred 1 % | Pred 0 % | TP | FP | TN | FN |"
+    )
+    divider = "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     body = [
         f"| {row['setting']} | {' '.join(row['active_modalities'])} | "
-        f"{row['accuracy']:.4f} | {row['precision']:.4f} | {row['recall']:.4f} |"
+        f"{row['accuracy']:.4f} | {row['precision']:.4f} | {row['recall']:.4f} | "
+        f"{int(row['pred_positive_count'])} | {int(row['pred_negative_count'])} | "
+        f"{row['pred_positive_pct']:.4f} | {row['pred_negative_pct']:.4f} | "
+        f"{int(row['tp'])} | {int(row['fp'])} | {int(row['tn'])} | {int(row['fn'])} |"
         for row in rows
     ]
     return "\n".join([header, divider, *body])
@@ -167,7 +248,11 @@ def print_metrics_row(setting: str, metrics: dict[str, float], active_modalities
         f"[{setting}] active={active} "
         f"acc={metrics['accuracy']:.4f} "
         f"prec={metrics['precision']:.4f} "
-        f"rec={metrics['recall']:.4f}"
+        f"rec={metrics['recall']:.4f} "
+        f"pred1={int(metrics['pred_positive_count'])} "
+        f"pred0={int(metrics['pred_negative_count'])} "
+        f"tp={int(metrics['tp'])} fp={int(metrics['fp'])} "
+        f"tn={int(metrics['tn'])} fn={int(metrics['fn'])}"
     )
 
 
@@ -208,6 +293,11 @@ def main() -> None:
         )
         print("Computed full-dataset sensor standardization stats.")
 
+    fill_values = None
+    if args.inactive_fill == "mean":
+        fill_values = compute_input_fill_values(dataset, stats)
+        print("Computed full-dataset input means for inactive-modality fill.")
+
     batch_size = args.batch_size if args.batch_size is not None else int(config.get("batch_size", 32))
     num_workers = args.num_workers if args.num_workers is not None else int(config.get("num_workers", 4))
     loader = DataLoader(
@@ -235,6 +325,7 @@ def main() -> None:
     print("Loading checkpoint into model...")
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict, strict=True)
+    model.set_ablation_fill_values(fill_values)
     print("Checkpoint loaded.")
 
     active_sets = [("all-modalities", requested_modalities)] + [
@@ -267,6 +358,7 @@ def main() -> None:
                 "checkpoint_path": str(checkpoint_path),
                 "dataset_root": args.root_dir,
                 "dataset_size": len(dataset),
+                "inactive_fill": args.inactive_fill,
                 "config": json_safe(config),
                 "wandb_summary": json_safe(summary),
                 "full_dataset_results": rows,

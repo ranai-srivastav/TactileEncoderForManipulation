@@ -41,6 +41,7 @@ class GraspStabilityLSTMVarLen(nn.Module):
         self.gripper_dim = gripper_dim
         self.modalities = set(modalities or ALL_MODALITIES)
         self.bidirectional = bidirectional
+        self.ablation_fill_values: dict[str, torch.Tensor] = {}
 
         self.rgb_encoder = resnet50(weights=resnet_weights)
         self.rgb_encoder.fc = nn.Identity()  # type: ignore[assignment]
@@ -88,11 +89,25 @@ class GraspStabilityLSTMVarLen(nn.Module):
     def set_modalities(self, modalities: Iterable[str]) -> None:
         self.modalities = set(modalities)
 
+    def set_ablation_fill_values(self, fill_values: dict[str, torch.Tensor] | None) -> None:
+        self.ablation_fill_values = dict(fill_values or {})
+
     def train(self, mode: bool = True):
         super().train(mode)
         self.rgb_encoder.eval()
         self.tactile_encoder.eval()
         return self
+
+    def _fill_inactive(self, tensor: torch.Tensor, modality: str) -> torch.Tensor:
+        if modality in self.modalities:
+            return tensor
+        fill_value = self.ablation_fill_values.get(modality)
+        if fill_value is None:
+            return tensor * 0.0
+        fill_value = fill_value.to(device=tensor.device, dtype=tensor.dtype)
+        while fill_value.ndim < tensor.ndim:
+            fill_value = fill_value.unsqueeze(0)
+        return torch.broadcast_to(fill_value, tensor.shape)
 
     def forward(
         self,
@@ -103,16 +118,11 @@ class GraspStabilityLSTMVarLen(nn.Module):
         gripper_force: torch.Tensor,
         lengths: Sequence[int] | torch.Tensor,
     ) -> torch.Tensor:
-        if "T" not in self.modalities:
-            tactile = tactile * 0.0
-        if "V" not in self.modalities:
-            rgb = rgb * 0.0
-        if "FT" not in self.modalities:
-            ft = ft * 0.0
-        if "G" not in self.modalities:
-            gripper = gripper * 0.0
-        if "GF" not in self.modalities:
-            gripper_force = gripper_force * 0.0
+        tactile = self._fill_inactive(tactile, "T")
+        rgb = self._fill_inactive(rgb, "V")
+        ft = self._fill_inactive(ft, "FT")
+        gripper = self._fill_inactive(gripper, "G")
+        gripper_force = self._fill_inactive(gripper_force, "GF")
 
         batch_size, steps, frames_per_step = tactile.shape[:3]
         flat_steps = steps * frames_per_step
