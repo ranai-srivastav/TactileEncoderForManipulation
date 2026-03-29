@@ -24,6 +24,27 @@ conda activate /ocean/projects/cis260031p/shared/temu_conda
 493 episodes, 26 object types, force levels F5 / F40 / F80.
 Folder format: `<object>_<timestamp>_F<force>_pose<idx>`
 
+### CLIP + T3 encoders (`--model clipt3`)
+
+Uses CLIP ViT-L/14 (LAION-2B, 768-d) for RGB and T3 large (304M, 1024-d) for tactile:
+
+```bash
+pip install -r requirements_clipt3.txt
+python scripts/download_pretrained.py --shared_dir /ocean/projects/cis260031p/shared
+```
+
+Then train with `--model clipt3`. Pretrained weights go to `shared/pretrained/` and `shared/.cache/huggingface/`.
+
+**Evaluate a saved checkpoint** (same flags as training for data/model):
+
+```bash
+python scripts/eval_test.py -c trained_models/clipt3_5k_best.pt --model clipt3 \
+  --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
+  --modalities V T FT G GF --split random
+```
+
+Use `--which val` or `--which test` for a single split. For `--split random`, add `--seed N` only if training used the same `numpy` seed.
+
 ---
 
 ## File Overview
@@ -32,9 +53,7 @@ Folder format: `<object>_<timestamp>_F<force>_pose<idx>`
 
 **Purpose:** Loads the GelSight dataset, parses episode folders, builds per-sample tensors, and provides train/val/test split utilities.
 
-Each episode is sampled at a fixed rate and clipped to `L` seconds. GelSight frames are baseline-subtracted (each frame minus the first frame at grasp time). Episodes with partially-filled temporal buckets are skipped with a `[WARN]` print.
-
-Because `L` is always set, all sequences in a batch are the same length — no padding is needed and the default PyTorch collate is used everywhere. `collate_variable_length` is defined in this file for potential future use but is not passed to any DataLoader.
+Each episode is sampled at a fixed rate. By default, `train.py` uses **variable-length** sequences (no `L` clipping) and `collate_variable_length` for padding. With `--fixed_length`, episodes are clipped to `L` seconds and the default collate is used. GelSight frames are baseline-subtracted (each frame minus the first frame at grasp time). Episodes with partially-filled temporal buckets are skipped with a `[WARN]` print.
 
 **What you can change here:**
 | Constant | Default | Effect |
@@ -122,7 +141,9 @@ DRS is **deferred**: it behaves as a standard random sampler until `activate()` 
 | `--anneal_iter` | `300` | Iteration at which LR is multiplied by 0.1 and DRS activates |
 | `--num_workers` | `4` | DataLoader worker processes. Use `0` for debugging |
 | `--modalities` | `V T FT G GF` | Active input modalities. Any subset of: `V` (RGB), `T` (tactile), `FT` (force-torque), `G` (gripper), `GF` (gripper force) |
-| `--L` | `20` | Max seconds per episode. Longer episodes are clipped at this value |
+| `--fixed_length` | off | If set, clip episodes to `L` seconds and use fixed batch shapes. Default: variable-length sequences |
+| `--no_standardize_sensors` | off | If set, use raw FT/gripper values. Default: standardise sensors using train-split statistics |
+| `--L` | `20` | Max seconds per episode when `--fixed_length` is set; ignored for the default variable-length mode |
 | `--F1` | `1` | Image frames sampled per second. Overrides `dataloader.F1` before dataset construction |
 | `--F2` | `1` | Sensor readings sampled per second. Overrides `dataloader.F2` before dataset construction |
 | `--subsample` | `1.0` | Fraction of dataset to load (e.g. `0.01` = 1%). Useful for quick tests |
