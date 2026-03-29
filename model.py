@@ -96,7 +96,7 @@ class GraspStabilityLSTM(nn.Module):
         )
 
         # --- 2-layer LSTM/GRU (bidirectional or unidirectional) ---
-        self.lstm = nn.GRU(
+        self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=lstm_layers,
@@ -250,7 +250,7 @@ class GraspStabilityLSTM_CLIP_T3(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.lstm = nn.GRU(
+        self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=lstm_layers,
