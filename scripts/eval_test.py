@@ -51,6 +51,8 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--hidden_dim", type=int, default=512)
     p.add_argument("--lstm_layers", type=int, default=2)
+    p.add_argument("--rnn", default="lstm", choices=["lstm", "gru"],
+                   help="Sequence module: lstm (default) or gru (must match training)")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--F1", type=int, default=1)
     p.add_argument("--F2", type=int, default=1)
@@ -150,6 +152,7 @@ def main():
             modalities=args.modalities,
             pretrained_dir=args.pretrained_dir,
             t3_encoder_domain=args.t3_encoder_domain,
+            rnn_type=args.rnn,
         ).to(device)
     else:
         model = GraspStabilityLSTM(
@@ -161,6 +164,7 @@ def main():
             bidirectional=not args.unidirectional,
             dropout=args.dropout,
             modalities=args.modalities,
+            rnn_type=args.rnn,
         ).to(device)
 
     try:

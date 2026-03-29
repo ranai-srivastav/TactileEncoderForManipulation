@@ -108,7 +108,9 @@ def parse_args():
     p.add_argument('--dropout',      type=float, default=0.1)
     p.add_argument('--hidden_dim',   type=int,   default=512)
     p.add_argument('--lstm_layers',  type=int,   default=2,
-                   help='Number of LSTM layers (default: 2)')
+                   help='Number of recurrent (LSTM/GRU) layers (default: 2)')
+    p.add_argument('--rnn', default='lstm', choices=['lstm', 'gru'],
+                   help='Sequence module after fusion: lstm (default) or gru')
     p.add_argument('--n_iters',      type=int,   default=600)
     p.add_argument('--log_interval', type=int,   default=20,
                    help='Evaluate val, log, and checkpoint every N iterations (plus last iter).')
@@ -283,7 +285,7 @@ def _apply_full_resume(ckpt, model, optimizer, scheduler, sampler, args):
     if ckpt.get('drs_active', False):
         sampler.activate()
     saved = ckpt.get('config') or {}
-    for key in ('model', 'split', 'modalities', 'hidden_dim', 'lstm_layers'):
+    for key in ('model', 'split', 'modalities', 'hidden_dim', 'lstm_layers', 'rnn'):
         if key in saved and key in vars(args) and saved[key] != getattr(args, key):
             print(
                 f"[resume][WARN] CLI {key}={getattr(args, key)!r} differs from "
@@ -400,6 +402,7 @@ def main():
             modalities=args.modalities,
             pretrained_dir=args.pretrained_dir,
             t3_encoder_domain=args.t3_encoder_domain,
+            rnn_type=args.rnn,
         ).to(device)
     else:
         model = GraspStabilityLSTM(
@@ -411,6 +414,7 @@ def main():
             bidirectional=not args.unidirectional,
             dropout=args.dropout,
             modalities=args.modalities,
+            rnn_type=args.rnn,
         ).to(device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)

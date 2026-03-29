@@ -8,13 +8,40 @@ from torchvision.models import resnet50, ResNet50_Weights
 from encoders import CLIPRGBEncoder, T3TactileEncoder
 
 
+def _make_seq_rnn(
+    rnn_type: str,
+    *,
+    input_size: int,
+    hidden_size: int,
+    num_layers: int,
+    batch_first: bool,
+    bidirectional: bool,
+    dropout: float,
+) -> nn.Module:
+    """Bidirectional or stacked LSTM or GRU over the fused per-timestep features."""
+    kind = rnn_type.lower()
+    common = dict(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        batch_first=batch_first,
+        bidirectional=bidirectional,
+        dropout=dropout if num_layers > 1 else 0.0,
+    )
+    if kind == "lstm":
+        return nn.LSTM(**common)
+    if kind == "gru":
+        return nn.GRU(**common)
+    raise ValueError("rnn_type must be 'lstm' or 'gru', got {!r}".format(rnn_type))
+
+
 class GraspStabilityLSTM(nn.Module):
     """
     Predicts P(grasp success) from multimodal sensor data.
 
     Each second of data is encoded independently (F1 image frames flattened,
-    FT/gripper readings concatenated flat), then the full temporal sequence of
-    L seconds is processed by a 2-layer bidirectional LSTM.
+    FT/gripper readings concatenated flat),     then the full temporal sequence of
+    L seconds is processed by a 2-layer bidirectional LSTM or GRU.
 
     Modalities can be selectively disabled at construction time via the
     `modalities` argument.  Disabled modalities are zeroed out before any
@@ -57,6 +84,7 @@ class GraspStabilityLSTM(nn.Module):
         dropout: float = 0.1,
         freeze_resnet: bool = True,
         modalities=None,           # collection of {'V','T','FT','G','GF'}; None = all
+        rnn_type: str = "lstm",    # "lstm" or "gru"
     ):
         super().__init__()
         self.frames_per_sec = frames_per_sec
@@ -64,6 +92,7 @@ class GraspStabilityLSTM(nn.Module):
         self.gripper_dim    = gripper_dim
         self.modalities     = set(modalities or ['V', 'T', 'FT', 'G', 'GF'])
         self.bidirectional  = bidirectional
+        self.rnn_type       = rnn_type.lower()
 
         # --- vision encoders (ResNet50, FC stripped → 2048-d) ---
         self.rgb_encoder        = resnet50(weights=ResNet50_Weights.DEFAULT)
@@ -95,14 +124,15 @@ class GraspStabilityLSTM(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # --- 2-layer LSTM/GRU (bidirectional or unidirectional) ---
-        self.lstm = nn.GRU(
+        # --- 2-layer LSTM/GRU (bidirectional or unidirectional); self.lstm holds either ---
+        self.lstm = _make_seq_rnn(
+            self.rnn_type,
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=lstm_layers,
             batch_first=True,
             bidirectional=bidirectional,
-            dropout=dropout if lstm_layers > 1 else 0.0,
+            dropout=dropout,
         )
 
         # --- classifier (hidden_dim * 2 if bidirectional else hidden_dim) ---
@@ -216,6 +246,7 @@ class GraspStabilityLSTM_CLIP_T3(nn.Module):
         modalities=None,
         pretrained_dir: Optional[str] = None,
         t3_encoder_domain: str = "gs_black",
+        rnn_type: str = "lstm",
     ):
         super().__init__()
         self.frames_per_sec = frames_per_sec
@@ -223,6 +254,7 @@ class GraspStabilityLSTM_CLIP_T3(nn.Module):
         self.gripper_dim = gripper_dim
         self.modalities = set(modalities or ['V', 'T', 'FT', 'G', 'GF'])
         self.bidirectional = bidirectional
+        self.rnn_type = rnn_type.lower()
 
         self.rgb_encoder = CLIPRGBEncoder(freeze=freeze_encoders)
         self.tactile_encoder = T3TactileEncoder(
@@ -250,13 +282,14 @@ class GraspStabilityLSTM_CLIP_T3(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.lstm = nn.GRU(
+        self.lstm = _make_seq_rnn(
+            self.rnn_type,
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=lstm_layers,
             batch_first=True,
             bidirectional=bidirectional,
-            dropout=dropout if lstm_layers > 1 else 0.0,
+            dropout=dropout,
         )
 
         classifier_in = hidden_dim * 2 if bidirectional else hidden_dim
