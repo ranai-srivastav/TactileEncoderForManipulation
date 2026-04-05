@@ -114,7 +114,21 @@ def parse_args():
     p.add_argument('--n_iters',      type=int,   default=600)
     p.add_argument('--log_interval', type=int,   default=20,
                    help='Evaluate val, log, and checkpoint every N iterations (plus last iter).')
-    p.add_argument('--anneal_iter',  type=int,   default=300)
+    p.add_argument('--anneal_iter',  type=int,   default=300,
+                   help='(lr_scheduler=step) iteration for single 10× LR drop. Ignored for cosine.')
+    p.add_argument(
+        '--lr_scheduler',
+        default='step',
+        choices=['step', 'cosine'],
+        help='step: one LR drop at --anneal_iter (PoseIt-style). '
+             'cosine: CosineAnnealingLR over --n_iters (per-iteration step).',
+    )
+    p.add_argument(
+        '--eta_min',
+        type=float,
+        default=1e-5,
+        help='Minimum LR for lr_scheduler=cosine (default: 1e-5).',
+    )
     p.add_argument('--F1',          type=int,   default=1)
     p.add_argument('--F2',          type=int,   default=1)
     p.add_argument('--num_workers',  type=int,   default=4)
@@ -285,7 +299,7 @@ def _apply_full_resume(ckpt, model, optimizer, scheduler, sampler, args):
     if ckpt.get('drs_active', False):
         sampler.activate()
     saved = ckpt.get('config') or {}
-    for key in ('model', 'split', 'modalities', 'hidden_dim', 'lstm_layers', 'rnn'):
+    for key in ('model', 'split', 'modalities', 'hidden_dim', 'lstm_layers', 'rnn', 'lr_scheduler'):
         if key in saved and key in vars(args) and saved[key] != getattr(args, key):
             print(
                 f"[resume][WARN] CLI {key}={getattr(args, key)!r} differs from "
@@ -424,7 +438,13 @@ def main():
         momentum=0.9,
         weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.1)
+    if args.lr_scheduler == 'cosine':
+        # One step() per training iteration; last_epoch runs 0..n_iters-1 → T_max=n_iters-1 hits eta_min on last iter
+        t_cos = max(1, args.n_iters - 1)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=t_cos, eta_min=args.eta_min)
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.1)
 
     # checkpoint paths
     save_dir    = os.path.dirname(args.model_save_path) or '.'
@@ -459,8 +479,8 @@ def main():
             if iteration >= args.n_iters:
                 break
 
-            # LR anneal at anneal_iter (paper: 10x drop at iter 300)
-            if iteration == args.anneal_iter:
+            # LR schedule: step = single drop at anneal_iter; cosine = smooth over n_iters
+            if args.lr_scheduler == 'step' and iteration == args.anneal_iter:
                 scheduler.step()
                 print(f"[iter {iteration}] LR annealed to {scheduler.get_last_lr()}")
             # DRS activates at drs_iter (decoupled; can be later to avoid overcorrection)
@@ -475,6 +495,8 @@ def main():
             loss   = criterion(logits, label.float())
             loss.backward()
             optimizer.step()
+            if args.lr_scheduler == 'cosine':
+                scheduler.step()
 
             if (iteration % args.log_interval == 0 or iteration == args.n_iters - 1):
                 # train_loss = last minibatch only; val_* = full validation set (no test during training)
