@@ -1,0 +1,46 @@
+program: train_full_transformer.py
+method: bayes
+metric:
+  name: val/f1
+  goal: maximize
+parameters:
+  root_dir:
+    value: /home/aayush/TEMUDataset/Gelsight
+  overfit_all:
+    value: false
+  split:
+    value: random
+  batch_size:
+    values: [1, 2]
+  d_model:
+    values: [128, 256]
+  nhead:
+    values: [4, 8]
+  num_layers:
+    values: [2, 4]
+  dim_feedforward:
+    values: [512, 1024]
+  dropout:
+    values: [0.0, 0.1]
+  lr:
+    distribution: log_uniform_values
+    min: 0.00005
+    max: 0.001
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.001
+  timeseries_conv_channels:
+    values: [64, 128]
+  timeseries_num_conv_layers:
+    values: [2, 3]
+  timeseries_kernel_size:
+    values: [3, 5]
+  tactile_items_per_second:
+    values: [8, 12]
+  side_cam_items_per_second:
+    values: [6, 8]
+  top_cam_items_per_second:
+    values: [6, 8]
+  robot_items_per_second:
+    values: [64, 128]
