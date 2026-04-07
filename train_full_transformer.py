@@ -8,6 +8,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, Subset
+try:
+    from tqdm.auto import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
 
 try:
     import wandb
@@ -78,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ft_items_per_second', type=int, default=100)
     parser.add_argument('--gripper_items_per_second', type=int, default=10)
     parser.add_argument('--robot_items_per_second', type=int, default=128)
+    parser.add_argument('--rgb_feature_cache_dir', type=str, default=None)
     parser.add_argument('--model_save_path', type=str, default='trained_models/full_transformer_best.pt')
     parser.add_argument('--wandb_project', type=str, default='TEMU-fullres-transformer')
     parser.add_argument('--wandb_entity', type=str, default='mrsd-smores')
@@ -85,6 +90,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--wandb_mode', type=str, default='disabled', choices=['disabled', 'offline', 'online'])
     parser.add_argument('--smoke_test_only', action='store_true', help='Run one forward/backward smoke test and exit.')
     return parser.parse_args()
+
+
+class _NullProgressBar:
+    def __init__(self, total: int | None = None, desc: str = '') -> None:
+        self.total = total
+        self.desc = desc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def update(self, _: int = 1) -> None:
+        return None
+
+    def set_postfix(self, *args, **kwargs) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _make_progress(total: int | None, desc: str, leave: bool = True):
+    if _tqdm is None:
+        return _NullProgressBar(total=total, desc=desc)
+    return _tqdm(total=total, desc=desc, dynamic_ncols=True, leave=leave)
 
 
 def resolve_modalities(args: argparse.Namespace) -> List[str]:
@@ -198,21 +230,32 @@ def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, An
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader[Dict[str, Any]], criterion: nn.Module, device: torch.device) -> Dict[str, float]:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader[Dict[str, Any]],
+    criterion: nn.Module,
+    device: torch.device,
+    desc: str = 'Eval',
+    show_progress: bool = True,
+) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
     total_items = 0
     pred_chunks: List[torch.Tensor] = []
     label_chunks: List[torch.Tensor] = []
-    for batch in loader:
-        batch = batch_to_device(batch, device)
-        logits = model(batch)
-        labels = batch['label'].float()
-        loss = criterion(logits, labels)
-        total_loss += loss.item() * labels.shape[0]
-        total_items += labels.shape[0]
-        pred_chunks.append((logits > 0).cpu())
-        label_chunks.append(labels.bool().cpu())
+    progress_cm = _make_progress(total=len(loader), desc=desc, leave=False) if show_progress else _NullProgressBar()
+    with progress_cm as progress:
+        for batch in loader:
+            batch = batch_to_device(batch, device)
+            logits = model(batch)
+            labels = batch['label'].float()
+            loss = criterion(logits, labels)
+            total_loss += loss.item() * labels.shape[0]
+            total_items += labels.shape[0]
+            pred_chunks.append((logits > 0).cpu())
+            label_chunks.append(labels.bool().cpu())
+            if show_progress:
+                progress.update(1)
     if total_items == 0:
         return {'loss': 0.0, 'acc': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0}
     preds = torch.cat(pred_chunks)
@@ -265,6 +308,7 @@ def build_dataset(args: argparse.Namespace) -> PoseItDataLoaderFull:
         time_layout=PoseItTimeLayout.BY_SECOND,
         padding_metadata=PoseItPaddingMetadata.BOTH,
         items_per_second=build_items_per_second(args),
+        rgb_feature_cache_dir=args.rgb_feature_cache_dir,
     )
     if args.subsample < 1.0:
         import random
@@ -328,7 +372,9 @@ def main() -> None:
     print(f'Using device: {device}')
     maybe_init_wandb(args)
 
+    print('Building dataset...')
     dataset = build_dataset(args)
+    print('Creating split...')
     train_set, val_set, test_set = make_split(dataset, args)
     print(f'Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}')
     print(f'Modalities: {args.modalities}')
@@ -347,6 +393,7 @@ def main() -> None:
     pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32, device=device)
     print(f'pos_weight={pos_weight.item():.3f} (n_pos={n_pos}, n_neg={n_neg})')
 
+    print('Building model...')
     model = build_model(args).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -355,43 +402,47 @@ def main() -> None:
     os.makedirs(save_dir, exist_ok=True)
     best_val_f1 = -1.0
     iteration = 0
-    while iteration < args.n_iters:
-        model.train()
-        for batch in train_loader:
-            if iteration >= args.n_iters:
-                break
-            batch = batch_to_device(batch, device)
-            optimizer.zero_grad()
-            logits = model(batch)
-            labels = batch['label'].float()
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
+    with _make_progress(total=args.n_iters, desc='Training', leave=True) as train_progress:
+        while iteration < args.n_iters:
+            model.train()
+            for batch in train_loader:
+                if iteration >= args.n_iters:
+                    break
+                batch = batch_to_device(batch, device)
+                optimizer.zero_grad()
+                logits = model(batch)
+                labels = batch['label'].float()
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+                train_progress.update(1)
+                if iteration % args.log_interval == 0 or iteration == args.n_iters - 1:
+                    train_progress.set_postfix(train_loss=f'{loss.item():.4f}')
 
-            should_validate = iteration % args.val_interval == 0 or iteration == args.n_iters - 1
-            if should_validate:
-                val_metrics = evaluate(model, val_loader, criterion, device)
-                print(
-                    f"[iter {iteration:03d}] train_loss={loss.item():.4f} "
-                    f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['acc']:.3f} "
-                    f"val_f1={val_metrics['f1']:.3f}"
-                )
-                maybe_log({
-                    'train/loss': float(loss.item()),
-                    'val/loss': val_metrics['loss'],
-                    'val/acc': val_metrics['acc'],
-                    'val/precision': val_metrics['precision'],
-                    'val/recall': val_metrics['recall'],
-                    'val/f1': val_metrics['f1'],
-                }, step=iteration)
-                if val_metrics['f1'] > best_val_f1:
-                    best_val_f1 = val_metrics['f1']
-                    torch.save(model.state_dict(), args.model_save_path)
-            iteration += 1
+                should_validate = iteration % args.val_interval == 0 or iteration == args.n_iters - 1
+                if should_validate:
+                    val_metrics = evaluate(model, val_loader, criterion, device, desc='Validation')
+                    print(
+                        f"[iter {iteration:03d}] train_loss={loss.item():.4f} "
+                        f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['acc']:.3f} "
+                        f"val_f1={val_metrics['f1']:.3f}"
+                    )
+                    maybe_log({
+                        'train/loss': float(loss.item()),
+                        'val/loss': val_metrics['loss'],
+                        'val/acc': val_metrics['acc'],
+                        'val/precision': val_metrics['precision'],
+                        'val/recall': val_metrics['recall'],
+                        'val/f1': val_metrics['f1'],
+                    }, step=iteration)
+                    if val_metrics['f1'] > best_val_f1:
+                        best_val_f1 = val_metrics['f1']
+                        torch.save(model.state_dict(), args.model_save_path)
+                iteration += 1
 
     if os.path.exists(args.model_save_path):
         model.load_state_dict(torch.load(args.model_save_path, map_location=device))
-    test_metrics = evaluate(model, test_loader, criterion, device)
+    test_metrics = evaluate(model, test_loader, criterion, device, desc='Test')
     print(
         f"Test loss={test_metrics['loss']:.4f} acc={test_metrics['acc']:.3f} "
         f"prec={test_metrics['precision']:.3f} rec={test_metrics['recall']:.3f} f1={test_metrics['f1']:.3f}"
