@@ -20,6 +20,11 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+try:
+    from tqdm.auto import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
+
 
 LABEL_MAP = {'pass': 0, 'slip': 1, 'drop': 1}
 IMAGE_SIZE = (224, 224)
@@ -59,6 +64,30 @@ class PoseItPaddingMetadata(StrEnum):
 
 
 ALL_MODALITIES: Tuple[PoseItModality, ...] = tuple(PoseItModality)
+
+
+class _NullProgressBar:
+    def __init__(self, total: int, desc: str) -> None:
+        self.total = total
+        self.desc = desc
+
+    def __enter__(self) -> _NullProgressBar:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def update(self, _: int = 1) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _make_progress(total: int, desc: str):
+    if _tqdm is None:
+        return _NullProgressBar(total=total, desc=desc)
+    return _tqdm(total=total, desc=desc, unit='sample', dynamic_ncols=True)
 
 
 @dataclass(frozen=True)
@@ -672,14 +701,18 @@ class PoseItDataLoaderFull(Dataset):
         self.items_per_second = _normalize_items_per_second(items_per_second)
         self.samples = []
         skipped = 0
-        for directory in dirs:
-            if not directory.is_dir():
-                continue
-            try:
-                self.samples.append(_build_full_entry_index(directory, modalities=self.modalities))
-            except Exception as exc:
-                print(f"[WARN] Skipping {directory.name}: {exc}")
-                skipped += 1
+        n_dirs = sum(1 for directory in dirs if directory.is_dir())
+        with _make_progress(total=n_dirs, desc='Indexing full-duration samples') as progress:
+            for directory in dirs:
+                if not directory.is_dir():
+                    continue
+                try:
+                    self.samples.append(_build_full_entry_index(directory, modalities=self.modalities))
+                except Exception as exc:
+                    print(f"[WARN] Skipping {directory.name}: {exc}")
+                    skipped += 1
+                finally:
+                    progress.update(1)
 
         print(f"Loaded {len(self.samples)} full-duration samples ({skipped} skipped)  "
               f"[modalities={[m.value for m in self.modalities]}, layout={self.time_layout.value}, "
