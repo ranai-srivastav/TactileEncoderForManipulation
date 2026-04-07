@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Iterable
 
 import torch
 import timm
 from tqdm.auto import tqdm
 from PIL import Image
+from PIL import UnidentifiedImageError
 
 from dataloader_full import RGB_TRANSFORM, _list_image_files, _rgb_feature_cache_path
 
@@ -20,6 +22,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--force', action='store_true')
     return parser.parse_args()
+
+
+def _filter_readable_entries(entries: Iterable[tuple[int, int, Path]]) -> tuple[list[tuple[int, int, Path]], int]:
+    readable_entries: list[tuple[int, int, Path]] = []
+    skipped = 0
+    for timestamp, frame_idx, path in entries:
+        try:
+            with Image.open(path) as image:
+                image.verify()
+        except (OSError, UnidentifiedImageError) as exc:
+            print(f'[WARN] Skipping unreadable RGB frame: {path} ({exc})')
+            skipped += 1
+            continue
+        readable_entries.append((timestamp, frame_idx, path))
+    return readable_entries, skipped
 
 
 @torch.no_grad()
@@ -52,12 +69,14 @@ def main() -> None:
     model_cache_dir = cache_dir / ''.join(ch if ch.isalnum() or ch in ('-', '_', '.') else '_' for ch in args.image_encoder_model_name)
     model_cache_dir.mkdir(parents=True, exist_ok=True)
     print(f'Caching RGB frame features with model={args.image_encoder_model_name} into {model_cache_dir}')
+    total_skipped_frames = 0
     for sample_dir in tqdm(sample_dirs, desc='Precomputing RGB feature cache', unit='sample', dynamic_ncols=True):
         cache_path = _rgb_feature_cache_path(cache_dir, args.image_encoder_model_name, sample_dir)
         if cache_path.exists() and not args.force:
             continue
 
-        entries = _list_image_files(sample_dir / 'rgb')
+        entries, skipped_frames = _filter_readable_entries(_list_image_files(sample_dir / 'rgb'))
+        total_skipped_frames += skipped_frames
         second_timestamps = torch.tensor([ts for ts, _, _ in entries], dtype=torch.long)
         frame_indices = torch.tensor([frame_idx for _, frame_idx, _ in entries], dtype=torch.long)
         features = encode_rgb_entries(model, entries, device=device, batch_size=args.batch_size)
@@ -71,6 +90,7 @@ def main() -> None:
             },
             cache_path,
         )
+    print(f'Finished RGB cache precompute. skipped_unreadable_frames={total_skipped_frames}')
 
 
 if __name__ == '__main__':
