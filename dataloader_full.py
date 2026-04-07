@@ -8,7 +8,9 @@ available observations and their timestamps.
 
 import argparse
 import csv
+import os
 import re
+from functools import lru_cache
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -39,6 +41,8 @@ RAW_IMAGE_TRANSFORM = transforms.Compose([
     transforms.Resize(IMAGE_SIZE),
     transforms.ToTensor(),
 ])
+
+IMAGE_CACHE_SIZE = int(os.environ.get('POSEIT_IMAGE_CACHE_SIZE', '512'))
 
 
 class PoseItModality(StrEnum):
@@ -313,6 +317,20 @@ def _load_image(path: Path,
     if path is None or not path.exists():
         return torch.zeros(zero_channels, *IMAGE_SIZE, dtype=torch.float32)
 
+    transform_name = 'rgb' if transform is RGB_TRANSFORM else 'raw'
+    return _load_image_cached(str(path), transform_name=transform_name, mode=mode, zero_channels=zero_channels).clone()
+
+
+@lru_cache(maxsize=IMAGE_CACHE_SIZE)
+def _load_image_cached(path_str: str,
+                       transform_name: str,
+                       mode: Optional[str],
+                       zero_channels: int) -> torch.Tensor:
+    path = Path(path_str)
+    if not path.exists():
+        return torch.zeros(zero_channels, *IMAGE_SIZE, dtype=torch.float32)
+
+    transform = RGB_TRANSFORM if transform_name == 'rgb' else RAW_IMAGE_TRANSFORM
     with Image.open(path) as image:
         if mode is not None:
             image = image.convert(mode)
