@@ -345,6 +345,14 @@ def _load_rgb_feature_cache(cache_path: Path) -> Tuple[torch.Tensor, torch.Tenso
     return features, second_timestamps, frame_indices
 
 
+def _sanitize_cache_key(name: str) -> str:
+    return ''.join(ch if ch.isalnum() or ch in ('-', '_', '.') else '_' for ch in name)
+
+
+def _rgb_feature_cache_path(cache_dir: Path, model_name: str, sample_dir: Path) -> Path:
+    return cache_dir / _sanitize_cache_key(model_name) / f'{sample_dir.name}.pt'
+
+
 def _stack_image_entries(entries: List[Tuple[int, int, Path]],
                          transform,
                          mode: Optional[str],
@@ -745,7 +753,8 @@ class PoseItDataLoaderFull(Dataset):
                  time_layout: PoseItTimeLayout = PoseItTimeLayout.FLAT,
                  padding_metadata: PoseItPaddingMetadata = PoseItPaddingMetadata.COUNTS,
                  items_per_second: Optional[PoseItItemsPerSecond] = None,
-                 rgb_feature_cache_dir: Optional[str] = None):
+                 rgb_feature_cache_dir: Optional[str] = None,
+                 rgb_feature_cache_model_name: Optional[str] = None):
         assert root_dir or sample_dirs, "Provide root_dir or sample_dirs"
         if root_dir is not None and not Path(root_dir).is_dir():
             raise FileNotFoundError(f"Dataset root does not exist or is not a directory: {root_dir}")
@@ -758,8 +767,10 @@ class PoseItDataLoaderFull(Dataset):
         self.padding_metadata = _normalize_padding_metadata(padding_metadata)
         self.items_per_second = _normalize_items_per_second(items_per_second)
         self.rgb_feature_cache_dir = Path(rgb_feature_cache_dir) if rgb_feature_cache_dir is not None else None
+        self.rgb_feature_cache_model_name = rgb_feature_cache_model_name
         self.samples = []
         skipped = 0
+        rgb_cache_hits = 0
         n_dirs = sum(1 for directory in dirs if directory.is_dir())
         with _make_progress(total=n_dirs, desc='Indexing full-duration samples') as progress:
             for directory in dirs:
@@ -771,11 +782,22 @@ class PoseItDataLoaderFull(Dataset):
                     print(f"[WARN] Skipping {directory.name}: {exc}")
                     skipped += 1
                 finally:
+                    if (
+                        self.rgb_feature_cache_dir is not None
+                        and self.rgb_feature_cache_model_name is not None
+                        and _rgb_feature_cache_path(self.rgb_feature_cache_dir, self.rgb_feature_cache_model_name, directory).exists()
+                    ):
+                        rgb_cache_hits += 1
                     progress.update(1)
 
         print(f"Loaded {len(self.samples)} full-duration samples ({skipped} skipped)  "
               f"[modalities={[m.value for m in self.modalities]}, layout={self.time_layout.value}, "
               f"padding={self.padding_metadata.value}]")
+        if self.rgb_feature_cache_dir is not None:
+            print(
+                f"RGB feature cache: dir={self.rgb_feature_cache_dir} "
+                f"model={self.rgb_feature_cache_model_name} hits={rgb_cache_hits}/{len(self.samples)}"
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -811,9 +833,14 @@ class PoseItDataLoaderFull(Dataset):
             use_rgb_feature_cache = (
                 spec.sample_key == 'rgb'
                 and self.rgb_feature_cache_dir is not None
+                and self.rgb_feature_cache_model_name is not None
             )
             if use_rgb_feature_cache:
-                cache_path = self.rgb_feature_cache_dir / f"{sample['sample_dir'].name}.pt"
+                cache_path = _rgb_feature_cache_path(
+                    self.rgb_feature_cache_dir,
+                    self.rgb_feature_cache_model_name,
+                    sample['sample_dir'],
+                )
                 if cache_path.exists():
                     cached_features, cached_second_timestamps, cached_frame_indices = _load_rgb_feature_cache(cache_path)
                     values, timestamps, second_timestamps, frame_indices, counts, valid_mask = _bucket_cached_image_features(

@@ -13,7 +13,7 @@ except ImportError:  # pragma: no cover - direct script execution
 
 
 class PerSecondImageViTEncoder(nn.Module):
-    """Encode all frames within a second using a ViT frame encoder + attention pooling.
+    """Encode all frames within a second using a frozen timm frame encoder + attention pooling.
 
     Input:
         frames: (batch, seconds, items, channels, height, width)
@@ -27,7 +27,7 @@ class PerSecondImageViTEncoder(nn.Module):
         self,
         in_channels: int,
         embed_dim: int,
-        vit_model_name: str = 'vit_small_patch16_224',
+        frame_model_name: str = 'vit_small_patch16_224',
         pretrained: bool = False,
         max_items_per_second: int = 32,
         num_pool_heads: int = 4,
@@ -37,12 +37,13 @@ class PerSecondImageViTEncoder(nn.Module):
         self.in_channels: Final[int] = in_channels
         self.embed_dim: Final[int] = embed_dim
         self.max_items_per_second: Final[int] = max_items_per_second
-        self.frame_encoder = timm.create_model(vit_model_name, pretrained=pretrained, num_classes=0, in_chans=3)
+        self.frame_model_name: Final[str] = frame_model_name
+        self.frame_encoder = timm.create_model(frame_model_name, pretrained=pretrained, num_classes=0, in_chans=3)
         for param in self.frame_encoder.parameters():
             param.requires_grad = False
         self.frame_encoder.eval()
-        frame_dim = getattr(self.frame_encoder, 'num_features')
-        self.frame_proj = nn.Linear(frame_dim, embed_dim)
+        self.frame_dim: Final[int] = int(getattr(self.frame_encoder, 'num_features'))
+        self.frame_proj = nn.Linear(self.frame_dim, embed_dim)
         self.item_position_embedding = nn.Embedding(max_items_per_second, embed_dim)
         self.pool = AttentionPooling1D(dim=embed_dim, num_heads=num_pool_heads, dropout=dropout)
         self.norm = nn.LayerNorm(embed_dim)
@@ -61,17 +62,26 @@ class PerSecondImageViTEncoder(nn.Module):
         raise ValueError(f'Unsupported in_channels={self.in_channels}')
 
     def forward(self, frames: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-        assert frames.ndim == 6, f"Expected (B, T, M, C, H, W), got {tuple(frames.shape)}"
         assert valid_mask.ndim == 3, f"Expected (B, T, M), got {tuple(valid_mask.shape)}"
-        batch, seconds, items, channels, height, width = frames.shape
-        assert channels == self.in_channels, f"Expected channels={self.in_channels}, got {channels}"
-        assert valid_mask.shape == (batch, seconds, items)
-        assert items <= self.max_items_per_second, f"items={items} exceeds max_items_per_second={self.max_items_per_second}"
+        if frames.ndim == 6:
+            batch, seconds, items, channels, height, width = frames.shape
+            assert channels == self.in_channels, f"Expected channels={self.in_channels}, got {channels}"
+            assert valid_mask.shape == (batch, seconds, items)
+            assert items <= self.max_items_per_second, f"items={items} exceeds max_items_per_second={self.max_items_per_second}"
 
-        frames = self._adapt_channels(frames)
-        frames = frames.reshape(batch * seconds * items, 3, height, width)
-        with torch.no_grad():
-            frame_tokens = self.frame_encoder(frames)
+            frames = self._adapt_channels(frames)
+            frames = frames.reshape(batch * seconds * items, 3, height, width)
+            with torch.no_grad():
+                frame_tokens = self.frame_encoder(frames)
+        elif frames.ndim == 4:
+            batch, seconds, items, frame_dim = frames.shape
+            assert frame_dim == self.frame_dim, f"Expected cached frame_dim={self.frame_dim}, got {frame_dim}"
+            assert valid_mask.shape == (batch, seconds, items)
+            assert items <= self.max_items_per_second, f"items={items} exceeds max_items_per_second={self.max_items_per_second}"
+            frame_tokens = frames.reshape(batch * seconds * items, frame_dim)
+        else:
+            raise AssertionError(f"Expected cached features (B, T, M, D) or images (B, T, M, C, H, W), got {tuple(frames.shape)}")
+
         frame_tokens = self.frame_proj(frame_tokens)
         frame_tokens = frame_tokens.reshape(batch * seconds, items, self.embed_dim)
 
@@ -84,7 +94,7 @@ class PerSecondImageViTEncoder(nn.Module):
 
 def _smoke_test() -> None:
     torch.manual_seed(0)
-    module = PerSecondImageViTEncoder(in_channels=3, embed_dim=64, vit_model_name='vit_tiny_patch16_224', max_items_per_second=8, num_pool_heads=4)
+    module = PerSecondImageViTEncoder(in_channels=3, embed_dim=64, frame_model_name='vit_tiny_patch16_224', max_items_per_second=8, num_pool_heads=4)
     frames = torch.randn(2, 3, 5, 3, 224, 224)
     valid_mask = torch.tensor([
         [[True, True, True, False, False] for _ in range(3)],

@@ -29,6 +29,11 @@ from dataloader_full import (
 )
 from model_transformer import DEFAULT_MODALITIES, SlipTransformer
 
+IMAGE_ENCODER_DEFAULTS: Dict[str, str] = {
+    'vit': 'vit_tiny_patch16_224',
+    'resnet': 'resnet18',
+}
+
 SENSOR_CONFIGS: Dict[str, tuple[str, ...]] = {
     'all': tuple(DEFAULT_MODALITIES),
     'vision_only': ('tactile', 'rgb', 'depth', 'side_cam', 'top_cam'),
@@ -68,7 +73,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--dim_feedforward', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--max_seconds', type=int, default=64)
-    parser.add_argument('--vit_model_name', type=str, default='vit_small_patch16_224')
+    parser.add_argument('--image_encoder_type', type=str, default='vit', choices=sorted(IMAGE_ENCODER_DEFAULTS))
+    parser.add_argument('--image_encoder_model_name', type=str, default=None)
+    parser.add_argument('--vit_model_name', type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--vit_pretrained', action='store_true')
     parser.add_argument('--timeseries_conv_channels', type=int, default=128)
     parser.add_argument('--timeseries_num_conv_layers', type=int, default=3)
@@ -130,6 +137,14 @@ def resolve_modalities(args: argparse.Namespace) -> List[str]:
     if invalid:
         raise ValueError(f'Unsupported modalities: {invalid}')
     return names
+
+
+def resolve_image_encoder_model_name(args: argparse.Namespace) -> str:
+    if args.image_encoder_model_name:
+        return args.image_encoder_model_name
+    if args.vit_model_name:
+        return args.vit_model_name
+    return IMAGE_ENCODER_DEFAULTS[args.image_encoder_type]
 
 
 def normalize_modalities(names: Sequence[str]) -> List[PoseItModality]:
@@ -302,6 +317,7 @@ def summarize_objects(dataset: Dataset[Any], subset: Subset[Any]) -> List[str]:
 
 
 def build_dataset(args: argparse.Namespace) -> PoseItDataLoaderFull:
+    image_encoder_model_name = resolve_image_encoder_model_name(args)
     dataset = PoseItDataLoaderFull(
         root_dir=args.root_dir,
         modalities=normalize_modalities(args.modalities),
@@ -309,6 +325,7 @@ def build_dataset(args: argparse.Namespace) -> PoseItDataLoaderFull:
         padding_metadata=PoseItPaddingMetadata.BOTH,
         items_per_second=build_items_per_second(args),
         rgb_feature_cache_dir=args.rgb_feature_cache_dir,
+        rgb_feature_cache_model_name=image_encoder_model_name,
     )
     if args.subsample < 1.0:
         import random
@@ -319,6 +336,7 @@ def build_dataset(args: argparse.Namespace) -> PoseItDataLoaderFull:
 
 
 def build_model(args: argparse.Namespace) -> SlipTransformer:
+    image_encoder_model_name = resolve_image_encoder_model_name(args)
     return SlipTransformer(
         d_model=args.d_model,
         nhead=args.nhead,
@@ -327,7 +345,7 @@ def build_model(args: argparse.Namespace) -> SlipTransformer:
         dropout=args.dropout,
         modalities=args.modalities,
         max_seconds=args.max_seconds,
-        vit_model_name=args.vit_model_name,
+        image_encoder_model_name=image_encoder_model_name,
         vit_pretrained=args.vit_pretrained,
         max_items_per_second={
             'tactile': args.tactile_items_per_second,
@@ -364,6 +382,7 @@ def run_smoke_test(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     args.modalities = resolve_modalities(args)
+    args.image_encoder_model_name = resolve_image_encoder_model_name(args)
     if args.smoke_test_only:
         run_smoke_test(args)
         return
@@ -378,6 +397,9 @@ def main() -> None:
     train_set, val_set, test_set = make_split(dataset, args)
     print(f'Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}')
     print(f'Modalities: {args.modalities}')
+    print(f'Image encoder: type={args.image_encoder_type} model={args.image_encoder_model_name}')
+    if args.rgb_feature_cache_dir is not None:
+        print(f'RGB feature cache parent: {args.rgb_feature_cache_dir}')
     if args.split == 'object':
         print(f'Train objects: {summarize_objects(dataset, train_set)}')
         print(f'Val objects: {summarize_objects(dataset, val_set)}')
