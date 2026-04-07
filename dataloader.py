@@ -342,14 +342,51 @@ class PoseItDataset(Dataset):
         )
 
 
-def split_by_object(dataset: PoseItDataset, test_objects: List[str], val_ratio: float = 0.1):
-    test_idx  = [i for i, s in enumerate(dataset.samples) if s['object'] in test_objects]
-    train_val = [i for i in range(len(dataset.samples)) if i not in set(test_idx)]
-    np.random.shuffle(train_val)
-    n_val = max(1, int(len(train_val) * val_ratio))
+def split_by_object(
+    dataset: PoseItDataset,
+    test_objects: List[str],
+    val_objects: Optional[List[str]] = None,
+    val_ratio: float = 0.1,
+    seed: int = 0,
+):
+    all_objects = sorted({str(s['object']) for s in dataset.samples})
+    test_object_set = set(test_objects)
+    unknown_test = sorted(test_object_set - set(all_objects))
+    if unknown_test:
+        raise ValueError(f"Unknown test objects: {unknown_test}")
+
+    remaining_objects = [obj for obj in all_objects if obj not in test_object_set]
+    if not remaining_objects:
+        raise ValueError('Object split needs at least one non-test object for train/val.')
+
+    if val_objects is None:
+        rng = np.random.default_rng(seed)
+        n_val_objects = max(1, int(round(len(remaining_objects) * val_ratio)))
+        n_val_objects = min(n_val_objects, max(1, len(remaining_objects) - 1))
+        val_objects = sorted(rng.choice(remaining_objects, size=n_val_objects, replace=False).tolist())
+
+    val_object_set = set(val_objects)
+    unknown_val = sorted(val_object_set - set(all_objects))
+    if unknown_val:
+        raise ValueError(f"Unknown val objects: {unknown_val}")
+    overlap = sorted(val_object_set & test_object_set)
+    if overlap:
+        raise ValueError(f"Validation/test objects overlap: {overlap}")
+
+    train_idx = [i for i, s in enumerate(dataset.samples) if s['object'] not in test_object_set and s['object'] not in val_object_set]
+    val_idx = [i for i, s in enumerate(dataset.samples) if s['object'] in val_object_set]
+    test_idx = [i for i, s in enumerate(dataset.samples) if s['object'] in test_object_set]
+
+    if not train_idx:
+        raise ValueError('Object split produced an empty training set.')
+    if not val_idx:
+        raise ValueError('Object split produced an empty validation set.')
+    if not test_idx:
+        raise ValueError('Object split produced an empty test set.')
+
     return (
-        torch.utils.data.Subset(dataset, train_val[n_val:]),
-        torch.utils.data.Subset(dataset, train_val[:n_val]),
+        torch.utils.data.Subset(dataset, train_idx),
+        torch.utils.data.Subset(dataset, val_idx),
         torch.utils.data.Subset(dataset, test_idx),
     )
 

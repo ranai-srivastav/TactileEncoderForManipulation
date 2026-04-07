@@ -25,14 +25,30 @@ from dataloader_full import (
 )
 from model_transformer import DEFAULT_MODALITIES, SlipTransformer
 
+SENSOR_CONFIGS: Dict[str, tuple[str, ...]] = {
+    'all': tuple(DEFAULT_MODALITIES),
+    'vision_only': ('tactile', 'rgb', 'depth', 'side_cam', 'top_cam'),
+    'tactile_only': ('tactile',),
+    'rgb_only': ('rgb',),
+    'no_visual': ('ft', 'gripper', 'robot', 'gripper_force'),
+    'proprio_only': ('ft', 'gripper', 'robot'),
+    'rgb_ft_gripper': ('rgb', 'ft', 'gripper', 'gripper_force'),
+    'all_no_robot': ('tactile', 'rgb', 'depth', 'side_cam', 'top_cam', 'ft', 'gripper', 'gripper_force'),
+    'all_no_depth': ('tactile', 'rgb', 'side_cam', 'top_cam', 'ft', 'gripper', 'robot', 'gripper_force'),
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train the hierarchical slip transformer on full-resolution PoseIt data.')
     parser.add_argument('--root_dir', type=str, default='./data')
     parser.add_argument('--split', type=str, default='random', choices=['object', 'pose', 'random'])
     parser.add_argument('--test_objects', nargs='+', default=['mug', 'bowl'])
+    parser.add_argument('--val_objects', nargs='+', default=None)
+    parser.add_argument('--split_seed', type=int, default=0)
     parser.add_argument('--test_poses', nargs='+', type=int, default=[1, 2, 3, 4, 5])
-    parser.add_argument('--modalities', nargs='+', default=list(DEFAULT_MODALITIES))
+    parser.add_argument('--sensor_config', type=str, default='all', choices=sorted(SENSOR_CONFIGS))
+    parser.add_argument('--modalities', nargs='+', default=None)
+    parser.add_argument('--exclude_modalities', nargs='*', default=[])
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--subsample', type=float, default=1.0)
@@ -70,6 +86,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_modalities(args: argparse.Namespace) -> List[str]:
+    names = list(args.modalities) if args.modalities is not None else list(SENSOR_CONFIGS[args.sensor_config])
+    if args.exclude_modalities:
+        excluded = set(args.exclude_modalities)
+        names = [name for name in names if name not in excluded]
+    if not names:
+        raise ValueError('Resolved modalities are empty after applying sensor config and exclusions.')
+    invalid = sorted(set(names) - set(DEFAULT_MODALITIES))
+    if invalid:
+        raise ValueError(f'Unsupported modalities: {invalid}')
+    return names
+
+
 def normalize_modalities(names: Sequence[str]) -> List[PoseItModality]:
     normalized: List[PoseItModality] = []
     for name in names:
@@ -98,7 +127,12 @@ def make_split(dataset: Dataset[Any], args: argparse.Namespace):
         subset = Subset(dataset, indices)
         return subset, subset, subset
     if args.split == 'object':
-        return split_by_object(dataset, test_objects=args.test_objects)
+        return split_by_object(
+            dataset,
+            test_objects=args.test_objects,
+            val_objects=args.val_objects,
+            seed=args.split_seed,
+        )
     if args.split == 'pose':
         return split_by_pose(dataset, test_pose_indices=args.test_poses)
     return uniform_random_split(dataset)
@@ -219,6 +253,10 @@ def maybe_log(metrics: Mapping[str, float], step: int) -> None:
         wandb.log(payload, step=step)
 
 
+def summarize_objects(dataset: Dataset[Any], subset: Subset[Any]) -> List[str]:
+    return sorted({str(dataset.samples[i]['object']) for i in subset.indices})
+
+
 def build_dataset(args: argparse.Namespace) -> PoseItDataLoaderFull:
     dataset = PoseItDataLoaderFull(
         root_dir=args.root_dir,
@@ -280,6 +318,7 @@ def run_smoke_test(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    args.modalities = resolve_modalities(args)
     if args.smoke_test_only:
         run_smoke_test(args)
         return
@@ -291,6 +330,11 @@ def main() -> None:
     dataset = build_dataset(args)
     train_set, val_set, test_set = make_split(dataset, args)
     print(f'Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}')
+    print(f'Modalities: {args.modalities}')
+    if args.split == 'object':
+        print(f'Train objects: {summarize_objects(dataset, train_set)}')
+        print(f'Val objects: {summarize_objects(dataset, val_set)}')
+        print(f'Test objects: {summarize_objects(dataset, test_set)}')
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=not args.overfit_all, num_workers=args.num_workers, collate_fn=collate_full_by_second)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_full_by_second)
