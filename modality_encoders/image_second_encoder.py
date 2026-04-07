@@ -38,12 +38,20 @@ class PerSecondImageViTEncoder(nn.Module):
         self.embed_dim: Final[int] = embed_dim
         self.max_items_per_second: Final[int] = max_items_per_second
         self.frame_encoder = timm.create_model(vit_model_name, pretrained=pretrained, num_classes=0, in_chans=3)
+        for param in self.frame_encoder.parameters():
+            param.requires_grad = False
+        self.frame_encoder.eval()
         frame_dim = getattr(self.frame_encoder, 'num_features')
         self.frame_proj = nn.Linear(frame_dim, embed_dim)
         self.item_position_embedding = nn.Embedding(max_items_per_second, embed_dim)
         self.pool = AttentionPooling1D(dim=embed_dim, num_heads=num_pool_heads, dropout=dropout)
         self.norm = nn.LayerNorm(embed_dim)
         nn.init.normal_(self.item_position_embedding.weight, std=0.02)
+
+    def train(self, mode: bool = True) -> PerSecondImageViTEncoder:
+        super().train(mode)
+        self.frame_encoder.eval()
+        return self
 
     def _adapt_channels(self, frames: torch.Tensor) -> torch.Tensor:
         if self.in_channels == 3:
@@ -62,7 +70,8 @@ class PerSecondImageViTEncoder(nn.Module):
 
         frames = self._adapt_channels(frames)
         frames = frames.reshape(batch * seconds * items, 3, height, width)
-        frame_tokens = self.frame_encoder(frames)
+        with torch.no_grad():
+            frame_tokens = self.frame_encoder(frames)
         frame_tokens = self.frame_proj(frame_tokens)
         frame_tokens = frame_tokens.reshape(batch * seconds, items, self.embed_dim)
 
