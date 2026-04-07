@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--overfit_all', action='store_true', help='Use the entire loaded dataset for train/val/test.')
     parser.add_argument('--n_iters', type=int, default=50)
     parser.add_argument('--log_interval', type=int, default=5)
+    parser.add_argument('--val_interval', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--d_model', type=int, default=512)
@@ -367,7 +368,8 @@ def main() -> None:
             loss.backward()
             optimizer.step()
 
-            if iteration % args.log_interval == 0 or iteration == args.n_iters - 1:
+            should_validate = iteration % args.val_interval == 0 or iteration == args.n_iters - 1
+            if should_validate:
                 val_metrics = evaluate(model, val_loader, criterion, device)
                 print(
                     f"[iter {iteration:03d}] train_loss={loss.item():.4f} "
