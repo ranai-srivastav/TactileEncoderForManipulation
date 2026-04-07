@@ -71,7 +71,7 @@ class _NullProgressBar:
         self.total = total
         self.desc = desc
 
-    def __enter__(self) -> _NullProgressBar:
+    def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
