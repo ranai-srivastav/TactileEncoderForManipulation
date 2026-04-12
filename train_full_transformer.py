@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 import torch
+import torch.backends.cudnn as cudnn
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, Subset
 try:
@@ -60,7 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--modalities', nargs='+', default=None)
     parser.add_argument('--exclude_modalities', nargs='*', default=[])
     parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--pin_memory', action='store_true', default=True)
+    parser.add_argument('--no_pin_memory', action='store_false', dest='pin_memory')
+    parser.add_argument('--persistent_workers', action='store_true', default=True)
+    parser.add_argument('--no_persistent_workers', action='store_false', dest='persistent_workers')
+    parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--subsample', type=float, default=1.0)
     parser.add_argument('--overfit_all', action='store_true', help='Use the entire loaded dataset for train/val/test.')
     parser.add_argument('--n_iters', type=int, default=50)
@@ -245,11 +251,29 @@ def collate_full_by_second(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 def batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     moved: Dict[str, Any] = {}
     for key, value in batch.items():
-        moved[key] = value.to(device) if isinstance(value, torch.Tensor) else value
+        if isinstance(value, torch.Tensor):
+            moved[key] = value.to(device, non_blocking=True)
+        else:
+            moved[key] = value
     return moved
 
 
-@torch.no_grad()
+def make_loader(dataset: Dataset[Any], batch_size: int, shuffle: bool, args: argparse.Namespace) -> DataLoader[Dict[str, Any]]:
+    loader_kwargs: Dict[str, Any] = {
+        'dataset': dataset,
+        'batch_size': batch_size,
+        'shuffle': shuffle,
+        'num_workers': args.num_workers,
+        'collate_fn': collate_full_by_second,
+        'pin_memory': args.pin_memory,
+    }
+    if args.num_workers > 0:
+        loader_kwargs['persistent_workers'] = args.persistent_workers
+        loader_kwargs['prefetch_factor'] = args.prefetch_factor
+    return DataLoader(**loader_kwargs)
+
+
+@torch.inference_mode()
 def evaluate(
     model: nn.Module,
     loader: DataLoader[Dict[str, Any]],
@@ -402,6 +426,9 @@ def main() -> None:
         return
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
     print(f'Using device: {device}')
     maybe_init_wandb(args)
 
@@ -421,9 +448,11 @@ def main() -> None:
         print(f'Val objects: {summarize_objects(dataset, val_set)}')
         print(f'Test objects: {summarize_objects(dataset, test_set)}')
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=not args.overfit_all, num_workers=args.num_workers, collate_fn=collate_full_by_second)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_full_by_second)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_full_by_second)
+    train_loader = make_loader(train_set, batch_size=args.batch_size, shuffle=not args.overfit_all, args=args)
+    val_loader = make_loader(val_set, batch_size=args.batch_size, shuffle=False, args=args)
+    test_loader = make_loader(test_set, batch_size=args.batch_size, shuffle=False, args=args)
+    steps_per_epoch = max(1, len(train_loader))
+    print(f'Steps per epoch: {steps_per_epoch}')
 
     train_labels = [int(dataset.samples[i]['labels'].get('stability', 'drop') != 'pass') for i in train_set.indices]
     n_pos = sum(train_labels)
