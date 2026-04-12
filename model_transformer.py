@@ -5,7 +5,11 @@ from typing import Dict, Final, List, Mapping, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from modality_encoders import PerSecondImageViTEncoder, PerSecondTimeseriesConvEncoder
+from modality_encoders import (
+    PerSecondImageTemporalConvEncoder,
+    PerSecondImageViTEncoder,
+    PerSecondTimeseriesConvEncoder,
+)
 
 IMAGE_MODALITIES: Final[tuple[str, ...]] = ('tactile', 'rgb', 'depth', 'side_cam', 'top_cam')
 TIMESERIES_MODALITIES: Final[tuple[str, ...]] = ('ft', 'gripper', 'robot')
@@ -64,6 +68,7 @@ class SlipTransformer(nn.Module):
         dropout: float = 0.1,
         modalities: Optional[Sequence[str]] = None,
         max_seconds: int = 64,
+        image_encoder_type: str = 'vit',
         image_encoder_model_name: str = 'vit_small_patch16_224',
         vit_pretrained: bool = False,
         max_items_per_second: Optional[Dict[str, int]] = None,
@@ -71,6 +76,10 @@ class SlipTransformer(nn.Module):
         timeseries_num_conv_layers: int = 3,
         timeseries_kernel_size: int = 5,
         scalar_hidden_dim: int = 128,
+        image_temporal_stem_channels: int = 16,
+        image_temporal_branch_channels: int = 48,
+        image_temporal_num_blocks: int = 3,
+        image_temporal_spatial_downsample: int = 4,
     ) -> None:
         super().__init__()
         self.modalities: Final[tuple[str, ...]] = tuple(modalities or DEFAULT_MODALITIES)
@@ -88,18 +97,37 @@ class SlipTransformer(nn.Module):
             'robot': 2970,
         })
 
-        self.image_encoders = nn.ModuleDict({
-            name: PerSecondImageViTEncoder(
-                in_channels=IMAGE_CHANNELS[name],
-                embed_dim=d_model,
-                frame_model_name=image_encoder_model_name,
-                pretrained=vit_pretrained,
-                max_items_per_second=self.max_items_per_second[name],
-                num_pool_heads=nhead,
-                dropout=dropout,
-            )
-            for name in self.modalities if name in IMAGE_CHANNELS
-        })
+        if image_encoder_type not in {'vit', 'resnet', 'temporal_cnn'}:
+            raise ValueError(f'Unsupported image_encoder_type={image_encoder_type}')
+
+        if image_encoder_type == 'temporal_cnn':
+            self.image_encoders = nn.ModuleDict({
+                name: PerSecondImageTemporalConvEncoder(
+                    in_channels=IMAGE_CHANNELS[name],
+                    embed_dim=d_model,
+                    max_items_per_second=self.max_items_per_second[name],
+                    num_pool_heads=nhead,
+                    dropout=dropout,
+                    stem_channels=image_temporal_stem_channels,
+                    branch_channels=image_temporal_branch_channels,
+                    spatial_downsample=image_temporal_spatial_downsample,
+                    num_branch_blocks=image_temporal_num_blocks,
+                )
+                for name in self.modalities if name in IMAGE_CHANNELS
+            })
+        else:
+            self.image_encoders = nn.ModuleDict({
+                name: PerSecondImageViTEncoder(
+                    in_channels=IMAGE_CHANNELS[name],
+                    embed_dim=d_model,
+                    frame_model_name=image_encoder_model_name,
+                    pretrained=vit_pretrained,
+                    max_items_per_second=self.max_items_per_second[name],
+                    num_pool_heads=nhead,
+                    dropout=dropout,
+                )
+                for name in self.modalities if name in IMAGE_CHANNELS
+            })
         self.timeseries_encoders = nn.ModuleDict({
             name: PerSecondTimeseriesConvEncoder(
                 input_dim=TIMESERIES_DIMS[name],
@@ -158,7 +186,7 @@ class SlipTransformer(nn.Module):
         assert seconds <= self.max_seconds, f'Sequence length {seconds} exceeds max_seconds={self.max_seconds}'
 
         time_ids = torch.arange(seconds, device=seconds_tensor.device)
-        time_emb = self.time_embedding(time_ids).unsqueeze(0)  # (1, T, D)
+        time_emb = self.time_embedding(time_ids).unsqueeze(0)
 
         token_blocks: List[torch.Tensor] = []
         padding_masks: List[torch.Tensor] = []
@@ -234,11 +262,15 @@ def _smoke_test() -> None:
         num_layers=1,
         dim_feedforward=128,
         modalities=smoke_modalities,
-        image_encoder_model_name='vit_tiny_patch16_224',
+        image_encoder_type='temporal_cnn',
+        image_encoder_model_name='temporal_cnn_small',
         max_seconds=4,
         max_items_per_second={'rgb': 3, 'ft': 8, 'gripper': 4, 'robot': 8, 'tactile': 4, 'depth': 2, 'side_cam': 4, 'top_cam': 4},
         timeseries_conv_channels=32,
         scalar_hidden_dim=32,
+        image_temporal_stem_channels=8,
+        image_temporal_branch_channels=16,
+        image_temporal_num_blocks=2,
     )
     batch = _make_fake_batch(modalities=smoke_modalities)
     logits = model(batch)

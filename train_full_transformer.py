@@ -32,6 +32,7 @@ from model_transformer import DEFAULT_MODALITIES, SlipTransformer
 IMAGE_ENCODER_DEFAULTS: Dict[str, str] = {
     'vit': 'vit_tiny_patch16_224',
     'resnet': 'resnet18',
+    'temporal_cnn': 'temporal_cnn_small',
 }
 
 SENSOR_CONFIGS: Dict[str, tuple[str, ...]] = {
@@ -77,6 +78,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--image_encoder_model_name', type=str, default=None)
     parser.add_argument('--vit_model_name', type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--vit_pretrained', action='store_true')
+    parser.add_argument('--image_temporal_stem_channels', type=int, default=16)
+    parser.add_argument('--image_temporal_branch_channels', type=int, default=48)
+    parser.add_argument('--image_temporal_num_blocks', type=int, default=3)
+    parser.add_argument('--image_temporal_spatial_downsample', type=int, default=4)
     parser.add_argument('--timeseries_conv_channels', type=int, default=128)
     parser.add_argument('--timeseries_num_conv_layers', type=int, default=3)
     parser.add_argument('--timeseries_kernel_size', type=int, default=5)
@@ -318,13 +323,14 @@ def summarize_objects(dataset: Dataset[Any], subset: Subset[Any]) -> List[str]:
 
 def build_dataset(args: argparse.Namespace) -> PoseItDataLoaderFull:
     image_encoder_model_name = resolve_image_encoder_model_name(args)
+    rgb_feature_cache_dir = args.rgb_feature_cache_dir if args.image_encoder_type != 'temporal_cnn' else None
     dataset = PoseItDataLoaderFull(
         root_dir=args.root_dir,
         modalities=normalize_modalities(args.modalities),
         time_layout=PoseItTimeLayout.BY_SECOND,
         padding_metadata=PoseItPaddingMetadata.BOTH,
         items_per_second=build_items_per_second(args),
-        rgb_feature_cache_dir=args.rgb_feature_cache_dir,
+        rgb_feature_cache_dir=rgb_feature_cache_dir,
         rgb_feature_cache_model_name=image_encoder_model_name,
     )
     if args.subsample < 1.0:
@@ -339,6 +345,7 @@ def build_model(args: argparse.Namespace) -> SlipTransformer:
     image_encoder_model_name = resolve_image_encoder_model_name(args)
     return SlipTransformer(
         d_model=args.d_model,
+        image_encoder_type=args.image_encoder_type,
         nhead=args.nhead,
         num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward,
@@ -347,6 +354,10 @@ def build_model(args: argparse.Namespace) -> SlipTransformer:
         max_seconds=args.max_seconds,
         image_encoder_model_name=image_encoder_model_name,
         vit_pretrained=args.vit_pretrained,
+        image_temporal_stem_channels=args.image_temporal_stem_channels,
+        image_temporal_branch_channels=args.image_temporal_branch_channels,
+        image_temporal_num_blocks=args.image_temporal_num_blocks,
+        image_temporal_spatial_downsample=args.image_temporal_spatial_downsample,
         max_items_per_second={
             'tactile': args.tactile_items_per_second,
             'rgb': args.rgb_items_per_second,
@@ -398,7 +409,9 @@ def main() -> None:
     print(f'Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}')
     print(f'Modalities: {args.modalities}')
     print(f'Image encoder: type={args.image_encoder_type} model={args.image_encoder_model_name}')
-    if args.rgb_feature_cache_dir is not None:
+    if args.image_encoder_type == 'temporal_cnn' and args.rgb_feature_cache_dir is not None:
+        print('RGB feature cache parent: ignored for temporal_cnn')
+    elif args.rgb_feature_cache_dir is not None:
         print(f'RGB feature cache parent: {args.rgb_feature_cache_dir}')
     if args.split == 'object':
         print(f'Train objects: {summarize_objects(dataset, train_set)}')
