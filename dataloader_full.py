@@ -498,6 +498,27 @@ def _truncate_layout(starts: np.ndarray,
     return truncated_ends, counts
 
 
+def _uniform_sample_layout(starts: np.ndarray,
+                           ends: np.ndarray,
+                           target_count: int) -> Tuple[List[np.ndarray], torch.Tensor]:
+    sampled_indices: List[np.ndarray] = []
+    sampled_counts = np.zeros(len(starts), dtype=np.int64)
+    for i, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
+        count = max(end - start, 0)
+        if count == 0 or target_count <= 0:
+            sampled_indices.append(np.zeros(0, dtype=np.int64))
+            continue
+        take = min(count, target_count)
+        sampled_counts[i] = take
+        if count <= target_count:
+            sampled_indices.append(np.arange(start, end, dtype=np.int64))
+            continue
+        positions = np.linspace(0, count - 1, num=take)
+        indices = start + np.floor(positions).astype(np.int64)
+        sampled_indices.append(indices)
+    return sampled_indices, torch.from_numpy(sampled_counts)
+
+
 def _pad_tensor_by_layout(values: torch.Tensor,
                           starts: np.ndarray,
                           ends: np.ndarray,
@@ -529,6 +550,33 @@ def _pad_scalar_by_layout(values: torch.Tensor,
     return padded
 
 
+def _pad_tensor_by_indices(values: torch.Tensor,
+                           sampled_indices: List[np.ndarray],
+                           target_count: int,
+                           pad_value: float = 0.0) -> torch.Tensor:
+    shape = (len(sampled_indices), target_count, *values.shape[1:])
+    padded = torch.full(shape, pad_value, dtype=values.dtype)
+    for i, indices in enumerate(sampled_indices):
+        if len(indices) == 0:
+            continue
+        index_tensor = torch.as_tensor(indices, dtype=torch.long)
+        padded[i, :len(indices)] = values.index_select(0, index_tensor)
+    return padded
+
+
+def _pad_scalar_by_indices(values: torch.Tensor,
+                           sampled_indices: List[np.ndarray],
+                           target_count: int,
+                           pad_value) -> torch.Tensor:
+    padded = torch.full((len(sampled_indices), target_count), pad_value, dtype=values.dtype)
+    for i, indices in enumerate(sampled_indices):
+        if len(indices) == 0:
+            continue
+        index_tensor = torch.as_tensor(indices, dtype=torch.long)
+        padded[i, :len(indices)] = values.index_select(0, index_tensor)
+    return padded
+
+
 def _bucket_image_entries(entries: List[Tuple[int, int, Path]],
                           seconds: torch.Tensor,
                           transform,
@@ -542,16 +590,16 @@ def _bucket_image_entries(entries: List[Tuple[int, int, Path]],
         zero_channels=zero_channels,
     )
     starts, ends, _ = _second_bucket_layout(second_timestamps, seconds)
-    truncated_ends, counts = _truncate_layout(starts, ends, target_count)
-    bucketed_frames = _pad_tensor_by_layout(frames, starts, truncated_ends, target_count, pad_value=0.0)
-    bucketed_timestamps = _pad_scalar_by_layout(
-        timestamps, starts, truncated_ends, target_count, pad_value=float('nan')
+    sampled_indices, counts = _uniform_sample_layout(starts, ends, target_count)
+    bucketed_frames = _pad_tensor_by_indices(frames, sampled_indices, target_count, pad_value=0.0)
+    bucketed_timestamps = _pad_scalar_by_indices(
+        timestamps, sampled_indices, target_count, pad_value=float('nan')
     )
-    bucketed_second_timestamps = _pad_scalar_by_layout(
-        second_timestamps, starts, truncated_ends, target_count, pad_value=-1
+    bucketed_second_timestamps = _pad_scalar_by_indices(
+        second_timestamps, sampled_indices, target_count, pad_value=-1
     )
-    bucketed_frame_indices = _pad_scalar_by_layout(
-        frame_indices, starts, truncated_ends, target_count, pad_value=-1
+    bucketed_frame_indices = _pad_scalar_by_indices(
+        frame_indices, sampled_indices, target_count, pad_value=-1
     )
     valid_mask = bucketed_second_timestamps >= 0
     return (
@@ -573,16 +621,16 @@ def _bucket_cached_image_features(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     interp_timestamps = _interpolate_second_timestamps(second_timestamps.numpy())
     starts, ends, _ = _second_bucket_layout(second_timestamps, seconds)
-    truncated_ends, counts = _truncate_layout(starts, ends, target_count)
-    bucketed_features = _pad_tensor_by_layout(features, starts, truncated_ends, target_count, pad_value=0.0)
-    bucketed_timestamps = _pad_scalar_by_layout(
-        interp_timestamps, starts, truncated_ends, target_count, pad_value=float('nan')
+    sampled_indices, counts = _uniform_sample_layout(starts, ends, target_count)
+    bucketed_features = _pad_tensor_by_indices(features, sampled_indices, target_count, pad_value=0.0)
+    bucketed_timestamps = _pad_scalar_by_indices(
+        interp_timestamps, sampled_indices, target_count, pad_value=float('nan')
     )
-    bucketed_second_timestamps = _pad_scalar_by_layout(
-        second_timestamps, starts, truncated_ends, target_count, pad_value=-1
+    bucketed_second_timestamps = _pad_scalar_by_indices(
+        second_timestamps, sampled_indices, target_count, pad_value=-1
     )
-    bucketed_frame_indices = _pad_scalar_by_layout(
-        frame_indices, starts, truncated_ends, target_count, pad_value=-1
+    bucketed_frame_indices = _pad_scalar_by_indices(
+        frame_indices, sampled_indices, target_count, pad_value=-1
     )
     valid_mask = bucketed_second_timestamps >= 0
     return (
@@ -732,8 +780,9 @@ class PoseItDataLoaderFull(Dataset):
             ``*_counts_per_second``, ``*_valid_mask``, or both.
         items_per_second:
             Typed per-modality target widths used in ``BY_SECOND`` mode. Seconds
-            with fewer than the target count are zero-padded. Seconds with more
-            than the target count are truncated in timestamp order. Defaults are
+            with fewer than the target count are zero-padded. Image modalities
+            with more than the target count are sampled uniformly across the
+            second; timeseries modalities are truncated in timestamp order. Defaults are
             the latest full-dataset medians: tactile=30, rgb=5, depth=5,
             side_cam=30, top_cam=30, ft=100, gripper=10, robot=2970.
 
