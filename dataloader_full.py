@@ -18,7 +18,7 @@ from typing import Dict, Iterable, List, Optional, TypedDict, Tuple
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torch.utils.data import Dataset
 from torchvision import transforms
 
@@ -331,10 +331,14 @@ def _load_image_cached(path_str: str,
         return torch.zeros(zero_channels, *IMAGE_SIZE, dtype=torch.float32)
 
     transform = RGB_TRANSFORM if transform_name == 'rgb' else RAW_IMAGE_TRANSFORM
-    with Image.open(path) as image:
-        if mode is not None:
-            image = image.convert(mode)
-        return transform(image)
+    try:
+        with Image.open(path) as image:
+            if mode is not None:
+                image = image.convert(mode)
+            return transform(image)
+    except (UnidentifiedImageError, OSError):
+        print(f"[WARN] Skipping unreadable image: {path}")
+        return torch.zeros(zero_channels, *IMAGE_SIZE, dtype=torch.float32)
 
 
 def _load_rgb_feature_cache(cache_path: Path) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
