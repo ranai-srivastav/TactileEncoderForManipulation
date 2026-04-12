@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--overfit_all', action='store_true', help='Use the entire loaded dataset for train/val/test.')
     parser.add_argument('--n_iters', type=int, default=50)
     parser.add_argument('--log_interval', type=int, default=5)
-    parser.add_argument('--val_interval', type=int, default=50)
+    parser.add_argument('--val_interval', type=int, default=1, help='Number of epochs between validation runs.')
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--d_model', type=int, default=512)
@@ -305,14 +305,17 @@ def maybe_init_wandb(args: argparse.Namespace) -> None:
         config=vars(args),
     )
     wandb.define_metric('iter')
+    wandb.define_metric('epoch')
     wandb.define_metric('train/*', step_metric='iter')
     wandb.define_metric('val/*', step_metric='iter')
     wandb.define_metric('test/*', step_metric='iter')
 
 
-def maybe_log(metrics: Mapping[str, float], step: int) -> None:
+def maybe_log(metrics: Mapping[str, float], step: int, epoch: int | None = None) -> None:
     if WANDB_AVAILABLE and wandb.run is not None:
         payload = {'iter': step}
+        if epoch is not None:
+            payload['epoch'] = epoch
         payload.update(metrics)
         wandb.log(payload, step=step)
 
@@ -437,8 +440,11 @@ def main() -> None:
     os.makedirs(save_dir, exist_ok=True)
     best_val_f1 = -1.0
     iteration = 0
+    epoch = 0
+    last_train_loss = 0.0
     with _make_progress(total=args.n_iters, desc='Training', leave=True) as train_progress:
         while iteration < args.n_iters:
+            epoch += 1
             model.train()
             for batch in train_loader:
                 if iteration >= args.n_iters:
@@ -450,30 +456,34 @@ def main() -> None:
                 loss = criterion(logits, labels)
                 loss.backward()
                 optimizer.step()
+                last_train_loss = float(loss.item())
                 train_progress.update(1)
                 if iteration % args.log_interval == 0 or iteration == args.n_iters - 1:
-                    train_progress.set_postfix(train_loss=f'{loss.item():.4f}')
-
-                should_validate = iteration % args.val_interval == 0 or iteration == args.n_iters - 1
-                if should_validate:
-                    val_metrics = evaluate(model, val_loader, criterion, device, desc='Validation')
-                    print(
-                        f"[iter {iteration:03d}] train_loss={loss.item():.4f} "
-                        f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['acc']:.3f} "
-                        f"val_f1={val_metrics['f1']:.3f}"
-                    )
-                    maybe_log({
-                        'train/loss': float(loss.item()),
-                        'val/loss': val_metrics['loss'],
-                        'val/acc': val_metrics['acc'],
-                        'val/precision': val_metrics['precision'],
-                        'val/recall': val_metrics['recall'],
-                        'val/f1': val_metrics['f1'],
-                    }, step=iteration)
-                    if val_metrics['f1'] > best_val_f1:
-                        best_val_f1 = val_metrics['f1']
-                        torch.save(model.state_dict(), args.model_save_path)
+                    train_progress.set_postfix(train_loss=f'{last_train_loss:.4f}', epoch=epoch)
+                maybe_log({
+                    'train/loss': last_train_loss,
+                }, step=iteration, epoch=epoch)
                 iteration += 1
+
+            should_validate = epoch % args.val_interval == 0 or iteration >= args.n_iters
+            if should_validate and iteration > 0:
+                val_metrics = evaluate(model, val_loader, criterion, device, desc=f'Validation (epoch {epoch})')
+                print(
+                    f"[epoch {epoch:03d} iter {iteration:03d}] train_loss={last_train_loss:.4f} "
+                    f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['acc']:.3f} "
+                    f"val_f1={val_metrics['f1']:.3f}"
+                )
+                maybe_log({
+                    'train/loss': last_train_loss,
+                    'val/loss': val_metrics['loss'],
+                    'val/acc': val_metrics['acc'],
+                    'val/precision': val_metrics['precision'],
+                    'val/recall': val_metrics['recall'],
+                    'val/f1': val_metrics['f1'],
+                }, step=max(iteration - 1, 0), epoch=epoch)
+                if val_metrics['f1'] > best_val_f1:
+                    best_val_f1 = val_metrics['f1']
+                    torch.save(model.state_dict(), args.model_save_path)
 
     if os.path.exists(args.model_save_path):
         model.load_state_dict(torch.load(args.model_save_path, map_location=device))
@@ -488,7 +498,7 @@ def main() -> None:
         'test/precision': test_metrics['precision'],
         'test/recall': test_metrics['recall'],
         'test/f1': test_metrics['f1'],
-    }, step=args.n_iters)
+    }, step=args.n_iters, epoch=epoch)
     if WANDB_AVAILABLE and wandb.run is not None:
         wandb.finish()
 
