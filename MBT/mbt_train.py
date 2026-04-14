@@ -113,6 +113,11 @@ def parse_args():
                    help='Frames subsampled from T*F1 for ViT tokenisation (default: 8, matches paper)')
     p.add_argument('--adapter_dim',       type=int,   default=64,
                    help='AdaptFormer hidden dim; 0 = frozen backbone only')
+    p.add_argument('--t3_encoder_domain', type=str,   default='gs_black',
+                   help='T3 sensor-specific encoder domain (gs_black | gs_tag)')
+    p.add_argument('--pretrained_dir',    type=str,
+                   default='/ocean/projects/cis260031p/shared/pretrained',
+                   help='Directory containing T3 pretrained weights')
     p.add_argument('--n_iters',      type=int,   default=600)
     p.add_argument('--anneal_iter',  type=int,   default=300,
                    help='Iteration to begin cosine LR decay (set > n_iters to disable)')
@@ -283,6 +288,8 @@ def main():
         adapter_dim=args.adapter_dim,
         dropout=args.dropout,
         modalities=args.modalities,
+        pretrained_dir=args.pretrained_dir,
+        t3_encoder_domain=args.t3_encoder_domain,
     ).to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)

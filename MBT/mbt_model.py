@@ -1,80 +1,35 @@
 """
-MBTGraspStability: Multimodal Bottleneck Transformer for Grasp Stability Prediction
+MBTGraspStability: Multimodal Bottleneck Transformer for grasp stability prediction.
+Based on "Attention Bottlenecks for Multimodal Fusion" (Nagrani et al., NeurIPS 2021).
 
-Architecture based on "Attention Bottlenecks for Multimodal Fusion" (Nagrani et al.,
-NeurIPS 2021)
+Streams: T (GelSight/T3-large), V (RGB/ViT-Base), FT (force-torque), G (gripper), GF (gripper force).
+Layers 0..Lf-1 are unimodal; layers Lf..11 fuse via shared bottleneck tokens.
+Tactile runs at T3's native 1024-d; a Linear(1024→768) projects to fusion dim.
 
-Architecture overview
-
-  Modality streams:
-    Visual (high-dim, many tokens):
-      'T'  — Tactile (GelSight) frames   →  ViT-Base patch tokens
-      'V'  — RGB camera frames            →  ViT-Base patch tokens
-    Temporal (low-dim, few tokens):
-      'FT' — Force-torque readings        →  projected to 768-d, one token per timestep
-      'G'  — Gripper state                →  projected to 768-d, one token per timestep
-    Static (single value):
-      'GF' — Gripper force                →  projected to a single 768-d token
-
-  Processing stages:
-    1. Tokenisation
-       Visual streams: patch-embed frames with factored spatial + temporal positional
-       embeddings (ViViT-style). Each frame reuses the same 196-patch spatial positions
-       from ViT, and a separate learned temporal embedding distinguishes frame order.
-       Temporal streams: linear projection to 768-d per timestep, with CLS token and
-       learned positional embeddings.
-       Static stream: linear projection of the scalar to 768-d.
-
-    2. Unimodal processing (layers 0 … Lf-1)
-       Each stream processes its own tokens independently to build modality-specific
-       representations before fusion begins.
-       Visual streams use frozen ViT-Base blocks with optional AdaptFormer adapters.
-       Temporal streams use lightweight trainable transformer blocks (4 heads, 2× MLP).
-
-    3. Bottleneck fusion (layers Lf … 11)
-       All 5 streams participate in cross-modal fusion via shared bottleneck tokens.
-
-    4. Classification
-       Each modality's CLS token is passed through its own linear classifier head.
-       The final prediction is the average of all per-modality pre-softmax logits.
-       This allows each modality to contribute independently and makes it easy to 
-       inspect per-modality contributions.
-
-Input shapes:
-    tactile:       (B, T, F1, 3, 224, 224)
-    rgb:           (B, T, F1, 3, 224, 224)
-    ft:            (B, T, FT_DIM)
-    gripper:       (B, T, GR_DIM)
-    gripper_force: (B, 1)
-
-Output: (B, num_classes) raw logits — use BCEWithLogitsLoss for binary classification
+Input:  tactile, rgb (B, T, F1, 3, 224, 224) | ft (B, T, FT_DIM) | gripper (B, T, GR_DIM) | gripper_force (B, 1)
+Output: (B, num_classes) raw logits
 """
 
 import math
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
 
+# encoders.py lives in the repo root, one level up from MBT/
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 class QuickGELU(nn.Module):
-    """Fast approximation of GELU used by AdaptFormer."""
+    """Fast GELU approximation used by AdaptFormer."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(1.702 * x)
 
 
 def _make_adapter(dim: int, adapter_dim: int):
-    """
-    Create an AdaptFormer adapter: a trainable down→GELU→up bottleneck that runs
-    in parallel with a frozen FFN. Zero-initialised output so the adapter starts
-    as a no-op and gradually learns to adjust the frozen representations.
-
-    Returns: (down_proj, up_proj, learnable_scale) or None if adapter_dim <= 0.
-    """
+    """AdaptFormer down→GELU→up bottleneck. Zero-init so it starts as a no-op."""
     if adapter_dim <= 0:
         return None
     down = nn.Linear(dim, adapter_dim)
@@ -85,17 +40,8 @@ def _make_adapter(dim: int, adapter_dim: int):
     return down, up, scale
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Unimodal transformer block (frozen ViT layer + optional AdaptFormer)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class UnimodalBlock(nn.Module):
-    """
-    Wraps one frozen ViT transformer layer, optionally augmented with a trainable
-    AdaptFormer adapter in parallel with the frozen FFN.
-
-    Used for visual streams (Tactile and RGB) during unimodal processing.
-    """
+    """Frozen ViT block with optional AdaptFormer adapter in parallel with the FFN."""
     VIT_DIM = 768
 
     def __init__(self, vit_block, adapter_dim: int = 64):
@@ -123,17 +69,8 @@ class UnimodalBlock(nn.Module):
         return x
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Lightweight transformer block for low-dimensional modalities
-# ─────────────────────────────────────────────────────────────────────────────
-
 class LightweightTransformerBlock(nn.Module):
-    """
-    A small, fully trainable transformer block for 1D modalities
-    (force-torque and gripper state).
-
-    Standard pre-norm transformer with 4 attention heads and 2× MLP.
-    """
+    """Fully trainable pre-norm transformer block (4 heads, 2× MLP)."""
     def __init__(self, dim: int = 768, num_heads: int = 4, mlp_ratio: float = 2.0,
                  dropout: float = 0.1):
         super().__init__()
@@ -156,21 +93,10 @@ class LightweightTransformerBlock(nn.Module):
         return x
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stream parameters container (used by the N-modality fusion block)
-# ─────────────────────────────────────────────────────────────────────────────
-
 class StreamParams(nn.Module):
     """
-    Holds the transformer layer components for a single modality stream within
-    a bottleneck fusion block. Provides a uniform interface for the fusion block
-    to process any stream type.
-
-    Two modes:
-      - Frozen ViT block (visual streams): extracts norm/attn/mlp components and
-        optionally adds an AdaptFormer adapter. Forward uses manual residuals.
-      - Lightweight block (non-visual streams): wraps the block directly.
-        Already fully trainable, no adapter needed.
+    Per-stream transformer layer for a bottleneck fusion block.
+    Two modes: frozen ViT block + optional adapter (visual), or lightweight block (others).
     """
     def __init__(self, block, dim: int = 768, adapter_dim: int = 64,
                  is_lightweight: bool = False):
@@ -197,23 +123,7 @@ class StreamParams(nn.Module):
         return self.up(self.dropout(self.act(self.down(x)))) * self.scale
 
     def forward_with_bottleneck(self, tokens, bn, Nb):
-        """
-        Concatenate stream tokens with shared bottleneck tokens, run one
-        transformer layer, then split them back apart.
-
-        This implements half of Eq. 8: the stream-specific update. The caller
-        is responsible for collecting temporary bottleneck outputs from all
-        streams and averaging them (Eq. 9).
-
-        Args:
-            tokens: (B, N_stream, D) — this stream's token sequence
-            bn:     (B, Nb, D)       — shared bottleneck tokens (same for all streams)
-            Nb:     int              — number of bottleneck tokens
-
-        Returns:
-            updated_tokens: (B, N_stream, D)
-            bn_temp:        (B, Nb, D) — this stream's bottleneck contribution
-        """
+        """Eq. 8: run layer on [stream | bottleneck], return them split. Caller averages bn outputs."""
         if self.is_lightweight:
             cat = torch.cat([tokens, bn], dim=1)
             cat = self.block(cat)
@@ -226,48 +136,19 @@ class StreamParams(nn.Module):
             return cat[:, :-Nb], cat[:, -Nb:]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# N-modality bottleneck fusion block
-# ─────────────────────────────────────────────────────────────────────────────
-
 class BottleneckFusionBlock(nn.Module):
     """
-    One layer of N-modality bottleneck fusion, generalising Eq. 8-9 of the paper
-    from 2 modalities to an arbitrary number.
-
-    Within each fusion layer, every modality stream independently attends to the
-    shared bottleneck tokens (Eq. 8). Each stream produces a temporary updated
-    version of the bottleneck tokens. These are then averaged across all streams
-    to produce the new shared bottleneck state (Eq. 9, symmetric update):
-
-        For each stream i ∈ {T, V, FT, G, GF}:
-          [z_i^{l+1} | ẑ_bn_i^{l+1}] = Transformer([z_i^l | z_bn^l]; θ_i)
-        z_bn^{l+1} = (1/N) Σ_i ẑ_bn_i^{l+1}
-
-    Each stream has its own parameters (θ_i), so modality-specific patterns are
-    preserved while cross-modal information flows exclusively through the bottleneck.
+    One N-modality bottleneck fusion layer (Eq. 8–9 from the paper, generalised).
+    Each stream attends to the shared bottleneck with its own params (θ_i);
+    per-stream bottleneck outputs are averaged to form the new shared state.
     """
 
     def __init__(self, stream_blocks: dict, num_bottlenecks: int = 4):
-        """
-        Args:
-            stream_blocks: dict mapping modality key → StreamParams module,
-                           e.g. {'T': StreamParams(...), 'V': StreamParams(...), ...}
-            num_bottlenecks: number of shared bottleneck tokens (B in the paper)
-        """
         super().__init__()
         self.streams = nn.ModuleDict(stream_blocks)
         self.Nb = num_bottlenecks
 
     def forward(self, token_dict: dict, bn: torch.Tensor):
-        """
-        Args:
-            token_dict: {modality_key: (B, N_i, D)} — token sequences per active modality
-            bn:         (B, Nb, D) — shared bottleneck tokens from previous layer
-        Returns:
-            updated_token_dict: same structure as input, with updated token sequences
-            bn_new:             (B, Nb, D) — updated shared bottleneck tokens
-        """
         bn_accum = torch.zeros_like(bn)
         out_dict = {}
         n_streams = 0
@@ -285,51 +166,15 @@ class BottleneckFusionBlock(nn.Module):
         return out_dict, bn_new
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main model
-# ─────────────────────────────────────────────────────────────────────────────
-
 class MBTGraspStability(nn.Module):
     """
-    Fuses all five modalities through attention bottlenecks at multiple layers
-    of a 12-layer transformer, following the MBT architecture from Nagrani et al.
-    (NeurIPS 2021).
+    5-modality bottleneck transformer for grasp stability (Nagrani et al., NeurIPS 2021).
 
-    Constructor args
-    ────────────────
-    frames_per_sec    int   = 1     F1: image frames captured per second of grasp
-    ft_dim            int   = 6     force-torque input dimension (e.g. F2 × 6)
-    gripper_dim       int   = 2     gripper state input dimension (e.g. F2 × 2)
-    max_timesteps     int   = 20    maximum T for temporal modalities (FT, Gripper).
-                                    Determines positional embedding table size.
-    num_bottlenecks   int   = 4     B: number of shared fusion tokens. The paper
-                                    finds performance robust across 4–256.
-    fusion_layer      int   = 8     Lf: layers 0…Lf-1 are unimodal, layers Lf…11
-                                    perform bottleneck fusion. Paper optimal: Lf=8.
-    max_visual_frames int   = 8     frames subsampled from T×F1 for ViT tokenisation.
-                                    8 frames × 196 patches = 1568 tokens ≈ paper setup.
-    adapter_dim       int   = 64    AdaptFormer bottleneck dimension for visual streams.
-                                    Set to 0 to disable adapters (frozen backbone only).
-    dropout           float = 0.1
-    freeze_vit        bool  = True  freeze ViT backbone weights (only adapters train)
-    modalities        set   = None  active subset of {'V','T','FT','G','GF'}; None = all.
-                                    Inactive modalities are zeroed out.
-    num_classes       int   = 1     output dimension (1 for binary BCEWithLogitsLoss)
-
-    Design notes
-    ────────────
-    • ViT-Base/16 backbone: 12 layers, 768-d, 12 heads, 196 patches per 224×224 frame
-    • Visual streams use factored spatial + temporal positional embeddings (ViViT-style):
-      each frame gets ViT's original 196-patch spatial positions plus a learned temporal
-      embedding per frame index, cleanly separating "where in the image" from "which frame".
-    • Non-visual temporal streams (FT, Gripper) are projected to 768-d and processed by
-      lightweight 4-head transformer blocks, which is sufficient for short sequences.
-    • GF (static scalar) becomes a single 768-d token refined by an MLP before fusion.
-    • Bottleneck tokens (B × 768) are learnable parameters initialised N(0, 0.02),
-      matching ViT positional embedding initialisation. They flow through all fusion layers
-      and are the sole conduit for cross-modal information exchange.
-    • Consider using different learning rates: higher for lightweight blocks and classifiers,
-      lower for AdaptFormer adapters.
+    Visual streams use ViViT-style factored spatial+temporal positional embeddings.
+    Tactile backbone is T3-large (GelSight-pretrained, 1024-d); a trainable
+    Linear(1024→768) projects to fusion dim so bottleneck tokens are uniform across streams.
+    Non-visual streams (FT, G, GF) use lightweight transformer blocks.
+    Per-modality classifier heads; final logit is their mean.
     """
 
     VIT_DIM    = 768
@@ -349,6 +194,8 @@ class MBTGraspStability(nn.Module):
         freeze_vit:        bool  = True,
         modalities                = None,
         num_classes:       int   = 1,
+        pretrained_dir:    str   = None,
+        t3_encoder_domain: str   = 'gs_black',
     ):
         super().__init__()
 
@@ -366,38 +213,44 @@ class MBTGraspStability(nn.Module):
         self.num_classes       = num_classes
         D = self.VIT_DIM
 
-        # ── ViT-Base/16 backbones for visual streams ────────────────────────
-        vit_tac = timm.create_model('vit_base_patch16_224', pretrained=True)
+        # RGB backbone: ViT-Base/16
         vit_rgb = timm.create_model('vit_base_patch16_224', pretrained=True)
-        vit_tac.head = vit_rgb.head = nn.Identity()
-
+        vit_rgb.head = nn.Identity()
         if freeze_vit:
-            for p in list(vit_tac.parameters()) + list(vit_rgb.parameters()):
+            for p in vit_rgb.parameters():
                 p.requires_grad = False
 
-        # Patch embedding, CLS token, spatial positional embedding, final LayerNorm
-        self.tac_patch_embed = vit_tac.patch_embed
         self.rgb_patch_embed = vit_rgb.patch_embed
-        self.tac_cls_token   = vit_tac.cls_token            # (1, 1, 768)
         self.rgb_cls_token   = vit_rgb.cls_token
-        self.tac_spatial_pos = vit_tac.pos_embed             # (1, 197, 768)
         self.rgb_spatial_pos = vit_rgb.pos_embed
-        self.tac_norm        = vit_tac.norm
         self.rgb_norm        = vit_rgb.norm
-
-        # ── Factored temporal positional embeddings for visual streams ──────
-        # Separate from the spatial positions so the model can distinguish
-        # "top-left of frame 3" from "top-left of frame 7".
-        # Shape: (1, max_frames, 1, D) — broadcasts over all patches in a frame.
-        self.tac_temporal_embed = nn.Parameter(
-            torch.zeros(1, max_visual_frames, 1, D))
-        self.rgb_temporal_embed = nn.Parameter(
-            torch.zeros(1, max_visual_frames, 1, D))
-        nn.init.trunc_normal_(self.tac_temporal_embed, std=0.02)
+        self.rgb_temporal_embed = nn.Parameter(torch.zeros(1, max_visual_frames, 1, D))
         nn.init.trunc_normal_(self.rgb_temporal_embed, std=0.02)
 
-        # ── Tokenisation layers for non-visual modalities ───────────────────
-        # Each timestep is projected to 768-d with a CLS token prepended.
+        # Tactile backbone: T3-large (3 encoder + 9 trunk = 12 blocks, 1024-d).
+        # Unimodal runs at 1024-d; tac_to_fusion projects to 768 at the fusion boundary.
+        from encoders import T3TactileEncoder
+        t3 = T3TactileEncoder(
+            pretrained_dir=pretrained_dir,
+            encoder_domain=t3_encoder_domain,
+            freeze=freeze_vit,
+        )
+        t3_dim = t3.embed_dim
+        all_t3_blocks = list(t3.encoder.blocks) + list(t3.trunk.blocks)
+        assert len(all_t3_blocks) >= self.VIT_LAYERS, (
+            f"T3 has {len(all_t3_blocks)} blocks, need {self.VIT_LAYERS}")
+
+        self.tac_dim         = t3_dim
+        self.tac_patch_embed = t3.encoder.patch_embed
+        self.tac_cls_token   = t3.encoder.cls_token          # (1, 1, t3_dim)
+        self.tac_spatial_pos = t3.encoder.pos_embed           # (1, 197, t3_dim)
+        self.tac_norm        = nn.LayerNorm(D)                # 768-d post-fusion norm
+        self.tac_temporal_embed = nn.Parameter(torch.zeros(1, max_visual_frames, 1, t3_dim))
+        nn.init.trunc_normal_(self.tac_temporal_embed, std=0.02)
+        self._tac_unimodal_blocks = all_t3_blocks[:fusion_layer]
+        # Tactile fusion stream uses lightweight trainable 768-d blocks (T3's
+        # fusion-range blocks are 1024-d and cannot share bottleneck tokens).
+        self.tac_to_fusion = nn.Linear(t3_dim, D)
 
         self.ft_proj = nn.Sequential(nn.Linear(ft_dim, D), nn.LayerNorm(D))
         self.ft_cls_token = nn.Parameter(torch.zeros(1, 1, D))
@@ -411,29 +264,21 @@ class MBTGraspStability(nn.Module):
         nn.init.trunc_normal_(self.grip_cls_token, std=0.02)
         nn.init.trunc_normal_(self.grip_pos_embed, std=0.02)
 
-        # GF is a single scalar — projected to one 768-d token (acts as its own CLS)
         self.gf_proj = nn.Sequential(nn.Linear(1, D), nn.LayerNorm(D))
 
-        # Final LayerNorms for non-visual streams (matching ViT's post-norm)
         self.ft_norm   = nn.LayerNorm(D)
         self.grip_norm = nn.LayerNorm(D)
         self.gf_norm   = nn.LayerNorm(D)
 
-        # ── Unimodal layers (layers 0 … Lf-1) ──────────────────────────────
-        # Each stream processes its tokens independently before fusion begins.
-
-        # Visual: frozen ViT blocks with optional AdaptFormer adapters
-        self.tac_unimodal = nn.ModuleList([
-            UnimodalBlock(vit_tac.blocks[i], adapter_dim)
-            for i in range(fusion_layer)
-        ])
+        # Unimodal stacks. Tactile uses raw T3 blocks at 1024-d (no adapter needed —
+        # T3 is GelSight-pretrained so the ImageNet-prior correction adapters provide is moot).
+        self.tac_unimodal = nn.ModuleList(self._tac_unimodal_blocks)
         self.rgb_unimodal = nn.ModuleList([
             UnimodalBlock(vit_rgb.blocks[i], adapter_dim)
             for i in range(fusion_layer)
         ])
 
-        # Temporal: lightweight trainable transformer blocks
-        n_unimodal = max(fusion_layer, 1)  # at least 1 layer for temporal streams
+        n_unimodal = max(fusion_layer, 1)
         self.ft_unimodal = nn.ModuleList([
             LightweightTransformerBlock(D, num_heads=4, dropout=dropout)
             for _ in range(n_unimodal)
@@ -457,8 +302,12 @@ class MBTGraspStability(nn.Module):
         # Visual streams use frozen ViT blocks + adapters; others use lightweight blocks.
         self.fusion_blocks = nn.ModuleList()
         for i in range(fusion_layer, self.VIT_LAYERS):
+            tac_stream = StreamParams(
+                LightweightTransformerBlock(D, num_heads=4, dropout=dropout),
+                D, adapter_dim=0, is_lightweight=True,
+            )
             stream_blocks = {
-                'T':  StreamParams(vit_tac.blocks[i], D, adapter_dim, is_lightweight=False),
+                'T':  tac_stream,
                 'V':  StreamParams(vit_rgb.blocks[i], D, adapter_dim, is_lightweight=False),
                 'FT': StreamParams(LightweightTransformerBlock(D, num_heads=4, dropout=dropout),
                                    D, adapter_dim=0, is_lightweight=True),
@@ -625,6 +474,8 @@ class MBTGraspStability(nn.Module):
 
         for blk in self.tac_unimodal:
             tac_tok = blk(tac_tok)
+        # Project tactile tokens to fusion dim (no-op for vit_base; 1024→768 for t3_large)
+        tac_tok = self.tac_to_fusion(tac_tok)
         for blk in self.rgb_unimodal:
             rgb_tok = blk(rgb_tok)
         for blk in self.ft_unimodal:
