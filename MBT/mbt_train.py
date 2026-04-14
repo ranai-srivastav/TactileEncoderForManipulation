@@ -299,20 +299,22 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # Differential learning rates: lightweight blocks full LR, adapters 10× lower
-    adapter_params = []
-    other_params   = []
+    # Differential learning rates
+    slow_params   = []
+    other_params  = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if any(k in name for k in ['_down.', '_up.', '_scale', '.down.', '.up.', '.scale']):
-            adapter_params.append(param)
+        is_adapter       = any(k in name for k in ['_down.', '_up.', '_scale', '.down.', '.up.', '.scale'])
+        is_tac_fusion    = name.startswith('fusion_blocks.') and '.streams.T.' in name
+        if is_adapter or is_tac_fusion:
+            slow_params.append(param)
         else:
             other_params.append(param)
 
     optimizer = torch.optim.AdamW([
         {'params': other_params,   'lr': args.lr},
-        {'params': adapter_params, 'lr': args.lr * 0.1},
+        {'params': slow_params,    'lr': args.lr * 0.1},
     ], weight_decay=args.weight_decay)
 
     # Cosine annealing: constant LR until anneal_iter, then cosine decay to 0
