@@ -27,5 +27,6 @@ python MBT/mbt_train.py \
   --grad_accum 8 \
   --lr 1e-4 \
   --weight_decay 0.01 \
+  --dropout 0.1 \
   --wandb_run mbt_t3_obj \
   --L 9
