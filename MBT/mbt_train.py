@@ -151,10 +151,10 @@ def make_split(dataset, args):
         return uniform_random_split(dataset)
 
 
-def make_loader(subset, sampler=None, batch_size=32, num_workers=4, shuffle=False):
+def make_loader(subset, sampler=None, batch_size=32, num_workers=4):
     if sampler is not None:
         return DataLoader(subset.dataset, batch_sampler=sampler, num_workers=num_workers)
-    return DataLoader(subset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+    return DataLoader(subset, batch_size=batch_size, num_workers=num_workers)
 
 
 def batch_to_device(batch, device):
