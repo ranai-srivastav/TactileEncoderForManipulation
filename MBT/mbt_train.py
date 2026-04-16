@@ -2,11 +2,11 @@
 Training script for Multimodal Bottleneck Transformer (MBT) on the PoseIt dataset.
 
 Supports all three split modes (examples):
-# by object
-python MBT/mbt_train.py --split object --test_objects mug bowl --sigma 1.0
+# by object (indices printed at startup; use --n_test_objects N for random selection)
+python MBT/mbt_train.py --split object --test_object_ids 0 5 --sigma 1.0
 
-# by pose
-python MBT/mbt_train.py --split pose --test_poses 1 2 3 4 5 --sigma 1.0
+# by pose (IDs from folder names; use --n_test_poses N for random selection)
+python MBT/mbt_train.py --split pose --test_pose_ids 1 2 3 4 5 --sigma 1.0
 
 # random
 python MBT/mbt_train.py --split random --anneal_iter 300 --n_iters 600
@@ -19,6 +19,7 @@ python MBT/mbt_train.py --overfit --n_iters 100 --lr 0.001 --num_workers 0 \
 import argparse
 import math
 import os
+import random
 import sys
 
 # dataloader.py and sampler.py live in the repo root, one level up from MBT/
@@ -91,12 +92,20 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--root_dir',     default='./data')
     p.add_argument('--split',        default='object', choices=['object', 'pose', 'random'])
-    p.add_argument('--test_objects', nargs='+', default=['mug', 'bowl'])
-    p.add_argument('--test_poses',   nargs='+', type=int, default=[1, 2, 3, 4, 5])
+    p.add_argument('--test_object_ids', nargs='+', type=int, default=None,
+                   help='Zero-based indices into the sorted alphabetical object list printed at '
+                        'startup. Use with --split object. Takes precedence over --n_test_objects.')
+    p.add_argument('--n_test_objects',  type=int, default=None,
+                   help='Randomly pick N objects for the test set (--split object). '
+                        'Ignored if --test_object_ids is given.')
+    p.add_argument('--test_pose_ids',   nargs='+', type=int, default=None,
+                   help='pose_idx integers (from folder names) to hold out for test. '
+                        'Use with --split pose. Takes precedence over --n_test_poses.')
+    p.add_argument('--n_test_poses',    type=int, default=None,
+                   help='Randomly pick N pose IDs for the test set (--split pose). '
+                        'Ignored if --test_pose_ids is given.')
     p.add_argument('--sigma',        type=float, default=0.5,
                    help='DRS target S≠/S= ratio. 0.5 = gentler resampling')
-    p.add_argument('--drs_iter',     type=int,   default=400,
-                   help='Iteration at which DRS activates (separate from LR anneal)')
     p.add_argument('--batch_size',   type=int,   default=4,
                    help='Micro-batch size per GPU forward pass (keep small for V100)')
     p.add_argument('--grad_accum',   type=int,   default=8,
@@ -146,9 +155,36 @@ def parse_args():
 
 def make_split(dataset, args):
     if args.split == 'object':
-        return split_by_object(dataset, test_objects=args.test_objects)
+        all_objects = sorted(set(s['object'] for s in dataset.samples))
+        print("Object index (sorted alphabetically):")
+        for i, obj in enumerate(all_objects):
+            print(f"  {i:>3}: {obj}")
+
+        if args.test_object_ids is not None:
+            test_objects = [all_objects[i] for i in args.test_object_ids]
+            print(f"Test objects (--test_object_ids {args.test_object_ids}): {test_objects}")
+        elif args.n_test_objects is not None:
+            test_objects = sorted(random.sample(all_objects, args.n_test_objects))
+            print(f"Randomly selected {args.n_test_objects} test objects: {test_objects}")
+        else:
+            raise ValueError("--split object requires --test_object_ids or --n_test_objects")
+
+        return split_by_object(dataset, test_objects=test_objects)
+
     elif args.split == 'pose':
-        return split_by_pose(dataset, test_pose_indices=args.test_poses)
+        all_poses = sorted(set(s['pose_idx'] for s in dataset.samples))
+        print(f"Pose IDs in dataset: {all_poses}")
+
+        if args.test_pose_ids is not None:
+            print(f"Test poses (--test_pose_ids): {args.test_pose_ids}")
+            return split_by_pose(dataset, test_pose_indices=args.test_pose_ids)
+        elif args.n_test_poses is not None:
+            test_poses = sorted(random.sample(all_poses, args.n_test_poses))
+            print(f"Randomly selected {args.n_test_poses} test poses: {test_poses}")
+            return split_by_pose(dataset, test_pose_indices=test_poses)
+        else:
+            raise ValueError("--split pose requires --test_pose_ids or --n_test_poses")
+
     else:
         return uniform_random_split(dataset)
 
@@ -238,7 +274,6 @@ def main():
         wandb.define_metric("train/*", step_metric="iter")
         wandb.define_metric("val/*", step_metric="iter")
         wandb.define_metric("lr", step_metric="iter")
-        wandb.define_metric("drs_active", step_metric="iter")
     elif args.wandb_project is not None:
         print("[WARN] wandb not installed — W&B logging disabled.")
 
@@ -259,22 +294,20 @@ def main():
         overfit_set = Subset(ds, [0])
         train_set = val_set = test_set = overfit_set
         args.anneal_iter = args.n_iters + 1
-        args.drs_iter = args.n_iters + 1
+        sampler = None
         print("Overfit mode: using 1 sample for train/val/test, DRS disabled")
     else:
         train_set, val_set, test_set = make_split(ds, args)
         print(f"Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
         print_dataset_stats(ds, train_set, val_set, test_set)
+        sampler = DRSSampler(
+            dataset=ds,
+            sigma=args.sigma,
+            batch_size=args.batch_size,
+            indices=train_set.indices,
+        )
 
-    # DRS sampler uses the micro-batch size (what the DataLoader actually yields)
-    sampler = DRSSampler(
-        dataset=ds,
-        sigma=args.sigma,
-        batch_size=args.batch_size,
-        indices=train_set.indices,
-    )
-
-    train_loader = make_loader(train_set, sampler=sampler, num_workers=args.num_workers)
+    train_loader = make_loader(train_set, sampler=sampler, batch_size=args.batch_size, num_workers=args.num_workers)
     val_loader   = make_loader(val_set,   batch_size=args.batch_size, num_workers=args.num_workers)
     test_loader  = make_loader(test_set,  batch_size=args.batch_size, num_workers=args.num_workers)
 
@@ -356,11 +389,6 @@ def main():
             if iteration >= args.n_iters:
                 break
 
-            # DRS activates at drs_iter
-            if iteration == args.drs_iter and accum_step == 0:
-                sampler.activate()
-                print(f"[iter {iteration}] DRS activated")
-
             tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
 
             # Forward pass with mixed precision
@@ -390,8 +418,7 @@ def main():
                           f"train_loss={avg_train_loss:.4f}  "
                           f"val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%  "
                           f"prec={val_prec:.3f}  rec={val_rec:.3f}  f1={val_f1:.3f}  "
-                          f"lr={current_lr:.2e}  "
-                          f"DRS={'on' if sampler.is_active else 'off'}")
+                          f"lr={current_lr:.2e}")
 
                     if use_wandb:
                         wandb.log({
@@ -402,7 +429,6 @@ def main():
                             'val/precision':  val_prec,
                             'val/recall':     val_rec,
                             'val/f1':         val_f1,
-                            'drs_active':     int(sampler.is_active),
                             'lr':             current_lr,
                         }, step=iteration)
 

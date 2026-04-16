@@ -126,7 +126,6 @@ gripper_force: (B, 1)
 --split              object | pose | random
 --test_objects / --test_poses
 --sigma              DRS ratio (default 0.5)
---drs_iter           iteration DRS activates (default 400; set >> n_iters to disable)
 --batch_size         micro-batch size (default 4, for V100)
 --grad_accum         gradient accumulation steps (default 8; effective = 4×8=32)
 --lr                 peak LR (default 1e-4)
@@ -149,7 +148,16 @@ gripper_force: (B, 1)
 --model_save_path    default "trained_models/best_mbt_model.pt"
 --overfit            1-sample sanity check mode
 --subsample          fraction of dataset to load
+--test_object_ids    zero-based indices into sorted alphabetical object list (printed at startup); use with --split object
+--n_test_objects     randomly pick N objects for test; use with --split object; ignored if --test_object_ids given
+--test_pose_ids      pose_idx integers from folder names to hold out; use with --split pose
+--n_test_poses       randomly pick N pose IDs for test; use with --split pose; ignored if --test_pose_ids given
 ```
+
+**Test-set selection precedence:**
+- Object split: `--test_object_ids` > `--n_test_objects` (must provide one; error if neither given)
+- Pose split: `--test_pose_ids` > `--n_test_poses` (must provide one; error if neither given)
+- `--split random` needs no selection arg
 
 **Execution flow:**
 1. Validate modality keys; print effective batch size
@@ -282,7 +290,7 @@ python dataloader.py /ocean/projects/cis260031p/shared/dataset/Gelsight
 - **Per-modality classifier heads, mean-pooled logit.** Each modality's CLS → its own head; final = mean of all active logits.
 - **Differential LR.** Adapter params + tactile fusion stream blocks at `lr × 0.1` (slower update for near-frozen components).
 - **L=9 in job.sh** (not the dataloader default of 20) — shorter episodes work better for MBT's fixed token budget.
-- **DRS disabled in job.sh** (`--drs_iter 99999`) — class balance addressed instead via `pos_weight` in BCEWithLogitsLoss.
+- **DRS** — resampling is active from iteration 0 (no deferred activation). To disable, skip passing `--sigma` or omit the DRSSampler (overfit mode does this automatically).
 
 ---
 

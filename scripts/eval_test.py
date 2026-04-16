@@ -12,7 +12,7 @@ Examples:
     --modalities V T FT G GF --split random
 
   python scripts/eval_test.py -c trained_models/best_model.pt --model resnet \\
-    --root_dir ... --split object --test_objects mug bowl
+    --root_dir ... --split object --test_object_ids 0 5
 """
 
 import argparse
@@ -46,8 +46,14 @@ def parse_args():
     p.add_argument("--checkpoint", "-c", required=True, help="Path to model state_dict .pt")
     p.add_argument("--root_dir", default="./data")
     p.add_argument("--split", default="object", choices=["object", "pose", "random"])
-    p.add_argument("--test_objects", nargs="+", default=["mug", "bowl"])
-    p.add_argument("--test_poses", nargs="+", type=int, default=[1, 2, 3, 4, 5])
+    p.add_argument("--test_object_ids", nargs="+", type=int, default=None,
+                   help="Zero-based indices into the sorted alphabetical object list. Use with --split object.")
+    p.add_argument("--n_test_objects", type=int, default=None,
+                   help="Randomly pick N objects for test (--split object). Ignored if --test_object_ids given.")
+    p.add_argument("--test_pose_ids", nargs="+", type=int, default=None,
+                   help="pose_idx integers to hold out for test. Use with --split pose.")
+    p.add_argument("--n_test_poses", type=int, default=None,
+                   help="Randomly pick N pose IDs for test (--split pose). Ignored if --test_pose_ids given.")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--hidden_dim", type=int, default=512)
     p.add_argument("--lstm_layers", type=int, default=2)

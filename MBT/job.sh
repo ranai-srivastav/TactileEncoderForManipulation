@@ -22,7 +22,6 @@ python MBT/mbt_train.py \
   --fusion_layer 8 \
   --n_iters 1500 \
   --anneal_iter 1000 \
-  --drs_iter 99999 \
   --batch_size 4 \
   --grad_accum 8 \
   --lr 1e-4 \
