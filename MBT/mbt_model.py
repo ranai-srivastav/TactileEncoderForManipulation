@@ -46,11 +46,11 @@ class UnimodalBlock(nn.Module):
 
     def __init__(self, vit_block, adapter_dim: int = 64):
         super().__init__()
-        self.norm1   = vit_block.norm1
+        self.norm1   = vit_block.norm1  # ViT LayerNorm
         self.attn    = vit_block.attn
         self.norm2   = vit_block.norm2
         self.mlp     = vit_block.mlp
-        self.adapter = Adapter(768, adapter_dim) if adapter_dim > 0 else None
+        self.adapter = Adapter(768, adapter_dim) if adapter_dim > 0 else None  # QUESTION: Why hardcoded to 768?
 
     def _forward_sequence(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
@@ -60,8 +60,12 @@ class UnimodalBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._forward_sequence(x)
 
-    def forward_with_bottleneck(self, tokens: torch.Tensor, bn: torch.Tensor, Nb: int):
-        """Concatenate stream tokens with bottleneck, run the block, then split them apart."""
+    def forward_with_bottleneck(self, tokens: torch.Tensor, bn: torch.Tensor, Nb: int):         
+        """Concatenate stream tokens with bottleneck, run the block, then split them apart.
+        tokens: TODO
+        bn: TODO
+        Nb: TODO
+        """
         out = self._forward_sequence(torch.cat([tokens, bn], dim=1))
         return out[:, :-Nb], out[:, -Nb:]
 
@@ -171,7 +175,7 @@ class MBTGraspStability(nn.Module):
         D = self.VIT_DIM
 
         # ── RGB backbone: ViT-Base/16 ────────────────────────────────────────
-        vit_rgb = timm.create_model('vit_base_patch16_224', pretrained=True)
+        vit_rgb = timm.create_model('vit_base_patch16_224', pretrained=True) # TODO replace with pre-trained CLiP?
         vit_rgb.head = nn.Identity()
         if freeze_vit:
             for p in vit_rgb.parameters():

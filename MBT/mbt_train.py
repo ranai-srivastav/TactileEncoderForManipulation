@@ -139,6 +139,8 @@ def parse_args():
     p.add_argument('--overfit', action='store_true',
                    help='Use a single sample for train/val/test to sanity-check the model.')
     p.add_argument("--model_save_path", type=str, default="trained_models/best_mbt_model.pt")
+    p.add_argument('--seed', type=int, default=None,
+                   help='Random seed for reproducibility. If not set, everything is truly random.')
     return p.parse_args()
 
 
@@ -202,6 +204,15 @@ def main():
     args   = parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
+
+    if args.seed is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"Seed set to {args.seed}")
 
     # Validate modality keys early
     valid_mods = {'V', 'T', 'FT', 'G', 'GF'}
