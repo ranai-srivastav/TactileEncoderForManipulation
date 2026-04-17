@@ -14,6 +14,7 @@ cd /ocean/projects/cis260031p/mlee12/TactileEncoderForManipulation
 python MBT/mbt_train.py \
   --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
   --split random \
+  --test_object_ids 0 5 10 15 \
   --modalities V T FT G GF \
   --t3_encoder_domain gs_black \
   --pretrained_dir /ocean/projects/cis260031p/shared/pretrained \
@@ -28,4 +29,4 @@ python MBT/mbt_train.py \
   --weight_decay 0.01 \
   --dropout 0.1 \
   --wandb_run mbt_t3_obj \
-  --L 9
+  --L 7
