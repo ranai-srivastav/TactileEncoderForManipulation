@@ -116,7 +116,6 @@ gripper_force: (B, 1)
 - Gradient accumulation (`--grad_accum`, default 8; effective batch = micro × accum)
 - Mixed precision (`torch.autocast` + `torch.GradScaler`)
 - Differential LR: adapter params + tactile fusion blocks at `lr × 0.1`
-- DRS activation controlled by separate `--drs_iter` (can be set very high to disable)
 - Best model saved by val F1; rolling `model_latest.pt` also saved
 - `--L 9` in the job script (not 20) — shorter episodes for MBT
 
@@ -166,7 +165,7 @@ gripper_force: (B, 1)
 4. Compute `pos_weight` from train label distribution for `BCEWithLogitsLoss`
 5. Build `MBTGraspStability`, print trainable/total param count
 6. Differential-LR AdamW + cosine LR lambda + `GradScaler`
-7. Training loop with gradient accumulation; DRS activates at `drs_iter`; evaluate every 10 iters
+7. Training loop with gradient accumulation; evaluate every 10 iters
 8. Test evaluation on best checkpoint
 
 ---
@@ -226,7 +225,6 @@ Split functions: `split_by_object`, `split_by_pose`, `uniform_random_split`
 ### sampler.py — `DRSSampler`
 
 Partitions indices into `S=` (pose_label == label) and `S≠` (pose_label ≠ label).
-- Starts inactive (uniform sampling). Call `sampler.activate()` at `drs_iter`.
 - `sigma` = target ratio `|S≠|/|S=|` per batch; must be `>= r` (natural ratio)
 - When `sigma == r`: keep_prob=1.0 (no-op, still valid)
 - `replace=True` automatically when `batch_size > len(indices)` (small datasets)
@@ -260,7 +258,6 @@ python MBT/mbt_train.py --overfit --n_iters 100 --lr 0.001 --num_workers 0 \
 # MBT smoke test (1% data, no DRS)
 python MBT/mbt_train.py --split random --subsample 0.01 \
     --n_iters 50 --batch_size 2 --grad_accum 2 --num_workers 0 \
-    --drs_iter 99999 \
     --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
     --wandb_project None
 
@@ -269,7 +266,7 @@ python MBT/mbt_train.py \
     --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
     --split random --modalities V T FT G GF \
     --adapter_dim 128 --num_bottlenecks 4 --fusion_layer 8 \
-    --n_iters 1500 --anneal_iter 1000 --drs_iter 99999 \
+    --n_iters 1500 --anneal_iter 1000 \
     --batch_size 4 --grad_accum 8 --lr 1e-4 --L 9
 
 # Submit SLURM job (from mlee12's copy — adjust cd path as needed)
