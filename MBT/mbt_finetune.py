@@ -1,19 +1,25 @@
 """
-Training script for Multimodal Bottleneck Transformer (MBT) on the PoseIt dataset.
+Fine-tuning script for a pretrained MBTGraspStability checkpoint on a new dataset.
 
-Supports all three split modes (examples):
-# by object (indices printed at startup; use --n_test_objects N for random selection)
-python MBT/mbt_train.py --split object --test_object_ids 0 5 --sigma 1.0
+Architecture config (modalities, L, F1/F2, bottlenecks, etc.) is read directly
+from the checkpoint — no architecture flags needed.  Only dataset path, split,
+and training hyper-parameters are required.
 
-# by pose (IDs from folder names; use --n_test_poses N for random selection)
-python MBT/mbt_train.py --split pose --test_pose_ids 1 2 3 4 5 --sigma 1.0
+DRS is always active from the first iteration with sigma=1.0 (balanced classes).
+W&B run name is auto-derived as finetune_<original_run_name>.
 
-# random
-python MBT/mbt_train.py --split random --anneal_iter 300 --n_iters 600
+Examples:
+# random split
+python MBT/mbt_finetune.py \
+    --checkpoint trained_models/best_mbt_model.pt \
+    --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
+    --split random --n_iters 600 --anneal_iter 400
 
-# overfit sanity check
-python MBT/mbt_train.py --overfit --n_iters 100 --lr 0.001 --num_workers 0 \
-    --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight --wandb_project None
+# object split
+python MBT/mbt_finetune.py \
+    --checkpoint trained_models/best_mbt_model.pt \
+    --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
+    --split object --test_object_ids 0 5 10
 """
 
 import argparse
@@ -22,7 +28,6 @@ import os
 import random
 import sys
 
-# dataloader.py and sampler.py live in the repo root, one level up from MBT/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -43,8 +48,6 @@ from mbt_model import MBTGraspStability
 
 
 def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
-    """Print per-phase label distribution for the loaded dataset and each split."""
-
     def _count(samples):
         c = {
             'grasp':     [0, 0, 0],
@@ -90,8 +93,10 @@ def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--root_dir',     default='./data')
-    p.add_argument('--split',        default='object', choices=['object', 'pose', 'random'])
+    p.add_argument('--checkpoint',    required=True,
+                   help='Path to pretrained .pt checkpoint (must contain state_dict + config).')
+    p.add_argument('--root_dir',      default='./data')
+    p.add_argument('--split',         default='object', choices=['object', 'pose', 'random'])
     p.add_argument('--test_object_ids', nargs='+', type=int, default=None,
                    help='Zero-based indices into the sorted alphabetical object list printed at '
                         'startup. Use with --split object. Takes precedence over --n_test_objects.')
@@ -104,52 +109,21 @@ def parse_args():
     p.add_argument('--n_test_poses',    type=int, default=None,
                    help='Randomly pick N pose IDs for the test set (--split pose). '
                         'Ignored if --test_pose_ids is given.')
-    p.add_argument('--sigma',        type=float, default=0.5,
-                   help='DRS target S≠/S= ratio. 0.5 = gentler resampling')
-    p.add_argument('--batch_size',   type=int,   default=4,
-                   help='Micro-batch size per GPU forward pass (keep small for V100)')
-    p.add_argument('--grad_accum',   type=int,   default=8,
+    p.add_argument('--batch_size',    type=int,   default=4)
+    p.add_argument('--grad_accum',    type=int,   default=8,
                    help='Gradient accumulation steps. Effective batch = batch_size × grad_accum')
-    p.add_argument('--lr',           type=float, default=1e-4,
-                   help='Peak learning rate (default: 1e-4 for AdamW with frozen backbone)')
-    p.add_argument('--weight_decay', type=float, default=0.01)
-    p.add_argument('--dropout',           type=float, default=0.1)
-    p.add_argument('--num_bottlenecks',   type=int,   default=4,
-                   help='B bottleneck latent tokens (paper default: 4)')
-    p.add_argument('--fusion_layer',      type=int,   default=8,
-                   help='Lf: unimodal for layers 0..Lf-1, bottleneck fusion for Lf..11 (paper default: 8)')
-    p.add_argument('--max_visual_frames', type=int,   default=8,
-                   help='Frames subsampled from T*F1 for ViT tokenisation (default: 8, matches paper)')
-    p.add_argument('--adapter_dim',       type=int,   default=64,
-                   help='AdaptFormer hidden dim; 0 = frozen backbone only')
-    p.add_argument('--t3_encoder_domain', type=str,   default='gs_black',
-                   help='T3 sensor-specific encoder domain (gs_black | gs_tag)')
-    p.add_argument('--pretrained_dir',    type=str,
-                   default='/ocean/projects/cis260031p/shared/pretrained',
-                   help='Directory containing T3 pretrained weights')
-    p.add_argument('--n_iters',      type=int,   default=600)
-    p.add_argument('--anneal_iter',  type=int,   default=300,
+    p.add_argument('--lr',            type=float, default=1e-4)
+    p.add_argument('--weight_decay',  type=float, default=0.01)
+    p.add_argument('--n_iters',       type=int,   default=600)
+    p.add_argument('--anneal_iter',   type=int,   default=300,
                    help='Iteration to begin cosine LR decay (set > n_iters to disable)')
-    p.add_argument('--F1',          type=int,   default=1)
-    p.add_argument('--F2',          type=int,   default=1)
-    p.add_argument('--num_workers',  type=int,   default=4)
-    p.add_argument('--modalities',   nargs='+',  default=['V', 'T', 'FT', 'G', 'GF'],
-                   help='Active modalities: V T FT G GF')
-    p.add_argument('--L',            type=int,   default=20,
-                   help='Max seconds per episode (clips longer sequences)')
-    p.add_argument('--subsample',    type=float, default=1.0,
-                   help='Fraction of dataset to use (e.g. 0.01 for 1%%)')
-    p.add_argument('--wandb_project', type=str, default="TEMU",
-                   help='W&B project name. Set to None to disable W&B logging.')
-    p.add_argument('--wandb_run',     type=str, default=None,
-                   help='W&B run name (optional).')
-    p.add_argument('--wandb_entity',  type=str, default="mrsd-smores",
-                   help='W&B entity/team. Set to None to disable W&B logging.')
-    p.add_argument('--overfit', action='store_true',
-                   help='Use a single sample for train/val/test to sanity-check the model.')
-    p.add_argument("--model_save_path", type=str, default="trained_models/best_mbt_model.pt")
-    p.add_argument('--seed', type=int, default=None,
-                   help='Random seed for reproducibility. If not set, everything is truly random.')
+    p.add_argument('--num_workers',   type=int,   default=4)
+    p.add_argument('--wandb_project', type=str,   default='TEMU')
+    p.add_argument('--wandb_run',     type=str,   default=None,
+                   help='Override W&B run name. Defaults to finetune_<original_run_name>.')
+    p.add_argument('--wandb_entity',  type=str,   default='mrsd-smores')
+    p.add_argument('--model_save_path', type=str, default='trained_models/best_mbt_finetune.pt')
+    p.add_argument('--seed',          type=int,   default=None)
     return p.parse_args()
 
 
@@ -242,33 +216,36 @@ def main():
     print(f"Using device: {device}")
 
     if args.seed is not None:
-        import random
         random.seed(args.seed)
-        np.random.seed(args.seed)
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
         print(f"Seed set to {args.seed}")
 
-    # Validate modality keys early
-    valid_mods = {'V', 'T', 'FT', 'G', 'GF'}
-    bad_mods = set(args.modalities) - valid_mods
-    if bad_mods:
-        raise ValueError(
-            f"Invalid modality keys: {bad_mods}. "
-            f"Valid keys are: {sorted(valid_mods)}")
+    # Load checkpoint first — config drives dataset shape and model construction
+    print(f"Loading checkpoint: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    cfg  = ckpt['config']
+    print(f"  Original run: {cfg.get('run_name', 'unknown')}")
+    print(f"  Modalities: {cfg['modalities']}  L={cfg['L']}  F1={cfg['F1']}  F2={cfg['F2']}")
+
+    _dl.L  = cfg['L']
+    _dl.F1 = cfg['F1']
+    _dl.F2 = cfg['F2']
 
     effective_batch = args.batch_size * args.grad_accum
     print(f"Batch: {args.batch_size} micro × {args.grad_accum} accum = {effective_batch} effective")
 
-    # W&B initialisation
+    # W&B run name derived from original run
+    finetune_run_name = args.wandb_run or f"finetune_{cfg.get('run_name', 'unknown')}"
+
     use_wandb = _WANDB_AVAILABLE and args.wandb_project is not None
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run,
+            name=finetune_run_name,
             entity=args.wandb_entity,
-            config=vars(args),
+            config={**cfg, **vars(args)},
         )
         wandb.define_metric("iter")
         wandb.define_metric("train/*", step_metric="iter")
@@ -277,102 +254,76 @@ def main():
     elif args.wandb_project is not None:
         print("[WARN] wandb not installed — W&B logging disabled.")
 
-    # set episode length cap before dataset construction
-    _dl.L = args.L
-    _dl.F1 = args.F1
-    _dl.F2 = args.F2
-
-    # dataset
+    # Dataset — shape driven by cfg
     ds = PoseItDataset(root_dir=args.root_dir)
-    if args.subsample < 1.0:
-        import random
-        k = max(4, int(len(ds.samples) * args.subsample))
-        ds.samples = random.sample(ds.samples, k)
-        print(f"Subsampled to {len(ds.samples)} samples ({args.subsample*100:.1f}% of dataset)")
-    if args.overfit:
-        ds.samples = ds.samples[:1]
-        overfit_set = Subset(ds, [0])
-        train_set = val_set = test_set = overfit_set
-        args.anneal_iter = args.n_iters + 1
-        sampler = None
-        print("Overfit mode: using 1 sample for train/val/test, DRS disabled")
-    else:
-        train_set, val_set, test_set = make_split(ds, args)
-        print(f"Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
-        print_dataset_stats(ds, train_set, val_set, test_set)
-        sampler = DRSSampler(
-            dataset=ds,
-            sigma=args.sigma,
-            batch_size=args.batch_size,
-            indices=train_set.indices,
-        )
+    train_set, val_set, test_set = make_split(ds, args)
+    print(f"Split ({args.split}): train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
+    print_dataset_stats(ds, train_set, val_set, test_set)
+
+    # DRS active immediately, sigma=1.0 (balanced)
+    sampler = DRSSampler(
+        dataset=ds,
+        sigma=1.0,
+        batch_size=args.batch_size,
+        indices=train_set.indices,
+    )
 
     train_loader = make_loader(train_set, sampler=sampler, batch_size=args.batch_size, num_workers=args.num_workers)
     val_loader   = make_loader(val_set,   batch_size=args.batch_size, num_workers=args.num_workers)
     test_loader  = make_loader(test_set,  batch_size=args.batch_size, num_workers=args.num_workers)
 
-    # pos_weight
+    # pos_weight from training labels
     train_labels = [ds.samples[i]['label'].item() for i in train_set.indices]
     n_pos = sum(train_labels)
     n_neg = len(train_labels) - n_pos
     pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(device)
     print(f"pos_weight={pos_weight.item():.3f} (n_pos={n_pos}, n_neg={n_neg})")
 
-    # Model
+    # Model — built from checkpoint config, weights loaded immediately
     model = MBTGraspStability(
-        frames_per_sec=_dl.F1,
-        ft_dim=FT_DIM,
-        gripper_dim=GR_DIM,
-        max_timesteps=args.L,
-        num_bottlenecks=args.num_bottlenecks,
-        fusion_layer=args.fusion_layer,
-        max_visual_frames=args.max_visual_frames,
-        adapter_dim=args.adapter_dim,
-        dropout=args.dropout,
-        modalities=args.modalities,
-        pretrained_dir=args.pretrained_dir,
-        t3_encoder_domain=args.t3_encoder_domain,
+        frames_per_sec=cfg['F1'],
+        ft_dim=cfg['F2'] * 6,
+        gripper_dim=cfg['F2'] * 2,
+        max_timesteps=cfg['L'],
+        num_bottlenecks=cfg['num_bottlenecks'],
+        fusion_layer=cfg['fusion_layer'],
+        max_visual_frames=cfg['max_visual_frames'],
+        adapter_dim=cfg['adapter_dim'],
+        dropout=cfg['dropout'],
+        modalities=cfg['modalities'],
+        pretrained_dir=cfg['pretrained_dir'],
+        t3_encoder_domain=cfg['t3_encoder_domain'],
     ).to(device)
+    model.load_state_dict(ckpt['state_dict'])
+    print(f"Loaded pretrained weights from {args.checkpoint}")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {trainable:,} trainable / {total:,} total "
           f"({trainable/total*100:.1f}% trainable)")
 
-    _model_config = {
-        'F1': args.F1, 'F2': args.F2, 'L': args.L,
-        'num_bottlenecks': args.num_bottlenecks,
-        'fusion_layer': args.fusion_layer,
-        'max_visual_frames': args.max_visual_frames,
-        'adapter_dim': args.adapter_dim,
-        'dropout': args.dropout,
-        'modalities': list(args.modalities),
-        'pretrained_dir': args.pretrained_dir,
-        't3_encoder_domain': args.t3_encoder_domain,
-        'run_name': wandb.run.name if use_wandb else args.wandb_run,
-    }
+    _model_config = {**cfg, 'run_name': finetune_run_name}
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # Differential learning rates
+    # Differential learning rates (same as pretraining)
     slow_params   = []
     other_params  = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        is_adapter       = any(k in name for k in ['_down.', '_up.', '_scale', '.down.', '.up.', '.scale'])
-        is_tac_fusion    = name.startswith('fusion_blocks.') and '.streams.T.' in name
+        is_adapter    = any(k in name for k in ['_down.', '_up.', '_scale', '.down.', '.up.', '.scale'])
+        is_tac_fusion = name.startswith('fusion_blocks.') and '.streams.T.' in name
         if is_adapter or is_tac_fusion:
             slow_params.append(param)
         else:
             other_params.append(param)
 
     optimizer = torch.optim.AdamW([
-        {'params': other_params,   'lr': args.lr},
-        {'params': slow_params,    'lr': args.lr * 0.1},
+        {'params': other_params, 'lr': args.lr},
+        {'params': slow_params,  'lr': args.lr * 0.1},
     ], weight_decay=args.weight_decay)
 
-    # Cosine annealing: constant LR until anneal_iter, then cosine decay to 0
     def lr_lambda(it):
         if it < args.anneal_iter:
             return 1.0
@@ -380,20 +331,16 @@ def main():
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scaler    = torch.GradScaler('cuda', enabled=torch.cuda.is_available())
 
-    # Mixed precision — cuts memory roughly in half for the frozen ViT forward passes
-    scaler = torch.GradScaler('cuda', enabled=torch.cuda.is_available())
-
-    # checkpoint paths
     save_dir    = os.path.dirname(args.model_save_path) or '.'
-    latest_path = os.path.join(save_dir, 'model_latest.pt')
+    latest_path = os.path.join(save_dir, 'finetune_latest.pt')
     os.makedirs(save_dir, exist_ok=True)
 
-    # training loop
     best_val_f1 = 0.0
     iteration   = 0
-    accum_step  = 0       # tracks micro-steps within one accumulation window
-    accum_loss  = 0.0     # running loss across accumulation steps
+    accum_step  = 0
+    accum_loss  = 0.0
 
     while iteration < args.n_iters:
         model.train()
@@ -404,24 +351,20 @@ def main():
 
             tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
 
-            # Forward pass with mixed precision
             with torch.autocast('cuda', enabled=torch.cuda.is_available()):
                 logits = model(tac, rgb, ft, grip, gf).squeeze(-1)
                 loss   = criterion(logits, label.float()) / args.grad_accum
 
-            # Backward (scaled for mixed precision)
             scaler.scale(loss).backward()
-            accum_loss += loss.item() * args.grad_accum  # unscale for logging
+            accum_loss += loss.item() * args.grad_accum
             accum_step += 1
 
-            # Optimizer step after grad_accum micro-batches
             if accum_step >= args.grad_accum:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 scheduler.step()
 
-                # Logging and evaluation
                 if iteration % 10 == 0 or iteration == args.n_iters - 1:
                     val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
                         model, val_loader, criterion, device)
@@ -463,7 +406,6 @@ def main():
                 accum_loss = 0.0
                 iteration += 1
 
-    # test
     print("\nLoading best checkpoint for test evaluation...")
     _ckpt = torch.load(args.model_save_path, map_location=device)
     model.load_state_dict(_ckpt['state_dict'] if isinstance(_ckpt, dict) else _ckpt)

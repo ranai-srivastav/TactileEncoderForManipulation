@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=mbt-test1
+#SBATCH --job-name=mbt
 #SBATCH --partition=GPU-shared
 #SBATCH --gres=gpu:v100-32:1
 #SBATCH --time=8:00:00
