@@ -14,14 +14,18 @@ rgb/        : rgb_{frame_idx}_{unix_ts}.jpg        @ ~10 Hz
 Sampling strategy:
   - T consecutive integer seconds from t_grasp to t_stability-1
     (variable length per sample, e.g. 6s, 8s, 10s depending on experiment)
-  - For each second, uniformly sample F1 image frames and F2 sensor readings
+  - For each second, uniformly sample per-modality rates:
+      FRGB       RGB frames per second
+      FTactile   GelSight frames per second
+      FFT        F/T readings per second
+      FGripper   gripper readings per second
   - Output shapes are (T, ...) where T varies per sample
 
 Output shapes (T = duration of grasp+pose in seconds):
-  ft      : (T, F2*6)          — F2 F/T readings per second, flattened
-  gripper : (T, F2*2)          — F2 gripper readings per second, flattened
-  tactile : (T, F1, 3, H, W)   — F1 GelSight frames per second
-  rgb     : (T, F1, 3, H, W)   — F1 RGB frames per second
+  ft      : (T, FFT, 6)             — FFT F/T readings per second
+  gripper : (T, FGripper, 2)        — FGripper gripper readings per second
+  tactile : (T, FTactile, 3, H, W) — FTactile GelSight frames per second
+  rgb     : (T, FRGB, 3, H, W)     — FRGB RGB frames per second
 
 If a bucket has fewer than F items (but > 0), the sample is skipped with a warning.
 If a bucket is completely empty, zeros / black frames are used.
@@ -47,12 +51,25 @@ from torchvision import transforms
 LABEL_MAP = {'pass': 0, 'slip': 1, 'drop': 1}
 IMAGE_SIZE = (224, 224)
 
-F1     = 1        # image frames sampled per second
-F2     = 1        # sensor readings sampled per second
-FT_DIM = F2 * 6  # flattened F/T dim per timestep  (= 6 when F2=1)
-GR_DIM = F2 * 2  # flattened gripper dim per timestep  (= 2 when F2=1)
+FRGB     = 1  # RGB frames sampled per second
+FTactile = 1  # GelSight frames sampled per second
+FFT      = 1  # F/T readings sampled per second
+FGripper = 1  # gripper readings sampled per second
+FT_READING_DIM = 6
+GRIPPER_READING_DIM = 2
+FT_DIM   = 6  # per-reading F/T dim
+GR_DIM   = 2  # per-reading gripper dim
 L      = 20       # max seconds per episode (train.py sets this before constructing the dataset)
 phase  = 'grasp+pose'  # window used: grasping → stability
+
+
+def refresh_sampling_dims() -> None:
+    global FT_DIM, GR_DIM
+    FT_DIM = FT_READING_DIM
+    GR_DIM = GRIPPER_READING_DIM
+
+
+refresh_sampling_dims()
 
 
 IMG_TRANSFORM = transforms.Compose([
@@ -252,47 +269,47 @@ def _build_sample(sample_dir: Path, rgb_transform=None) -> Optional[dict]:
         # F/T: all rows with this integer timestamp
         ft_mask   = ft_ts == sec
         ft_bucket = ft_val[ft_mask]                             # (k, 6)
-        ft_row    = _sample_bucket(ft_bucket, n_cols=6, f=F2)  # (F2*6,) or None
+        ft_row = _sample_bucket(ft_bucket, n_cols=FT_READING_DIM, f=FFT)  # (FFT*6,) or None
         if ft_row is None:
             print(f"[WARN] {sample_dir.name}: only {len(ft_bucket)} F/T rows "
-                  f"in second {sec}, need F2={F2}. Skipping sample.")
+                  f"in second {sec}, need FFT={FFT}. Skipping sample.")
             return None
-        ft_seq.append(ft_row)
+        ft_seq.append(ft_row.reshape(FFT, FT_READING_DIM))
 
         # Gripper
         gr_mask   = gr_ts == sec
         gr_bucket = gr_val[gr_mask]                             # (k, 2)
-        gr_row    = _sample_bucket(gr_bucket, n_cols=2, f=F2)  # (F2*2,) or None
+        gr_row = _sample_bucket(gr_bucket, n_cols=GRIPPER_READING_DIM, f=FGripper)  # (FGripper*2,) or None
         if gr_row is None:
             print(f"[WARN] {sample_dir.name}: only {len(gr_bucket)} gripper rows "
-                  f"in second {sec}, need F2={F2}. Skipping sample.")
+                  f"in second {sec}, need FGripper={FGripper}. Skipping sample.")
             return None
-        gr_seq.append(gr_row)
+        gr_seq.append(gr_row.reshape(FGripper, GRIPPER_READING_DIM))
 
-        # GelSight: F1 frames from this second, subtract baseline
-        gel_paths = _sample_image_bucket(gel_by_sec.get(sec, []), f=F1)
+        # GelSight: FTactile frames from this second, subtract baseline
+        gel_paths = _sample_image_bucket(gel_by_sec.get(sec, []), f=FTactile)
         if gel_paths is None:
             print(f"[WARN] {sample_dir.name}: only {len(gel_by_sec.get(sec, []))} GelSight frames "
-                  f"in second {sec}, need F1={F1}. Skipping sample.")
+                  f"in second {sec}, need FTactile={FTactile}. Skipping sample.")
             return None
         gel_frames = torch.stack([_load_image(p, IMG_TRANSFORM) - baseline for p in gel_paths])
-        tactile_seq.append(gel_frames)                          # (F1, 3, H, W)
+        tactile_seq.append(gel_frames)                          # (FTactile, 3, H, W)
 
-        # RGB: F1 frames from this second
-        rgb_paths = _sample_image_bucket(rgb_by_sec.get(sec, []), f=F1)
+        # RGB: FRGB frames from this second
+        rgb_paths = _sample_image_bucket(rgb_by_sec.get(sec, []), f=FRGB)
         if rgb_paths is None:
             print(f"[WARN] {sample_dir.name}: only {len(rgb_by_sec.get(sec, []))} RGB frames "
-                  f"in second {sec}, need F1={F1}. Skipping sample.")
+                  f"in second {sec}, need FRGB={FRGB}. Skipping sample.")
             return None
         rgb_t = rgb_transform if rgb_transform is not None else IMG_TRANSFORM
         rgb_frames = torch.stack([_load_image(p, rgb_t) for p in rgb_paths])
-        rgb_seq.append(rgb_frames)                              # (F1, 3, H, W)
+        rgb_seq.append(rgb_frames)                              # (FRGB, 3, H, W)
 
     return {
-        'tactile':       torch.stack(tactile_seq),                               # (T, F1, 3, H, W)
-        'rgb':           torch.stack(rgb_seq),                                   # (T, F1, 3, H, W)
-        'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),    # (T, F2*6)
-        'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),    # (T, F2*2)
+        'tactile':       torch.stack(tactile_seq),                               # (T, FTactile, 3, H, W)
+        'rgb':           torch.stack(rgb_seq),                                   # (T, FRGB, 3, H, W)
+        'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),    # (T, FFT, 6)
+        'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),    # (T, FGripper, 2)
         'gripper_force': torch.tensor([meta['force']], dtype=torch.float32),     # (1,)
         'label':         torch.tensor(LABEL_MAP[shake_str],            dtype=torch.long),
         'pose_label':    torch.tensor(LABEL_MAP[pose_str],             dtype=torch.long),
@@ -320,8 +337,8 @@ def compute_sensor_stats(dataset: "PoseItDataset", indices: List[int]) -> dict:
         ft_list.append(s['ft'])
         gr_list.append(s['gripper'])
         gf_list.append(s['gripper_force'])
-    ft_all = torch.cat(ft_list, dim=0)   # (N*T, F2*6)
-    gr_all = torch.cat(gr_list, dim=0)   # (N*T, F2*2)
+    ft_all = torch.cat(ft_list, dim=0).reshape(-1, FT_READING_DIM)            # (N*T*FFT, 6)
+    gr_all = torch.cat(gr_list, dim=0).reshape(-1, GRIPPER_READING_DIM)       # (N*T*FGripper, 2)
     gf_all = torch.stack(gf_list, dim=0) # (N, 1)
 
     ft_mean = ft_all.mean(dim=0)
@@ -383,7 +400,8 @@ class PoseItDataset(Dataset):
                 skipped += 1
 
         print(f"Loaded {len(self.samples)} samples ({skipped} skipped)  "
-              f"[L={L}, F1={F1}, F2={F2}, phase='{phase}', rgb_preprocess='{rgb_preprocess}']")
+              f"[L={L}, FRGB={FRGB}, FTactile={FTactile}, FFT={FFT}, "
+              f"FGripper={FGripper}, phase='{phase}', rgb_preprocess='{rgb_preprocess}']")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -406,10 +424,10 @@ class PoseItDataset(Dataset):
             gf = (gf - self.sensor_stats['gf_mean']) / self.sensor_stats['gf_std']
 
         return (
-            tac,                 # (T, F1, 3, H, W)
-            rgb,                 # (T, F1, 3, H, W)
-            ft,                  # (T, F2*6)
-            grip,                # (T, F2*2)
+            tac,                 # (T, FTactile, 3, H, W)
+            rgb,                 # (T, FRGB, 3, H, W)
+            ft,                  # (T, FFT, 6)
+            grip,                # (T, FGripper, 2)
             gf,                  # (1,)
             s['label'],
             s['pose_label'],
@@ -513,14 +531,17 @@ if __name__ == '__main__':
         print("No samples found — check your root_dir path.")
     else:
         tac, rgb, ft, grip, gf, label, pose_label = ds[0]
-        print(f"tactile      : {tac.shape}")   # (T, F1, 3, 224, 224)
-        print(f"rgb          : {rgb.shape}")   # (T, F1, 3, 224, 224)
-        print(f"ft           : {ft.shape}")    # (T, F2*6)
-        print(f"gripper      : {grip.shape}")  # (T, F2*2)
+        print(f"tactile      : {tac.shape}")   # (T, FTactile, 3, 224, 224)
+        print(f"rgb          : {rgb.shape}")   # (T, FRGB, 3, 224, 224)
+        print(f"ft           : {ft.shape}")    # (T, FFT, 6)
+        print(f"gripper      : {grip.shape}")  # (T, FGripper, 2)
         print(f"gripper_force: {gf.shape}")    # (1,)
         print(f"label        : {label}")
         print(f"pose_label   : {pose_label}")
-        print(f"\nF1={F1}, F2={F2}  ->  FT_DIM={FT_DIM}, GR_DIM={GR_DIM}")
+        print(
+            f"\nFRGB={FRGB}, FTactile={FTactile}, FFT={FFT}, FGripper={FGripper}  "
+            f"->  FT_DIM={FT_DIM}, GR_DIM={GR_DIM}"
+        )
 
         print("\n=== Default batch (uniform length, no collate needed) ===")
         loader = DataLoader(ds, batch_size=4, shuffle=True)
