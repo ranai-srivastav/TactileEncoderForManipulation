@@ -51,6 +51,7 @@ def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
             'pose':      [0, 0, 0],
             'stability': [0, 0, 0],
         }
+        s_eq = s_neq = 0
         for s in samples:
             g = s.get('grasp_label', -1)
             c['grasp'][0 if g == 0 else (1 if g == 1 else 2)] += 1
@@ -58,17 +59,27 @@ def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
             c['pose'][0 if p == 0 else 1] += 1
             l = s['label'].item()
             c['stability'][0 if l == 0 else 1] += 1
-        return c
+            if l == p:
+                s_eq += 1
+            else:
+                s_neq += 1
+        return c, s_eq, s_neq
 
     def _print_split(name, samples):
-        c = _count(samples)
-        print(f'  {name} — {len(samples)} samples')
+        c, s_eq, s_neq = _count(samples)
+        n = len(samples)
+        print(f'  {name} — {n} samples')
         print(f'    {"Phase":<18} {"Pass":>5} {"Fail":>5} {"Unknown":>8}')
         print(f'    {"-"*38}')
         labels = [('grasp', 'Grasp'), ('pose', 'Pose'), ('stability', 'Stability/Retract')]
         for key, display in labels:
             p, f, u = c[key]
             print(f'    {display:<18} {p:>5} {f:>5} {u:>8}')
+        r = s_neq / max(s_eq, 1)
+        print(f'    {"DRS balance":<18} '
+              f'S= {s_eq} ({100*s_eq/max(n,1):.1f}%)  '
+              f'S≠ {s_neq} ({100*s_neq/max(n,1):.1f}%)  '
+              f'r={r:.3f}')
 
     train_s = [dataset.samples[i] for i in train_set.indices]
     val_s   = [dataset.samples[i] for i in val_set.indices]
