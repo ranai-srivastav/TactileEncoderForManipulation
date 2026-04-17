@@ -227,8 +227,9 @@ def _build_sample(sample_dir: Path, rgb_transform=None) -> Optional[dict]:
     if t_grasp is None or t_stability is None:
         return None
 
-    # T consecutive seconds: [t_grasp, t_grasp+1, ..., t_stability-1]
-    seconds = list(range(t_grasp, t_stability))
+    # T consecutive seconds after grasp start: [t_grasp+1, ..., t_stability-1]
+    # We intentionally drop the first second because it can have sparse readings.
+    seconds = list(range(t_grasp + 1, t_stability))
     if L is not None:
         # Fixed-length mode: clip to last L seconds, drop if too short
         if len(seconds) < L:

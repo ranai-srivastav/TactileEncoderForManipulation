@@ -64,7 +64,6 @@ def parse_args():
     p.add_argument("--FFT", type=int, default=1)
     p.add_argument("--FGripper", type=int, default=1)
     p.add_argument("--L", type=int, default=20)
-    p.add_argument("--subsample", type=float, default=1.0)
     p.add_argument("--overfit", action="store_true")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--hidden_dim", type=int, default=768)
@@ -190,10 +189,6 @@ def main():
     _dl.refresh_sampling_dims()
 
     dataset = PoseItDataset(root_dir=args.root_dir)
-    if args.subsample < 1.0:
-        k = max(4, int(len(dataset.samples) * args.subsample))
-        dataset.samples = random.sample(dataset.samples, k)
-        print(f"Subsampled to {len(dataset.samples)} samples")
     if len(dataset) == 0:
         raise ValueError(f"No samples found in {args.root_dir}")
 
