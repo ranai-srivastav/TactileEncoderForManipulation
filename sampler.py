@@ -1,5 +1,5 @@
 """
-Deferred-Resampling (DRS) Sampler for PoseIt
+Resampling (DRS) Sampler for PoseIt
 
 Training examples are split into two groups:
   S=  : examples where pose_label == label  (majority, ~80%)
@@ -12,18 +12,16 @@ Each batch B is constructed from a pre-sampled batch B̃ as follows:
   3. B = kept S= examples  ∪  (B̃ ∩ S≠)
 
 This makes the ratio of S≠ to S= updates equal to σ in expectation.
-
-DRS is DEFERRED: it does not activate until you call sampler.activate().
-Before activation, the sampler behaves like a standard random batch sampler.
+Resampling is active from the first iteration.
 
 Notes
 -----
 - Use batch_sampler=sampler (not batch_size=) with DataLoader.
 - When working with a Subset, pass the underlying dataset and the
   subset's indices via the `indices` argument.
-- After DRS activates, the effective batch size will be smaller than
-  `batch_size` on average (by a factor of roughly σ/(σ+1) for a
-  balanced B̃ split), which is expected and matches the paper.
+- The effective batch size will be smaller than `batch_size` on average
+  (by a factor of roughly σ/(σ+1) for a balanced B̃ split), which is
+  expected and matches the paper.
 """
 
 import numpy as np
@@ -62,7 +60,6 @@ class DRSSampler(Sampler):
         self.sigma     = sigma
         self.batch_size = batch_size
         self.rng       = np.random.default_rng(seed)
-        self._active   = False   # DRS is deferred until activate() is called
 
         # Use provided indices (Subset case) or all indices
         all_indices = indices if indices is not None else list(range(len(dataset)))
@@ -101,24 +98,8 @@ class DRSSampler(Sampler):
         print(
             f"[DRSSampler] |S=|={len(self.s_eq)}, |S≠|={len(self.s_neq)}, "
             f"r={r:.4f}, σ={sigma}, keep_prob(S=)={self.keep_prob:.4f}, "
-            f"batch_size={batch_size}, deferred=True"
+            f"batch_size={batch_size}"
         )
-
-    def activate(self):
-        """Enable DRS resampling. Call this at the LR annealing step."""
-        if not self._active:
-            self._active = True
-            print("[DRSSampler] DRS activated.")
-
-    def deactivate(self):
-        """Disable DRS (revert to uniform random sampling)."""
-        if self._active:
-            self._active = False
-            print("[DRSSampler] DRS deactivated.")
-
-    @property
-    def is_active(self) -> bool:
-        return self._active
 
     def __len__(self) -> int:
         return self._n_batches
@@ -135,10 +116,6 @@ class DRSSampler(Sampler):
         b_tilde_idx = self.rng.choice(
             self.all_indices, size=self.batch_size, replace=replace
         )
-
-        if not self._active:
-            # Pre-activation: return B̃ as-is (standard random batching)
-            return b_tilde_idx.tolist()
 
         # Step 2 & 3: Apply DRS thinning
         s_neq_set = set(self.s_neq.tolist())

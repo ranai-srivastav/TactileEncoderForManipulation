@@ -38,6 +38,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from PIL import Image
+from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
@@ -368,7 +369,7 @@ class PoseItDataset(Dataset):
         self.sensor_stats = sensor_stats  # ft/gr/gf mean & std for standardization
         self.samples = []
         skipped = 0
-        for d in dirs:
+        for d in tqdm(dirs, desc="Loading dataset", unit="episode"):
             if not d.is_dir():
                 continue
             try:

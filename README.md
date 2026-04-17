@@ -110,7 +110,7 @@ See the [Training Reference](#training-reference) section below for all CLI argu
 
 **Purpose:** Implements Deferred Resampling (DRS) to counter class imbalance. Training samples are partitioned into S= (examples where `pose_label == label`, majority ~80%) and S≠ (minority ~20%). Each batch is constructed by thinning S= examples with probability `r/σ`, so the effective S≠/S= ratio in each batch approaches `σ`.
 
-DRS is **deferred**: it behaves as a standard random sampler until `activate()` is called at `anneal_iter`. This lets the model warm up before the batch distribution shifts.
+DRS is active from the first iteration. Pass `--sigma` to control the resampling ratio.
 
 **What you can change here:**
 | Parameter | Notes |
@@ -129,16 +129,18 @@ DRS is **deferred**: it behaves as a standard random sampler until `activate()` 
 |----------|---------|-------------|
 | `--root_dir` | `./data` | Path to the dataset root (folder containing episode subdirectories) |
 | `--split` | `object` | How to split data: `object` (held-out objects), `pose` (held-out pose indices), `random` (random 70/15/15) |
-| `--test_objects` | `mug bowl` | Object names held out for test when `--split object` |
-| `--test_poses` | `1 2 3 4 5` | Pose indices held out for test when `--split pose` |
-| `--sigma` | `1.0` | DRS target S≠/S= ratio. Use `0.5` for tactile-only runs, `1.0` for vision or full fusion |
-| `--batch_size` | `200` | Pre-DRS batch size. Effective batch is smaller once DRS activates |
+| `--test_object_ids` | — | Zero-based indices into the sorted alphabetical object list (printed at startup). Use with `--split object`. |
+| `--n_test_objects` | — | Randomly pick N objects for test. Use with `--split object`. Ignored if `--test_object_ids` is given. |
+| `--test_pose_ids` | — | `pose_idx` integers from folder names to hold out for test. Use with `--split pose`. |
+| `--n_test_poses` | — | Randomly pick N pose IDs for test. Use with `--split pose`. Ignored if `--test_pose_ids` is given. |
+| `--sigma` | `1.0` | DRS target S≠/S= ratio. Use `0.5` for tactile-only runs, `1.0` for vision or full fusion. Resampling is active from the first iteration. |
+| `--batch_size` | `200` | Pre-DRS batch size. Effective batch is smaller after DRS thinning |
 | `--lr` | `0.01` | Initial learning rate for SGD |
 | `--weight_decay` | `0.01` | L2 regularization strength. Set to `0.0` to remove regularization |
 | `--dropout` | `0.1` | Dropout applied in projection layer and classifier head |
 | `--hidden_dim` | `256` | LSTM hidden size and projection width |
 | `--n_iters` | `600` | Total training iterations (not epochs) |
-| `--anneal_iter` | `300` | Iteration at which LR is multiplied by 0.1 and DRS activates |
+| `--anneal_iter` | `300` | Iteration at which LR is multiplied by 0.1 |
 | `--num_workers` | `4` | DataLoader worker processes. Use `0` for debugging |
 | `--modalities` | `V T FT G GF` | Active input modalities. Any subset of: `V` (RGB), `T` (tactile), `FT` (force-torque), `G` (gripper), `GF` (gripper force) |
 | `--fixed_length` | off | If set, clip episodes to `L` seconds and use fixed batch shapes. Default: variable-length sequences |
@@ -152,6 +154,43 @@ DRS is **deferred**: it behaves as a standard random sampler until `activate()` 
 | `--wandb_entity` | `mrsd-smores` | W&B team/entity |
 | `--overfit` | off | Flag: use a single sample for train/val/test to sanity-check the model |
 | `--model_save_path` | `trained_models/best_model.pt` | Path for the best-val-F1 checkpoint. A rolling `model_latest.pt` is also saved in the same directory every 10 iterations |
+
+---
+
+## Test Set Selection
+
+When using `--split object` or `--split pose`, the script always prints the full set of available objects or pose IDs at startup so you can see what is in the loaded dataset before deciding what to hold out.
+
+### Object split (`--split object`)
+
+**By index** — the startup printout lists objects sorted alphabetically with a zero-based index. Pass those indices to hold out specific objects:
+```bash
+python MBT/mbt_train.py --split object --test_object_ids 0 5 ...
+```
+
+**By random count** — let the script randomly select N objects for you:
+```bash
+python MBT/mbt_train.py --split object --n_test_objects 3 ...
+```
+
+> Note: when `--subsample` is used, the index is computed from the subsampled dataset, so IDs may not match a full-dataset run. For production runs (no subsample) the index is stable.
+
+### Pose split (`--split pose`)
+
+**By explicit pose IDs** — pass the integer `pose_idx` values from the folder names:
+```bash
+python MBT/mbt_train.py --split pose --test_pose_ids 1 2 3 4 5 ...
+```
+
+**By random count** — let the script randomly select N pose IDs:
+```bash
+python MBT/mbt_train.py --split pose --n_test_poses 3 ...
+```
+
+Precedence when multiple args are given:
+- Object split: `--test_object_ids` takes precedence over `--n_test_objects`.
+- Pose split: `--test_pose_ids` takes precedence over `--n_test_poses`.
+- `--split object` with neither arg → error; `--split pose` with neither arg → error.
 
 ---
 
@@ -179,11 +218,11 @@ python train.py \
 ```
 
 ### 3. Full training run — all modalities, object split
-The standard experiment. Holds out `mug` and `bowl` for generalization testing. DRS activates at iteration 300.
+The standard experiment. Object indices are printed at startup; pass two of them with `--test_object_ids`. DRS activates at iteration 300.
 ```bash
 python train.py \
     --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
-    --split object --test_objects mug bowl \
+    --split object --test_object_ids 0 5 \
     --modalities V T FT G GF \
     --anneal_iter 300 --n_iters 600 \
     --sigma 1.0 --lr 0.01 --L 20 \
@@ -227,11 +266,11 @@ python train.py \
 ```
 
 ### 7. Pose-split generalization test
-Holds out pose indices 1–5 for testing. Evaluates whether the model generalizes to unseen object orientations.
+Holds out specific pose indices for testing. Evaluates whether the model generalizes to unseen object orientations. Available pose IDs are printed at startup.
 ```bash
 python train.py \
     --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
-    --split pose --test_poses 1 2 3 4 5 \
+    --split pose --test_pose_ids 1 2 3 4 5 \
     --modalities V T FT G GF \
     --anneal_iter 300 --n_iters 600 \
     --wandb_run pose-split-full-fusion
