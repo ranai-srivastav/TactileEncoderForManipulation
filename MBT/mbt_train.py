@@ -21,6 +21,7 @@ import math
 import os
 import random
 import sys
+import numpy as np
 
 # dataloader.py and sampler.py live in the repo root, one level up from MBT/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
