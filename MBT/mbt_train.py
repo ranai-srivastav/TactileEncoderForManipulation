@@ -150,7 +150,7 @@ def parse_args():
     p.add_argument('--overfit', action='store_true',
                    help='Use a single sample for train/val/test to sanity-check the model.')
     p.add_argument("--model_save_path", type=str, default="trained_models/best_mbt_model.pt")
-    p.add_argument('--seed', type=int, default=None,
+    p.add_argument('--seed', type=int, default=42,
                    help='Random seed for reproducibility. If not set, everything is truly random.')
     p.add_argument('--ogm',             type=int,   default=0, choices=[0, 1])
     p.add_argument('--ogm_alpha',       type=float, default=0.5)
