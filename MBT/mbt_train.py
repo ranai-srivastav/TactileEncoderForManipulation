@@ -40,6 +40,7 @@ from dataloader import (PoseItDataset, split_by_object, split_by_pose,
                         uniform_random_split, FT_DIM, GR_DIM)
 from sampler import DRSSampler
 from mbt_model import MBTGraspStability
+from mbt_ogm_utils import compute_confidence_scores, compute_discrepancy_ratios, compute_ogm_coefficients
 
 
 def print_dataset_stats(dataset, train_set, val_set, test_set) -> None:
@@ -150,6 +151,9 @@ def parse_args():
     p.add_argument("--model_save_path", type=str, default="trained_models/best_mbt_model.pt")
     p.add_argument('--seed', type=int, default=None,
                    help='Random seed for reproducibility. If not set, everything is truly random.')
+    p.add_argument('--ogm',             type=int,   default=0, choices=[0, 1])
+    p.add_argument('--ogm_alpha',       type=float, default=0.5)
+    p.add_argument('--aux_loss_weight', type=float, default=0.1)
     return p.parse_args()
 
 
@@ -218,7 +222,8 @@ def evaluate(model, loader, criterion, device):
     for batch in loader:
         tac, rgb, ft, grip, gf, label, _, lengths = batch_to_device(batch, device)
         with torch.autocast('cuda', enabled=torch.cuda.is_available()):
-            logits = model(tac, rgb, ft, grip, gf).squeeze(-1)
+            out = model(tac, rgb, ft, grip, gf)
+            logits = (out[0] if isinstance(out, tuple) else out).squeeze(-1)
             total_loss += criterion(logits, label.float()).item() * len(label)
         preds  = logits > 0
         actual = label.bool()
@@ -274,6 +279,7 @@ def main():
         wandb.define_metric("train/*", step_metric="iter")
         wandb.define_metric("val/*", step_metric="iter")
         wandb.define_metric("lr", step_metric="iter")
+        wandb.define_metric("ogm/*", step_metric="iter")
     elif args.wandb_project is not None:
         print("[WARN] wandb not installed — W&B logging disabled.")
 
@@ -393,8 +399,14 @@ def main():
 
             # Forward pass with mixed precision
             with torch.autocast('cuda', enabled=torch.cuda.is_available()):
-                logits = model(tac, rgb, ft, grip, gf).squeeze(-1)
-                loss   = criterion(logits, label.float()) / args.grad_accum
+                fused_logit, logits_per_mod = model(tac, rgb, ft, grip, gf)
+                logits = fused_logit.squeeze(-1)
+                loss   = criterion(logits, label.float())
+                if args.ogm == 1:
+                    for mod_logit in logits_per_mod.values():
+                        loss = loss + args.aux_loss_weight * criterion(
+                            mod_logit.squeeze(-1), label.float())
+                loss = loss / args.grad_accum
 
             # Backward (scaled for mixed precision)
             scaler.scale(loss).backward()
@@ -403,6 +415,16 @@ def main():
 
             # Optimizer step after grad_accum micro-batches
             if accum_step >= args.grad_accum:
+                scaler.unscale_(optimizer)
+                
+                # OGM monitoring + modulation
+                if iteration % 10 == 0 or iteration == args.n_iters - 1:
+                    scores = compute_confidence_scores(logits_per_mod, label)
+                    rhos   = compute_discrepancy_ratios(scores)
+                    if args.ogm == 1:
+                        coeffs = compute_ogm_coefficients(rhos, args.ogm_alpha)
+                        model.apply_ogm(coeffs)
+                        
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -421,16 +443,21 @@ def main():
                           f"lr={current_lr:.2e}")
 
                     if use_wandb:
-                        wandb.log({
-                            'iter':           iteration,
-                            'train/loss':     avg_train_loss,
-                            'val/loss':       val_loss,
-                            'val/acc':        val_acc,
-                            'val/precision':  val_prec,
-                            'val/recall':     val_rec,
-                            'val/f1':         val_f1,
-                            'lr':             current_lr,
-                        }, step=iteration)
+                        log_dict = {
+                            'iter': iteration,
+                            'train/loss': avg_train_loss,
+                            'val/loss': val_loss,
+                            'val/acc': val_acc,
+                            'val/precision': val_prec,
+                            'val/recall': val_rec,
+                            'val/f1': val_f1,
+                            'lr': current_lr,
+                        }
+                        for key, s in scores.items():
+                            log_dict[f'ogm/conf_{key.lower()}'] = s.mean().item()
+                        for key, r in rhos.items():
+                            log_dict[f'ogm/rho_{key.lower()}'] = r
+                        wandb.log(log_dict, step=iteration)
 
                     if val_f1 > best_val_f1:
                         best_val_f1 = val_f1

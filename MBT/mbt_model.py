@@ -391,8 +391,27 @@ class MBTGraspStability(nn.Module):
         # ── Stage 4: Classification ───────────────────────────────────────────
         # Each modality's CLS token → per-modality head → logit; final = mean.
 
-        logits_list = [
-            self.classifiers[k](self.norms[k](token_dict[k])[:, 0])
+        logits_per_mod = {
+            k: self.classifiers[k](self.norms[k](token_dict[k])[:, 0])
             for k in token_dict
-        ]
-        return torch.stack(logits_list, dim=0).mean(dim=0)  # (B, num_classes)
+        }
+        fused_logit = torch.stack(list(logits_per_mod.values()), dim=0).mean(dim=0)  # (B, num_classes)
+        
+        return fused_logit, logits_per_mod
+    
+    def apply_ogm(self, coefficients: dict) -> None:
+        """Scale gradients of each modality's classifier, norm, and fusion stream blocks."""
+        for key, k in coefficients.items():
+            if k >= 1.0:
+                continue
+            for p in self.classifiers[key].parameters():
+                if p.grad is not None:
+                    p.grad.mul_(k)
+            for p in self.norms[key].parameters():
+                if p.grad is not None:
+                    p.grad.mul_(k)
+            for blk in self.fusion_blocks:
+                if key in blk.streams:
+                    for p in blk.streams[key].parameters():
+                        if p.grad is not None:
+                            p.grad.mul_(k)
