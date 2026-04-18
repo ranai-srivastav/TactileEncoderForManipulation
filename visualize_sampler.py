@@ -67,7 +67,6 @@ def main():
 
     # ---- Sampler ratio check -----------------------------------------------
     sampler = DRSSampler(ds, sigma=args.sigma, batch_size=args.batch_size, seed=42)
-    sampler.activate()
 
     s_neq_set = set(sampler.s_neq.tolist())
     ratios, eq_counts, neq_counts = [], [], []

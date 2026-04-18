@@ -2,21 +2,22 @@
 PoseIt 2D unimodal training script (ResNet-50 + MLP)
 
 Usage:
-  # Train with RGB
+  # Train with RGB (object indices printed at startup)
   python unimodal/train_2d.py --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
-      --modality rgb --test_objects mug bowl flashlight --n_iters 6000
+      --modality rgb --test_object_ids 0 3 5 --n_iters 6000
 
-  # Train with tactile
+  # Train with tactile (random 3 test objects)
   python unimodal/train_2d.py --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
-      --modality tactile --test_objects mug bowl flashlight --n_iters 6000
+      --modality tactile --n_test_objects 3 --n_iters 6000
 
   # Test only
   python unimodal/train_2d.py --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
-      --modality rgb --test_objects mug bowl flashlight --test
+      --modality rgb --test_object_ids 0 3 5 --test
 """
 
 import argparse
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -85,10 +86,15 @@ def parse_args():
                    help='Which image stream to use')
     p.add_argument('--split',      default='object',
                    choices=['object', 'pose', 'random'])
-    p.add_argument('--test_objects', nargs='+',
-                   default=['mug', 'bowl', 'flashlight'])
-    p.add_argument('--test_poses',  nargs='+', type=int,
-                   default=[1, 2, 3, 4, 5])
+    p.add_argument('--test_object_ids', nargs='+', type=int, default=None,
+                   help='Zero-based indices into the sorted alphabetical object list printed at '
+                        'startup. Use with --split object. Takes precedence over --n_test_objects.')
+    p.add_argument('--n_test_objects',  type=int, default=None,
+                   help='Randomly pick N objects for the test set (--split object).')
+    p.add_argument('--test_pose_ids',   nargs='+', type=int, default=None,
+                   help='pose_idx integers to hold out for test. Use with --split pose.')
+    p.add_argument('--n_test_poses',    type=int, default=None,
+                   help='Randomly pick N pose IDs for the test set (--split pose).')
     p.add_argument('--batch_size',  type=int, default=32)
     p.add_argument('--lr',          type=float, default=1e-3)
     p.add_argument('--weight_decay', type=float, default=0.01)
@@ -115,9 +121,36 @@ def parse_args():
 
 def make_split(dataset, args):
     if args.split == 'object':
-        return split_by_object(dataset, test_objects=args.test_objects)
+        all_objects = sorted(set(s['object'] for s in dataset.samples))
+        print("Object index (sorted alphabetically):")
+        for i, obj in enumerate(all_objects):
+            print(f"  {i:>3}: {obj}")
+
+        if args.test_object_ids is not None:
+            test_objects = [all_objects[i] for i in args.test_object_ids]
+            print(f"Test objects (--test_object_ids {args.test_object_ids}): {test_objects}")
+        elif args.n_test_objects is not None:
+            test_objects = sorted(random.sample(all_objects, args.n_test_objects))
+            print(f"Randomly selected {args.n_test_objects} test objects: {test_objects}")
+        else:
+            raise ValueError("--split object requires --test_object_ids or --n_test_objects")
+
+        return split_by_object(dataset, test_objects=test_objects)
+
     elif args.split == 'pose':
-        return split_by_pose(dataset, test_pose_indices=args.test_poses)
+        all_poses = sorted(set(s['pose_idx'] for s in dataset.samples))
+        print(f"Pose IDs in dataset: {all_poses}")
+
+        if args.test_pose_ids is not None:
+            print(f"Test poses (--test_pose_ids): {args.test_pose_ids}")
+            return split_by_pose(dataset, test_pose_indices=args.test_pose_ids)
+        elif args.n_test_poses is not None:
+            test_poses = sorted(random.sample(all_poses, args.n_test_poses))
+            print(f"Randomly selected {args.n_test_poses} test poses: {test_poses}")
+            return split_by_pose(dataset, test_pose_indices=test_poses)
+        else:
+            raise ValueError("--split pose requires --test_pose_ids or --n_test_poses")
+
     else:
         return uniform_random_split(dataset)
 

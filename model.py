@@ -1,8 +1,11 @@
 from itertools import chain
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torchvision.models import resnet50, ResNet50_Weights
+
+from encoders import CLIPRGBEncoder, T3TactileEncoder
 
 
 class GraspStabilityLSTM(nn.Module):
@@ -38,6 +41,11 @@ class GraspStabilityLSTM(nn.Module):
 
     RESNET_EMB = 2048  # ResNet50 penultimate-layer width
 
+    # Option B: per-modality projection for balanced fusion
+    V_EMB, T_EMB = 512, 512
+    FT_EMB, G_EMB, GF_EMB = 128, 64, 32
+    PRE_LSTM_DIM = V_EMB + T_EMB + FT_EMB + G_EMB + GF_EMB  # 1248
+
     def __init__(
         self,
         frames_per_sec: int = 1,   # F1 — image frames sampled per second
@@ -70,15 +78,21 @@ class GraspStabilityLSTM(nn.Module):
                            self.tactile_encoder.parameters()):
                 p.requires_grad = False
 
-        # --- per-second fusion projection ---
-        # concat: [tac_emb (F1*2048), rgb_emb (F1*2048), ft (FT_DIM), grip (GR_DIM), gf (1)]
-        pre_lstm_dim = frames_per_sec * self.RESNET_EMB * 2 + ft_dim + gripper_dim + 1
+        # --- per-modality projectors (Option B: balanced fusion) ---
+        resnet_out = frames_per_sec * self.RESNET_EMB  # F1*2048
+        self.v_proj   = nn.Linear(resnet_out, self.V_EMB)    # 2048 → 512
+        self.t_proj   = nn.Linear(resnet_out, self.T_EMB)    # 2048 → 512
+        self.ft_proj  = nn.Linear(ft_dim, self.FT_EMB)       # 6 → 128
+        self.g_proj   = nn.Linear(gripper_dim, self.G_EMB)   # 2 → 64
+        self.gf_proj  = nn.Linear(1, self.GF_EMB)            # 1 → 32
+
+        # --- fusion projection (1248 → hidden_dim) ---
         self.projection = nn.Sequential(
-            nn.Linear(pre_lstm_dim, hidden_dim *2),
+            nn.Linear(self.PRE_LSTM_DIM, hidden_dim * 2),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim * 2),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim *2, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
@@ -121,7 +135,7 @@ class GraspStabilityLSTM(nn.Module):
         self.tactile_encoder.eval()
         return self
 
-    def forward(self, tactile, rgb, ft, gripper, gripper_force):
+    def forward(self, tactile, rgb, ft, gripper, gripper_force, lengths):
         """
         Args:
             tactile:       (B, T, F1, 3, H, W)
@@ -129,6 +143,7 @@ class GraspStabilityLSTM(nn.Module):
             ft:            (B, T, FT_DIM)
             gripper:       (B, T, GR_DIM)
             gripper_force: (B, 1)
+            lengths:       (B,) or list — actual sequence length per sample (for pack_padded_sequence)
 
         Returns:
             (B, 1) raw logits.
@@ -179,19 +194,42 @@ class GraspStabilityLSTM(nn.Module):
                 logit_prop = self.head_prop(
                     torch.relu(self.proj_prop(prop)).mean(dim=1)
                 ) if any(m in self.modalities for m in ['FT', 'G', 'GF']) else None
+        # --- per-modality projection (Option B: balanced fusion) ---
+        v_emb  = self.v_proj(rgb_emb)                              # (B, T, 512)
+        t_emb  = self.t_proj(tac_emb)                             # (B, T, 512)
+        ft_emb = self.ft_proj(ft)                                 # (B, T, 128)
+        g_emb  = self.g_proj(gripper)                             # (B, T, 64)
+        gf     = gripper_force.unsqueeze(1).expand(B, T, 1)
+        gf_emb = self.gf_proj(gf)                                 # (B, T, 32)
 
-        # --- fuse all modalities per second, project to hidden_dim ---
-        fused     = torch.cat([tac_emb, rgb_emb, ft, gripper, gf], dim=-1)  # (B, T, pre_lstm_dim)
-        projected = self.projection(fused)                                    # (B, T, hidden_dim)
+        # Zero out disabled modalities (after projection)
+        if 'V'  not in self.modalities: v_emb  = v_emb  * 0.0
+        if 'T'  not in self.modalities: t_emb  = t_emb  * 0.0
+        if 'FT' not in self.modalities: ft_emb = ft_emb * 0.0
+        if 'G'  not in self.modalities: g_emb  = g_emb  * 0.0
+        if 'GF' not in self.modalities: gf_emb = gf_emb * 0.0
 
-        # --- LSTM over T seconds, classify from final hidden state ---
-        lstm_out, _ = self.lstm(projected)
+        # --- fuse projected modalities, then project to hidden_dim ---
+        fused     = torch.cat([v_emb, t_emb, ft_emb, g_emb, gf_emb], dim=-1)  # (B, T, 1248)
+        projected = self.projection(fused)                                       # (B, T, hidden_dim)
+
+        # --- GRU over T seconds with pack_padded_sequence (handles variable length) ---
+        lengths_cpu = lengths.cpu() if isinstance(lengths, torch.Tensor) else torch.tensor(lengths, dtype=torch.long)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            projected, lengths_cpu, batch_first=True, enforce_sorted=False
+        )
+        lstm_out, _ = self.lstm(packed)
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)  # (B, T_max, hidden*2)
+
+        # Index last valid timestep per sequence
+        idx = (lengths_cpu - 1).to(projected.device)
         if self.bidirectional:
-            # Forward at T-1: seen 0→T-1; Backward at 0: seen T-1→0
             h = self.lstm.hidden_size
-            last = torch.cat([lstm_out[:, -1, :h], lstm_out[:, 0, h:]], dim=-1)
+            last_fwd = lstm_out[torch.arange(B, device=lstm_out.device), idx, :h]
+            last_bwd = lstm_out[:, 0, h:]
+            last = torch.cat([last_fwd, last_bwd], dim=-1)
         else:
-            last = lstm_out[:, -1, :]   # (B, hidden_dim)
+            last = lstm_out[torch.arange(B, device=lstm_out.device), idx, :]  # (B, hidden_dim)
             
         return self.classifier(last), logit_tac, logit_rgb, logit_prop
     
@@ -224,3 +262,144 @@ class GraspStabilityLSTM(nn.Module):
                 if p.grad is not None:
                     p.grad *= k_prop
 
+class GraspStabilityLSTM_CLIP_T3(nn.Module):
+    """
+    Same as GraspStabilityLSTM but uses CLIP (ViT-L/14) for RGB and T3 large for tactile.
+    CLIP outputs 768-d per image (``CLIP_EMB``). Tactile width is ``tactile_encoder.embed_dim``
+    (from the T3 checkpoint; large is typically 1024-d).
+    """
+
+    CLIP_EMB = 768
+    V_EMB, T_EMB = 512, 512
+    FT_EMB, G_EMB, GF_EMB = 128, 64, 32
+    PRE_LSTM_DIM = V_EMB + T_EMB + FT_EMB + G_EMB + GF_EMB  # 1248
+
+    def __init__(
+        self,
+        frames_per_sec: int = 1,
+        ft_dim: int = 6,
+        gripper_dim: int = 2,
+        hidden_dim: int = 256,
+        lstm_layers: int = 2,
+        bidirectional: bool = True,
+        dropout: float = 0.1,
+        freeze_encoders: bool = True,
+        modalities=None,
+        pretrained_dir: Optional[str] = None,
+        t3_encoder_domain: str = "gs_black",
+    ):
+        super().__init__()
+        self.frames_per_sec = frames_per_sec
+        self.ft_dim = ft_dim
+        self.gripper_dim = gripper_dim
+        self.modalities = set(modalities or ['V', 'T', 'FT', 'G', 'GF'])
+        self.bidirectional = bidirectional
+
+        self.rgb_encoder = CLIPRGBEncoder(freeze=freeze_encoders)
+        self.tactile_encoder = T3TactileEncoder(
+            pretrained_dir=pretrained_dir,
+            encoder_domain=t3_encoder_domain,
+            freeze=freeze_encoders,
+        )
+        t3_out = self.tactile_encoder.embed_dim
+
+        v_in = frames_per_sec * self.CLIP_EMB
+        t_in = frames_per_sec * t3_out
+        self.v_proj = nn.Linear(v_in, self.V_EMB)
+        self.t_proj = nn.Linear(t_in, self.T_EMB)
+        self.ft_proj = nn.Linear(ft_dim, self.FT_EMB)
+        self.g_proj = nn.Linear(gripper_dim, self.G_EMB)
+        self.gf_proj = nn.Linear(1, self.GF_EMB)
+
+        self.projection = nn.Sequential(
+            nn.Linear(self.PRE_LSTM_DIM, hidden_dim * 2),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+
+        classifier_in = hidden_dim * 2 if bidirectional else hidden_dim
+        self.classifier = nn.Sequential(
+            nn.Linear(classifier_in, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.rgb_encoder.train(mode)
+        self.tactile_encoder.train(mode)
+        return self
+
+    def forward(self, tactile, rgb, ft, gripper, gripper_force, lengths):
+        if 'T' not in self.modalities:
+            tactile = tactile * 0.0
+        if 'V' not in self.modalities:
+            rgb = rgb * 0.0
+        if 'FT' not in self.modalities:
+            ft = ft * 0.0
+        if 'G' not in self.modalities:
+            gripper = gripper * 0.0
+        if 'GF' not in self.modalities:
+            gripper_force = gripper_force * 0.0
+
+        B, T, F1 = tactile.shape[:3]
+        S = T * F1
+
+        tac_emb = self.tactile_encoder(
+            tactile.reshape(B * S, *tactile.shape[3:])
+        ).reshape(B, T, F1 * self.tactile_encoder.embed_dim)
+        rgb_emb = self.rgb_encoder(
+            rgb.reshape(B * S, *rgb.shape[3:])
+        ).reshape(B, T, F1 * self.CLIP_EMB)
+
+        v_emb = self.v_proj(rgb_emb)
+        t_emb = self.t_proj(tac_emb)
+        ft_emb = self.ft_proj(ft)
+        g_emb = self.g_proj(gripper)
+        gf = gripper_force.unsqueeze(1).expand(B, T, 1)
+        gf_emb = self.gf_proj(gf)
+
+        if 'V' not in self.modalities:
+            v_emb = v_emb * 0.0
+        if 'T' not in self.modalities:
+            t_emb = t_emb * 0.0
+        if 'FT' not in self.modalities:
+            ft_emb = ft_emb * 0.0
+        if 'G' not in self.modalities:
+            g_emb = g_emb * 0.0
+        if 'GF' not in self.modalities:
+            gf_emb = gf_emb * 0.0
+
+        fused = torch.cat([v_emb, t_emb, ft_emb, g_emb, gf_emb], dim=-1)
+        projected = self.projection(fused)
+
+        lengths_cpu = lengths.cpu() if isinstance(lengths, torch.Tensor) else torch.tensor(lengths, dtype=torch.long)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            projected, lengths_cpu, batch_first=True, enforce_sorted=False
+        )
+        lstm_out, _ = self.lstm(packed)
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+
+        idx = (lengths_cpu - 1).to(projected.device)
+        if self.bidirectional:
+            h = self.lstm.hidden_size
+            last_fwd = lstm_out[torch.arange(B, device=lstm_out.device), idx, :h]
+            last_bwd = lstm_out[:, 0, h:]
+            last = torch.cat([last_fwd, last_bwd], dim=-1)
+        else:
+            last = lstm_out[torch.arange(B, device=lstm_out.device), idx, :]
+        return self.classifier(last)

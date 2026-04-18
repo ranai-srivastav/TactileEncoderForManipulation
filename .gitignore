@@ -5,3 +5,12 @@ dataset
 wandb/
 __pycache__/
 *.pt
+*.pdf
+figures/
+plot_test_metrics.py
+plot_training_curves.py
+plot_rho_bars.py
+download_pretrained.py
+logs
+train_clipt3_2k_gru_cosine.sbatch
+train_clipt3_2k_gru.sbatch
