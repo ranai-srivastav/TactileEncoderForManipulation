@@ -141,7 +141,9 @@ def batch_to_device(batch, device):
 def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
-    tp = fp = fn = n = 0
+    tp = fp = tn = fn = n = 0
+    y_true = []
+    y_pred = []
 
     for batch in loader:
         tac, rgb, ft, grip, gf, label, _ = batch_to_device(batch, device)
@@ -152,16 +154,44 @@ def evaluate(model, loader, criterion, device):
         actual = label.bool()
         tp += (preds & actual).sum().item()
         fp += (preds & ~actual).sum().item()
+        tn += (~preds & ~actual).sum().item()
         fn += (~preds & actual).sum().item()
         n += len(label)
+        y_true.extend(label.cpu().tolist())
+        y_pred.extend(preds.long().cpu().tolist())
 
     if n == 0:
-        return 0.0, 0.0
+        return {
+            "loss": 0.0,
+            "acc": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "y_true": [],
+            "y_pred": [],
+        }
 
+    acc = (tp + tn) / n
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    return total_loss / n, f1
+    return {
+        "loss": total_loss / n,
+        "acc": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "y_true": y_true,
+        "y_pred": y_pred,
+    }
+
+
+def wandb_confusion_matrix(metrics):
+    return wandb.plot.confusion_matrix(
+        y_true=metrics["y_true"],
+        preds=metrics["y_pred"],
+        class_names=["pass/no slip", "slip/drop"],
+    )
 
 
 def main():
@@ -286,32 +316,69 @@ def main():
             train_count += len(label)
 
         avg_train_loss = train_loss_sum / max(train_count, 1)
-        val_loss, val_f1 = evaluate(model, val_loader, criterion, device)
+        train_metrics = evaluate(model, train_loader, criterion, device)
+        val_metrics = evaluate(model, val_loader, criterion, device)
+        test_metrics = evaluate(model, test_loader, criterion, device)
         print(
             f"[epoch {epoch + 1:3d}/{args.epochs:3d}] "
             f"train_loss={avg_train_loss:.4f} "
-            f"val_loss={val_loss:.4f} "
-            f"val_f1={val_f1:.3f}"
+            f"train_acc={train_metrics['acc']:.3f} "
+            f"train_prec={train_metrics['precision']:.3f} "
+            f"train_rec={train_metrics['recall']:.3f} "
+            f"val_loss={val_metrics['loss']:.4f} "
+            f"val_acc={val_metrics['acc']:.3f} "
+            f"val_prec={val_metrics['precision']:.3f} "
+            f"val_rec={val_metrics['recall']:.3f} "
+            f"val_f1={val_metrics['f1']:.3f} "
+            f"test_acc={test_metrics['acc']:.3f} "
+            f"test_prec={test_metrics['precision']:.3f} "
+            f"test_rec={test_metrics['recall']:.3f}"
         )
         if use_wandb:
             wandb.log({
                 "epoch": epoch + 1,
                 "train/loss": avg_train_loss,
-                "val/loss": val_loss,
-                "val/f1": val_f1,
+                "train/eval_loss": train_metrics["loss"],
+                "train/acc": train_metrics["acc"],
+                "train/precision": train_metrics["precision"],
+                "train/recall": train_metrics["recall"],
+                "train/f1": train_metrics["f1"],
+                "train/confusion_matrix": wandb_confusion_matrix(train_metrics),
+                "val/loss": val_metrics["loss"],
+                "val/acc": val_metrics["acc"],
+                "val/precision": val_metrics["precision"],
+                "val/recall": val_metrics["recall"],
+                "val/f1": val_metrics["f1"],
+                "val/confusion_matrix": wandb_confusion_matrix(val_metrics),
+                "test/loss": test_metrics["loss"],
+                "test/acc": test_metrics["acc"],
+                "test/precision": test_metrics["precision"],
+                "test/recall": test_metrics["recall"],
+                "test/f1": test_metrics["f1"],
+                "test/confusion_matrix": wandb_confusion_matrix(test_metrics),
             })
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        if val_metrics["f1"] > best_val_f1:
+            best_val_f1 = val_metrics["f1"]
             torch.save(model.state_dict(), args.model_save_path)
 
     print("\nLoading best checkpoint for test evaluation...")
     model.load_state_dict(torch.load(args.model_save_path, map_location=device))
-    test_loss, test_f1 = evaluate(model, test_loader, criterion, device)
-    print(f"Test loss={test_loss:.4f}  f1={test_f1:.3f}")
+    test_metrics = evaluate(model, test_loader, criterion, device)
+    print(
+        f"Test loss={test_metrics['loss']:.4f}  "
+        f"acc={test_metrics['acc']:.3f}  "
+        f"precision={test_metrics['precision']:.3f}  "
+        f"recall={test_metrics['recall']:.3f}  "
+        f"f1={test_metrics['f1']:.3f}"
+    )
     if use_wandb:
         wandb.log({
-            "test/loss": test_loss,
-            "test/f1": test_f1,
+            "best/test_loss": test_metrics["loss"],
+            "best/test_acc": test_metrics["acc"],
+            "best/test_precision": test_metrics["precision"],
+            "best/test_recall": test_metrics["recall"],
+            "best/test_f1": test_metrics["f1"],
+            "best/test_confusion_matrix": wandb_confusion_matrix(test_metrics),
             "best_val_f1": best_val_f1,
         })
         wandb.finish()
