@@ -163,6 +163,8 @@ def parse_args():
     p.add_argument('--overfit', action='store_true',
                    help='Use a single sample for train/val/test to sanity-check the model.')
     p.add_argument("--model_save_path", type=str, default="trained_models/best_mbt_model.pt")
+    p.add_argument('--log_interval', type=int, default=10,
+                   help='Evaluate and log metrics every N iterations (default: 10).')
     p.add_argument('--seed', type=int, default=None,
                    help='Random seed for reproducibility. If not set, everything is truly random.')
     return p.parse_args()
@@ -287,8 +289,10 @@ def main():
         )
         wandb.define_metric("iter")
         wandb.define_metric("train/*", step_metric="iter")
-        wandb.define_metric("val/*", step_metric="iter")
-        wandb.define_metric("lr", step_metric="iter")
+        wandb.define_metric("val/*",   step_metric="iter")
+        wandb.define_metric("test/*",  step_metric="iter")
+        wandb.define_metric("overfit/*", step_metric="iter")
+        wandb.define_metric("lr",      step_metric="iter")
     elif args.wandb_project is not None:
         print("[WARN] wandb not installed — W&B logging disabled.")
 
@@ -460,27 +464,37 @@ def main():
                 scheduler.step()
 
                 # Logging and evaluation
-                if iteration % 10 == 0 or iteration == args.n_iters - 1:
+                if iteration % args.log_interval == 0 or iteration == args.n_iters - 1:
+                    train_loss_eval, train_acc, train_prec, train_rec, train_f1 = evaluate(
+                        model, train_loader, criterion, device)
                     val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(
                         model, val_loader, criterion, device)
                     current_lr = optimizer.param_groups[0]['lr']
                     avg_train_loss = accum_loss / args.grad_accum
                     print(f"[iter {iteration:4d}] "
                           f"train_loss={avg_train_loss:.4f}  "
+                          f"train_f1={train_f1:.3f}  "
                           f"val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%  "
                           f"prec={val_prec:.3f}  rec={val_rec:.3f}  f1={val_f1:.3f}  "
+                          f"overfit_gap={train_f1 - val_f1:+.3f}  "
                           f"lr={current_lr:.2e}")
 
                     if use_wandb:
                         wandb.log({
-                            'iter':           iteration,
-                            'train/loss':     avg_train_loss,
-                            'val/loss':       val_loss,
-                            'val/acc':        val_acc,
-                            'val/precision':  val_prec,
-                            'val/recall':     val_rec,
-                            'val/f1':         val_f1,
-                            'lr':             current_lr,
+                            'iter':             iteration,
+                            'train/loss':       avg_train_loss,
+                            'train/acc':        train_acc,
+                            'train/precision':  train_prec,
+                            'train/recall':     train_rec,
+                            'train/f1':         train_f1,
+                            'val/loss':         val_loss,
+                            'val/acc':          val_acc,
+                            'val/precision':    val_prec,
+                            'val/recall':       val_rec,
+                            'val/f1':           val_f1,
+                            'overfit/f1_gap':   train_f1 - val_f1,
+                            'overfit/loss_gap': val_loss - avg_train_loss,
+                            'lr':               current_lr,
                         }, step=iteration)
 
                     if val_f1 > best_val_f1:
