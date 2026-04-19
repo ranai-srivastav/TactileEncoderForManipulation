@@ -79,14 +79,15 @@ MBTGraspStability(
     max_timesteps=20,    # L
     num_bottlenecks=4,   # Nb (paper default)
     fusion_layer=8,      # Lf: unimodal 0..7, fusion 8..11 (paper default)
-    max_visual_frames=8, # subsample T*F1 frames to this many for ViT
+    max_visual_frames=8, # fixed; not exposed as CLI flag
     adapter_dim=64,      # AdaptFormer hidden dim; 0 = no adapter
     dropout=0.1,
-    freeze_vit=True,
+    freeze_rgb=True,     # --no_freeze_vit to unfreeze
+    freeze_t3=True,      # --no_freeze_t3 to unfreeze
     modalities=None,     # set of {'V','T','FT','G','GF'}; None = all
     num_classes=1,
     pretrained_dir=None, # defaults to /ocean/projects/cis260031p/shared/pretrained
-    t3_encoder_domain='gs_black',  # or 'gs_tag'
+    t3_encoder_domain='gs_black',  # fixed; not exposed as CLI flag
 )
 ```
 
@@ -132,9 +133,9 @@ gripper_force: (B, 1)
 --dropout            default 0.1
 --num_bottlenecks    default 4
 --fusion_layer       Lf (default 8)
---max_visual_frames  default 8
 --adapter_dim        AdaptFormer dim (default 64)
---t3_encoder_domain  gs_black | gs_tag (default gs_black)
+--freeze_vit         freeze ViT-Base/16 RGB backbone (default True); --no_freeze_vit to unfreeze
+--freeze_t3          freeze T3-large tactile backbone (default True); --no_freeze_t3 to unfreeze
 --pretrained_dir     T3 weights dir (default shared/pretrained)
 --n_iters            default 600
 --anneal_iter        cosine decay start (default 300; set > n_iters to disable)

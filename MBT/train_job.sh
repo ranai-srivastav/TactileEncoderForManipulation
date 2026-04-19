@@ -16,7 +16,6 @@ python MBT/mbt_train.py \
   --split object \
   --n_test_objects 5 \
   --modalities V T FT G GF \
-  --t3_encoder_domain gs_black \
   --pretrained_dir /ocean/projects/cis260031p/shared/pretrained \
   --adapter_dim 256 \
   --num_bottlenecks 8 \

@@ -129,16 +129,12 @@ def parse_args():
                    help='B bottleneck latent tokens (paper default: 4)')
     p.add_argument('--fusion_layer',      type=int,   default=8,
                    help='Lf: unimodal for layers 0..Lf-1, bottleneck fusion for Lf..11 (paper default: 8)')
-    p.add_argument('--max_visual_frames', type=int,   default=8,
-                   help='Frames subsampled from T*F1 for ViT tokenisation (default: 8, matches paper)')
     p.add_argument('--adapter_dim',       type=int,   default=64,
                    help='AdaptFormer hidden dim; 0 = frozen backbone only')
     p.add_argument('--freeze_vit', action=argparse.BooleanOptionalAction, default=True,
                    help='Freeze ViT-Base/16 RGB backbone (default: frozen). Use --no_freeze_vit to unfreeze.')
     p.add_argument('--freeze_t3',  action=argparse.BooleanOptionalAction, default=True,
                    help='Freeze T3-large tactile backbone (default: frozen). Use --no_freeze_t3 to unfreeze.')
-    p.add_argument('--t3_encoder_domain', type=str,   default='gs_black',
-                   help='T3 sensor-specific encoder domain (gs_black | gs_tag)')
     p.add_argument('--pretrained_dir',    type=str,
                    default='/ocean/projects/cis260031p/shared/pretrained',
                    help='Directory containing T3 pretrained weights')
@@ -345,14 +341,12 @@ def main():
         max_timesteps=args.L,
         num_bottlenecks=args.num_bottlenecks,
         fusion_layer=args.fusion_layer,
-        max_visual_frames=args.max_visual_frames,
         adapter_dim=args.adapter_dim,
         dropout=args.dropout,
         freeze_rgb=args.freeze_vit,
         freeze_t3=args.freeze_t3,
         modalities=args.modalities,
         pretrained_dir=args.pretrained_dir,
-        t3_encoder_domain=args.t3_encoder_domain,
     ).to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -364,12 +358,12 @@ def main():
         'F1': args.F1, 'F2': args.F2, 'L': args.L,
         'num_bottlenecks': args.num_bottlenecks,
         'fusion_layer': args.fusion_layer,
-        'max_visual_frames': args.max_visual_frames,
+        'max_visual_frames': 8,
         'adapter_dim': args.adapter_dim,
         'dropout': args.dropout,
         'modalities': list(args.modalities),
         'pretrained_dir': args.pretrained_dir,
-        't3_encoder_domain': args.t3_encoder_domain,
+        't3_encoder_domain': 'gs_black',
         'run_name': wandb.run.name if use_wandb else args.wandb_run,
     }
 
