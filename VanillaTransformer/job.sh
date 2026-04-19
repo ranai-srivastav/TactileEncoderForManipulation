@@ -14,7 +14,7 @@ mkdir -p logs
 module load anaconda3
 conda activate /ocean/projects/cis260031p/shared/temu_conda
 
-cd /ocean/projects/cis260031p/afadia/TEMURepoVanillaTransformer/
+cd /ocean/projects/cis260031p/afadia/TEMURepoVanillaTransformerNew/
 
 export WANDB_DIR="${PWD}/wandb"
 export WANDB_DATA_DIR="${PWD}/wandb_data"
@@ -31,7 +31,7 @@ mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR" "$WANDB_ARTIFACT_DIR"
 python VanillaTransformer/transformer-train.py \
   --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
   --split object \
-  --test_object_ids 1 3 5 \
+  --n_test_objects 5 \
   --batch_size 16 \
   --num_workers 4 \
   --FRGB 2 \
