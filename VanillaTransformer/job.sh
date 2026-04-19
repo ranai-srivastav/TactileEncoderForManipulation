@@ -31,7 +31,7 @@ mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR" "$WANDB_ARTIFACT_DIR"
 python VanillaTransformer/transformer-train.py \
   --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
   --split object \
-  --test_object_ids 1 \
+  --test_object_ids 1 3 5 \
   --batch_size 16 \
   --num_workers 4 \
   --FRGB 2 \
@@ -45,7 +45,7 @@ python VanillaTransformer/transformer-train.py \
   --num_heads 8 \
   --mlp_ratio 4.0 \
   --dropout 0.1 \
-  --modalities V T FT \
+  --modalities V T \
   --lr 1e-4 \
   --weight_decay 0.01 \
   --epochs 32 \
