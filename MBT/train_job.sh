@@ -20,14 +20,15 @@ python MBT/mbt_train.py \
   --adapter_dim 256 \
   --num_bottlenecks 8 \
   --fusion_layer 8 \
-  --n_iters 3000 \
+  --n_iters 2000 \
   --anneal_iter 1000 \
   --batch_size 4 \
   --grad_accum 8 \
-  --lr 1e-4 \
+  --lr 5e-4 \
   --weight_decay 0.01 \
-  --dropout 0.1 \
-  --wandb_run "train_0.5sig" \
+  --dropout 0.25 \
+  --wandb_run "train_mbt_ftVT" \
+  --log_interval 50 \
   --model_save_path "trained_models/train_0.5sig/best_mbt_model.pt" \
   --L 9 \
   --seed 42 
