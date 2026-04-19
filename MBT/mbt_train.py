@@ -133,6 +133,10 @@ def parse_args():
                    help='Frames subsampled from T*F1 for ViT tokenisation (default: 8, matches paper)')
     p.add_argument('--adapter_dim',       type=int,   default=64,
                    help='AdaptFormer hidden dim; 0 = frozen backbone only')
+    p.add_argument('--freeze_vit', action=argparse.BooleanOptionalAction, default=True,
+                   help='Freeze ViT-Base/16 RGB backbone (default: frozen). Use --no_freeze_vit to unfreeze.')
+    p.add_argument('--freeze_t3',  action=argparse.BooleanOptionalAction, default=True,
+                   help='Freeze T3-large tactile backbone (default: frozen). Use --no_freeze_t3 to unfreeze.')
     p.add_argument('--t3_encoder_domain', type=str,   default='gs_black',
                    help='T3 sensor-specific encoder domain (gs_black | gs_tag)')
     p.add_argument('--pretrained_dir',    type=str,
@@ -340,6 +344,8 @@ def main():
         max_visual_frames=args.max_visual_frames,
         adapter_dim=args.adapter_dim,
         dropout=args.dropout,
+        freeze_rgb=args.freeze_vit,
+        freeze_t3=args.freeze_t3,
         modalities=args.modalities,
         pretrained_dir=args.pretrained_dir,
         t3_encoder_domain=args.t3_encoder_domain,
@@ -365,22 +371,43 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # Differential learning rates
-    slow_params   = []
-    other_params  = []
+    # Differential learning rates:
+    #   backbone_params — unfrozen T3 / ViT-Base pretrained weights → lr × 0.01
+    #   slow_params     — adapters + tactile fusion blocks           → lr × 0.1
+    #   other_params    — projections, heads, bottleneck, etc.       → lr × 1
+    backbone_params = []
+    slow_params     = []
+    other_params    = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        is_adapter       = any(k in name for k in ['_down.', '_up.', '_scale', '.down.', '.up.', '.scale'])
-        is_tac_fusion    = name.startswith('fusion_blocks.') and '.streams.T.' in name
-        if is_adapter or is_tac_fusion:
+        is_adapter    = '.adapter.' in name
+        is_tac_fusion = name.startswith('fusion_blocks.') and '.streams.T.' in name
+
+        is_t3_backbone = (not args.freeze_t3) and (
+            name.startswith('tac_patch_embed.')
+            or name.startswith('tac_unimodal.')
+            or name in ('tac_cls_token', 'tac_spatial_pos')
+        )
+        is_rgb_backbone = (not args.freeze_vit) and (
+            name.startswith('rgb_patch_embed.')
+            or name.startswith('norms.V.')
+            or name in ('rgb_cls_token', 'rgb_spatial_pos')
+            or (name.startswith('rgb_unimodal.') and not is_adapter)
+            or (name.startswith('fusion_blocks.') and '.streams.V.' in name and not is_adapter)
+        )
+
+        if is_t3_backbone or is_rgb_backbone:
+            backbone_params.append(param)
+        elif is_adapter or is_tac_fusion:
             slow_params.append(param)
         else:
             other_params.append(param)
 
     optimizer = torch.optim.AdamW([
-        {'params': other_params,   'lr': args.lr},
-        {'params': slow_params,    'lr': args.lr * 0.1},
+        {'params': other_params,    'lr': args.lr},
+        {'params': slow_params,     'lr': args.lr * 0.1},
+        {'params': backbone_params, 'lr': args.lr * 0.01},
     ], weight_decay=args.weight_decay)
 
     # Cosine annealing: constant LR until anneal_iter, then cosine decay to 0

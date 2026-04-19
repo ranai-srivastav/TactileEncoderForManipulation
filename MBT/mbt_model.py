@@ -152,7 +152,8 @@ class MBTGraspStability(nn.Module):
         max_visual_frames: int   = 8,
         adapter_dim:       int   = 64,
         dropout:           float = 0.1,
-        freeze_vit:        bool  = True,
+        freeze_rgb:        bool  = True,
+        freeze_t3:         bool  = True,
         modalities                = None,
         num_classes:       int   = 1,
         pretrained_dir:    str   = None,
@@ -177,7 +178,7 @@ class MBTGraspStability(nn.Module):
         # ── RGB backbone: ViT-Base/16 ────────────────────────────────────────
         vit_rgb = timm.create_model('vit_base_patch16_224', pretrained=True) # TODO replace with pre-trained CLiP?
         vit_rgb.head = nn.Identity()
-        if freeze_vit:
+        if freeze_rgb:
             for p in vit_rgb.parameters():
                 p.requires_grad = False
 
@@ -195,7 +196,7 @@ class MBTGraspStability(nn.Module):
         t3 = T3TactileEncoder(
             pretrained_dir=pretrained_dir,
             encoder_domain=t3_encoder_domain,
-            freeze=freeze_vit,
+            freeze=freeze_t3,
         )
         t3_dim        = t3.embed_dim
         all_t3_blocks = list(t3.encoder.blocks) + list(t3.trunk.blocks)
