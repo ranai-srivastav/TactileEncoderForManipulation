@@ -13,23 +13,31 @@ set -euo pipefail
 
 mkdir -p logs
 
-module load anaconda3/2022.10
+module load anaconda3
 conda activate /ocean/projects/cis260031p/shared/temu_conda
 
-cd /ocean/projects/cis260031p/mlee12/TactileEncoderForManipulation
+cd /ocean/projects/cis260031p/afadia/TEMURepoVanillaTransformer/
+
+export WANDB_DIR="${PWD}/wandb"
+export WANDB_DATA_DIR="${PWD}/wandb_data"
+export WANDB_CACHE_DIR="${PWD}/wandb_cache"
+export WANDB_ARTIFACT_DIR="${PWD}/wandb_artifacts"
+mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR" "$WANDB_ARTIFACT_DIR" trained_models
 
 # To resume from W&B, add:
 #   --resume_wandb_artifact entity/project/artifact-name:latest
 # For fast smoke tests, add:
 #   --debug_max_episodes_per_object 1
+# Increase this to upload latest checkpoints less often:
+#   --wandb_checkpoint_interval 5
 python VanillaTransformer/transformer-train.py \
   --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
   --split object \
   --test_object_ids 1 \
-  --batch_size 1 \
+  --batch_size 16 \
   --num_workers 4 \
   --FRGB 2 \
-  --FTactile 8 \
+  --FTactile 4 \
   --FFT 8 \
   --FGripper 1 \
   --L 0 \
@@ -39,11 +47,12 @@ python VanillaTransformer/transformer-train.py \
   --num_heads 8 \
   --mlp_ratio 4.0 \
   --dropout 0.1 \
-  --modalities V T FT G \
+  --modalities V T FT \
   --lr 1e-4 \
   --weight_decay 0.01 \
-  --epochs 20 \
+  --epochs 32 \
   --model_save_path trained_models/vanilla_transformer_best.pt \
+  --wandb_checkpoint_interval 1 \
   --wandb_project TEMU \
-  --wandb_run vanilla-transformer \
+  --wandb_run vanilla-transformer-v5 \
   --wandb_entity mrsd-smores

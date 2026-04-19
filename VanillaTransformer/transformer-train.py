@@ -82,6 +82,7 @@ def parse_args():
     p.add_argument("--model_save_path", default="trained_models/best_vanilla_transformer.pt")
     p.add_argument("--resume_path", default=None)
     p.add_argument("--resume_wandb_artifact", default=None)
+    p.add_argument("--wandb_checkpoint_interval", type=int, default=1)
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_run", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
@@ -606,7 +607,11 @@ def main():
             if use_wandb:
                 log_wandb_checkpoint(args.model_save_path, "best", epoch, best_val_f1, args)
         save_checkpoint(latest_path, model, optimizer, epoch, best_val_f1, args, train_generator)
-        if use_wandb:
+        should_log_latest = (
+            args.wandb_checkpoint_interval > 0
+            and (epoch + 1) % args.wandb_checkpoint_interval == 0
+        )
+        if use_wandb and should_log_latest:
             log_wandb_checkpoint(latest_path, "latest", epoch, best_val_f1, args)
 
     print("\nLoading best checkpoint for test evaluation...")
