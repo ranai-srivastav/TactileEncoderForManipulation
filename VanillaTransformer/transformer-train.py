@@ -65,7 +65,7 @@ def parse_args():
     p.add_argument("--FGripper", type=int, default=1)
     p.add_argument("--L", type=int, default=20)
     p.add_argument("--overfit", action="store_true")
-    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--hidden_dim", type=int, default=768)
     p.add_argument("--depth", type=int, default=4)
     p.add_argument("--num_heads", type=int, default=8)
@@ -76,6 +76,8 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--model_save_path", default="trained_models/best_vanilla_transformer.pt")
+    p.add_argument("--resume_path", default=None)
+    p.add_argument("--resume_wandb_artifact", default=None)
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_run", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
@@ -90,6 +92,38 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def get_rng_state(train_generator):
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "train_generator": train_generator.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def set_rng_state(state, train_generator):
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    train_generator.set_state(state["train_generator"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def optimizer_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
 
 
 def make_split(dataset, args):
@@ -120,8 +154,21 @@ def make_split(dataset, args):
     return uniform_random_split(dataset)
 
 
-def make_loader(subset, batch_size, num_workers, shuffle=False):
-    return DataLoader(subset, batch_size=batch_size, num_workers=num_workers, shuffle=shuffle)
+def make_loader(subset, batch_size, num_workers, shuffle=False, generator=None):
+    return DataLoader(
+        subset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=shuffle,
+        generator=generator,
+        worker_init_fn=seed_worker if generator is not None else None,
+    )
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def batch_to_device(batch, device):
@@ -194,8 +241,99 @@ def wandb_confusion_matrix(metrics):
     )
 
 
+def save_checkpoint(pathname, model, optimizer, epoch, best_val_f1, args, train_generator):
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_val_f1": best_val_f1,
+        "args": vars(args),
+        "rng_state": get_rng_state(train_generator),
+    }, pathname)
+
+
+def wandb_artifact_ref(args):
+    ref = args.resume_wandb_artifact
+    if ref is None:
+        return None
+    if "/" in ref:
+        return ref
+    if args.wandb_project is None:
+        raise ValueError("--resume_wandb_artifact without a full entity/project/name:alias ref requires --wandb_project")
+    if args.wandb_entity is not None:
+        return f"{args.wandb_entity}/{args.wandb_project}/{ref}"
+    return f"{args.wandb_project}/{ref}"
+
+
+def download_wandb_checkpoint(args):
+    ref = wandb_artifact_ref(args)
+    if ref is None:
+        return None
+    if not _WANDB_AVAILABLE:
+        raise ImportError("wandb is required for --resume_wandb_artifact")
+
+    artifact = wandb.Api().artifact(ref, type="model")
+    download_root = path.join(path.dirname(args.model_save_path) or ".", "wandb_artifacts")
+    artifact_dir = artifact.download(root=download_root)
+    checkpoint_path = path.join(artifact_dir, "checkpoint.pt")
+    if path.exists(checkpoint_path):
+        return checkpoint_path
+    for filename in os.listdir(artifact_dir):
+        if filename.endswith(".pt"):
+            return path.join(artifact_dir, filename)
+    raise FileNotFoundError(f"No .pt checkpoint found in W&B artifact {ref}")
+
+
+def apply_checkpoint_config(args, ckpt_args):
+    if not ckpt_args:
+        return args
+    current = vars(args)
+    keep_current = {
+        "root_dir",
+        "model_save_path",
+        "resume_path",
+        "resume_wandb_artifact",
+        "wandb_project",
+        "wandb_run",
+        "wandb_entity",
+    }
+    for key, value in ckpt_args.items():
+        if key in current and key not in keep_current:
+            setattr(args, key, value)
+    return args
+
+
+def log_wandb_checkpoint(pathname, kind, epoch, best_val_f1, args):
+    artifact = wandb.Artifact(
+        name=f"{wandb.run.id}-{kind}",
+        type="model",
+        metadata={"epoch": epoch, "best_val_f1": best_val_f1, "config": vars(args)},
+    )
+    artifact.add_file(pathname, name="checkpoint.pt")
+    aliases = [kind, f"epoch-{epoch + 1}", "latest"]
+    wandb.log_artifact(artifact, aliases=aliases)
+
+
+def load_checkpoint(pathname, map_location):
+    try:
+        return torch.load(pathname, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(pathname, map_location=map_location)
+
+
 def main():
     args = parse_args()
+
+    resume_checkpoint = None
+    resume_path = args.resume_path
+    if args.resume_wandb_artifact is not None:
+        resume_path = download_wandb_checkpoint(args)
+        print(f"Downloaded W&B checkpoint to {resume_path}")
+    if resume_path is not None:
+        resume_checkpoint = load_checkpoint(resume_path, map_location="cpu")
+        args = apply_checkpoint_config(args, resume_checkpoint.get("args"))
+        print("Loaded training config from checkpoint")
+
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -208,6 +346,9 @@ def main():
             entity=args.wandb_entity,
             config=vars(args),
         )
+        wandb.config.update(vars(args), allow_val_change=True)
+        print(f"W&B latest checkpoint artifact: {'/'.join(wandb.run.path[:2])}/{wandb.run.id}-latest:latest")
+        print(f"W&B best checkpoint artifact:   {'/'.join(wandb.run.path[:2])}/{wandb.run.id}-best:best")
     elif args.wandb_project is not None:
         print("[WARN] wandb not installed — W&B logging disabled.")
 
@@ -270,7 +411,17 @@ def main():
 
     print_split_stats(dataset, train_set, val_set, test_set)
 
-    train_loader = make_loader(train_set, args.batch_size, args.num_workers, shuffle=True)
+    train_generator = torch.Generator()
+    if args.seed is not None:
+        train_generator.manual_seed(args.seed)
+
+    train_loader = make_loader(
+        train_set,
+        args.batch_size,
+        args.num_workers,
+        shuffle=True,
+        generator=train_generator,
+    )
     val_loader = make_loader(val_set, args.batch_size, args.num_workers)
     test_loader = make_loader(test_set, args.batch_size, args.num_workers)
 
@@ -295,10 +446,21 @@ def main():
 
     save_dir = path.dirname(args.model_save_path) or "."
     path.isdir(save_dir) or os.makedirs(save_dir, exist_ok=True)
+    latest_path = path.join(save_dir, "vanilla_transformer_latest.pt")
     best_val_f1 = -1.0
-    train_iter = iter(train_loader)
+    start_epoch = 0
 
-    for epoch in range(args.epochs):
+    if resume_checkpoint is not None:
+        ckpt = resume_checkpoint
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        optimizer_to_device(optimizer, device)
+        set_rng_state(ckpt.get("rng_state"), train_generator)
+        start_epoch = ckpt["epoch"] + 1
+        best_val_f1 = ckpt.get("best_val_f1", -1.0)
+        print(f"Resumed from {resume_path} at epoch {start_epoch}")
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         train_loss_sum = 0.0
         train_count = 0
@@ -359,10 +521,16 @@ def main():
             })
         if val_metrics["f1"] > best_val_f1:
             best_val_f1 = val_metrics["f1"]
-            torch.save(model.state_dict(), args.model_save_path)
+            save_checkpoint(args.model_save_path, model, optimizer, epoch, best_val_f1, args, train_generator)
+            if use_wandb:
+                log_wandb_checkpoint(args.model_save_path, "best", epoch, best_val_f1, args)
+        save_checkpoint(latest_path, model, optimizer, epoch, best_val_f1, args, train_generator)
+        if use_wandb:
+            log_wandb_checkpoint(latest_path, "latest", epoch, best_val_f1, args)
 
     print("\nLoading best checkpoint for test evaluation...")
-    model.load_state_dict(torch.load(args.model_save_path, map_location=device))
+    best_ckpt = load_checkpoint(args.model_save_path, map_location=device)
+    model.load_state_dict(best_ckpt["model"])
     test_metrics = evaluate(model, test_loader, criterion, device)
     print(
         f"Test loss={test_metrics['loss']:.4f}  "

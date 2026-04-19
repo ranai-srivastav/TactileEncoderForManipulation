@@ -18,6 +18,8 @@ conda activate /ocean/projects/cis260031p/shared/temu_conda
 
 cd /ocean/projects/cis260031p/mlee12/TactileEncoderForManipulation
 
+# To resume from W&B, add:
+#   --resume_wandb_artifact entity/project/artifact-name:latest
 python VanillaTransformer/transformer-train.py \
   --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
   --split object \
@@ -29,7 +31,6 @@ python VanillaTransformer/transformer-train.py \
   --FFT 8 \
   --FGripper 1 \
   --L 0 \
-  --subsample 1.0 \
   --seed 42 \
   --hidden_dim 768 \
   --depth 4 \
