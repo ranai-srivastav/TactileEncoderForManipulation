@@ -174,7 +174,16 @@ class VanillaTransformer(nn.Module):
         x = self.gripper_proj(gripper)
         return x.reshape(b, t * fgripper, -1)
 
-    def encode_modalities(self, tactile, rgb, ft, gripper) -> dict[str, torch.Tensor]:
+    def _token_mask_for_rate(
+        self,
+        timestep_mask: torch.Tensor | None,
+        samples_per_second: int,
+    ) -> torch.Tensor | None:
+        if timestep_mask is None:
+            return None
+        return timestep_mask.repeat_interleave(samples_per_second, dim=1)
+
+    def encode_modalities(self, tactile, rgb, ft, gripper, timestep_mask=None) -> dict[str, torch.Tensor]:
         outputs = {}
         b, t = tactile.shape[:2]
         device = tactile.device
@@ -184,28 +193,32 @@ class VanillaTransformer(nn.Module):
             rgb_positions = self._positions_for_rate(t, rgb.shape[2], device)
             outputs["rgb_tokens"] = self._add_time_and_modality(rgb_tokens, rgb_positions, "V")
             outputs["rgb_positions"] = rgb_positions
+            outputs["rgb_mask"] = self._token_mask_for_rate(timestep_mask, rgb.shape[2])
 
         if "T" in self.modalities:
             tactile_tokens = self.encode_tactile(tactile)
             tactile_positions = self._positions_for_rate(t, tactile.shape[2], device)
             outputs["tactile_tokens"] = self._add_time_and_modality(tactile_tokens, tactile_positions, "T")
             outputs["tactile_positions"] = tactile_positions
+            outputs["tactile_mask"] = self._token_mask_for_rate(timestep_mask, tactile.shape[2])
 
         if "FT" in self.modalities:
             ft_tokens = self.encode_ft(ft)
             ft_positions = self._positions_for_rate(t, ft.shape[2], device)
             outputs["ft_tokens"] = self._add_time_and_modality(ft_tokens, ft_positions, "FT")
             outputs["ft_positions"] = ft_positions
+            outputs["ft_mask"] = self._token_mask_for_rate(timestep_mask, ft.shape[2])
 
         if "G" in self.modalities:
             gripper_tokens = self.encode_gripper(gripper)
             gripper_positions = self._positions_for_rate(t, gripper.shape[2], device)
             outputs["gripper_tokens"] = self._add_time_and_modality(gripper_tokens, gripper_positions, "G")
             outputs["gripper_positions"] = gripper_positions
+            outputs["gripper_mask"] = self._token_mask_for_rate(timestep_mask, gripper.shape[2])
 
         return outputs
 
-    def build_sequence(self, encoded: dict[str, torch.Tensor]) -> torch.Tensor:
+    def build_sequence(self, encoded: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor | None]:
         token_keys = ("rgb_tokens", "tactile_tokens", "ft_tokens", "gripper_tokens")
         active_tokens = [encoded[k] for k in token_keys if k in encoded]
         if not active_tokens:
@@ -226,28 +239,56 @@ class VanillaTransformer(nn.Module):
             "ft_tokens": "ft_positions",
             "gripper_tokens": "gripper_positions",
         }
+        mask_keys = {
+            "rgb_tokens": "rgb_mask",
+            "tactile_tokens": "tactile_mask",
+            "ft_tokens": "ft_mask",
+            "gripper_tokens": "gripper_mask",
+        }
+        masks = []
         for key in token_keys:
             if key in encoded:
                 pieces.append(encoded[key])
                 positions.append(encoded[position_keys[key]] + offsets[key])
+                masks.append(encoded.get(mask_keys[key]))
 
         sequence = torch.cat(pieces, dim=1)
         all_positions = torch.cat(positions, dim=0)
         order = torch.argsort(all_positions)
         sequence = sequence[:, order]
         cls = self.cls_token.expand(batch_size, -1, -1)
-        return torch.cat([cls, sequence], dim=1)
+        sequence = torch.cat([cls, sequence], dim=1)
 
-    def forward(self, tactile, rgb, ft, gripper, gripper_force=None, return_debug: bool = False):
-        encoded = self.encode_modalities(tactile, rgb, ft, gripper)
-        sequence = self.build_sequence(encoded)
-        hidden = self.transformer(sequence)
+        padding_mask = None
+        if any(mask is not None for mask in masks):
+            valid_mask = torch.cat(masks, dim=1)[:, order]
+            cls_valid = torch.ones(batch_size, 1, device=valid_mask.device, dtype=torch.bool)
+            valid_mask = torch.cat([cls_valid, valid_mask], dim=1)
+            padding_mask = ~valid_mask
+
+        return sequence, padding_mask
+
+    def forward(
+        self,
+        tactile,
+        rgb,
+        ft,
+        gripper,
+        gripper_force=None,
+        timestep_mask=None,
+        return_debug: bool = False,
+    ):
+        encoded = self.encode_modalities(tactile, rgb, ft, gripper, timestep_mask=timestep_mask)
+        sequence, padding_mask = self.build_sequence(encoded)
+        hidden = self.transformer(sequence, src_key_padding_mask=padding_mask)
         cls = self.norm(hidden[:, 0])
         logits = self.head(cls)
 
         if return_debug:
             debug = {k: v for k, v in encoded.items() if k.endswith("_tokens")}
             debug["sequence_tokens"] = sequence
+            if padding_mask is not None:
+                debug["padding_mask"] = padding_mask
             debug["cls_embedding"] = cls
             return logits, debug
         return logits

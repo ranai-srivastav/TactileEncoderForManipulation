@@ -1,8 +1,10 @@
 import argparse
 import os
 import random
+import re
 import sys
 from os import path
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -65,6 +67,8 @@ def parse_args():
     p.add_argument("--FGripper", type=int, default=1)
     p.add_argument("--L", type=int, default=20)
     p.add_argument("--overfit", action="store_true")
+    p.add_argument("--debug_max_episodes", type=int, default=None)
+    p.add_argument("--debug_max_episodes_per_object", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--hidden_dim", type=int, default=768)
     p.add_argument("--depth", type=int, default=4)
@@ -82,6 +86,39 @@ def parse_args():
     p.add_argument("--wandb_run", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
     return p.parse_args()
+
+
+def object_from_episode_dir(episode_dir):
+    match = re.match(r"^(.+)_(\d+)_F(\d+)_pose(\d+)$", episode_dir.name)
+    return match.group(1) if match else None
+
+
+def select_debug_sample_dirs(root_dir, max_episodes=None, max_episodes_per_object=None):
+    if max_episodes is None and max_episodes_per_object is None:
+        return None
+
+    selected = []
+    per_object = {}
+    for episode_dir in sorted(Path(root_dir).iterdir()):
+        if not episode_dir.is_dir():
+            continue
+        obj = object_from_episode_dir(episode_dir)
+        if obj is None:
+            continue
+        if max_episodes_per_object is not None:
+            count = per_object.get(obj, 0)
+            if count >= max_episodes_per_object:
+                continue
+            per_object[obj] = count + 1
+        selected.append(str(episode_dir))
+        if max_episodes is not None and len(selected) >= max_episodes:
+            break
+
+    print(
+        f"[DEBUG] Loading only {len(selected)} episode dirs "
+        f"(max_episodes={max_episodes}, max_episodes_per_object={max_episodes_per_object})"
+    )
+    return selected
 
 
 def set_seed(seed):
@@ -162,6 +199,7 @@ def make_loader(subset, batch_size, num_workers, shuffle=False, generator=None):
         shuffle=shuffle,
         generator=generator,
         worker_init_fn=seed_worker if generator is not None else None,
+        collate_fn=pad_collate,
     )
 
 
@@ -171,8 +209,45 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
 
 
+def _pad_time(tensor, max_timesteps):
+    if tensor.shape[0] == max_timesteps:
+        return tensor
+    padded = tensor.new_zeros((max_timesteps, *tensor.shape[1:]))
+    padded[: tensor.shape[0]] = tensor
+    return padded
+
+
+def pad_collate(batch):
+    timesteps = [sample[0].shape[0] for sample in batch]
+    max_timesteps = max(timesteps)
+    timestep_mask = torch.zeros(len(batch), max_timesteps, dtype=torch.bool)
+
+    tactile, rgb, ft, grip, gf, label, pose_label = [], [], [], [], [], [], []
+    for i, sample in enumerate(batch):
+        tac_i, rgb_i, ft_i, grip_i, gf_i, label_i, pose_label_i = sample
+        timestep_mask[i, : timesteps[i]] = True
+        tactile.append(_pad_time(tac_i, max_timesteps))
+        rgb.append(_pad_time(rgb_i, max_timesteps))
+        ft.append(_pad_time(ft_i, max_timesteps))
+        grip.append(_pad_time(grip_i, max_timesteps))
+        gf.append(gf_i)
+        label.append(label_i)
+        pose_label.append(pose_label_i)
+
+    return (
+        torch.stack(tactile, dim=0),
+        torch.stack(rgb, dim=0),
+        torch.stack(ft, dim=0),
+        torch.stack(grip, dim=0),
+        torch.stack(gf, dim=0),
+        torch.stack(label, dim=0),
+        torch.stack(pose_label, dim=0),
+        timestep_mask,
+    )
+
+
 def batch_to_device(batch, device):
-    tac, rgb, ft, grip, gf, label, pose_label = batch
+    tac, rgb, ft, grip, gf, label, pose_label, timestep_mask = batch
     return (
         tac.to(device),
         rgb.to(device),
@@ -181,6 +256,7 @@ def batch_to_device(batch, device):
         gf.to(device),
         label.to(device),
         pose_label.to(device),
+        timestep_mask.to(device),
     )
 
 
@@ -193,8 +269,8 @@ def evaluate(model, loader, criterion, device):
     y_pred = []
 
     for batch in loader:
-        tac, rgb, ft, grip, gf, label, _ = batch_to_device(batch, device)
-        logits = model(tac, rgb, ft, grip, gf).squeeze(-1)
+        tac, rgb, ft, grip, gf, label, _, timestep_mask = batch_to_device(batch, device)
+        logits = model(tac, rgb, ft, grip, gf, timestep_mask=timestep_mask).squeeze(-1)
         total_loss += criterion(logits, label.float()).item() * len(label)
 
         preds = logits > 0
@@ -359,7 +435,12 @@ def main():
     _dl.FGripper = args.FGripper
     _dl.refresh_sampling_dims()
 
-    dataset = PoseItDataset(root_dir=args.root_dir)
+    sample_dirs = select_debug_sample_dirs(
+        args.root_dir,
+        max_episodes=args.debug_max_episodes,
+        max_episodes_per_object=args.debug_max_episodes_per_object,
+    )
+    dataset = PoseItDataset(root_dir=args.root_dir) if sample_dirs is None else PoseItDataset(sample_dirs=sample_dirs)
     if len(dataset) == 0:
         raise ValueError(f"No samples found in {args.root_dir}")
 
@@ -466,8 +547,8 @@ def main():
         train_count = 0
 
         for batch in train_loader:
-            tac, rgb, ft, grip, gf, label, _ = batch_to_device(batch, device)
-            logits = model(tac, rgb, ft, grip, gf).squeeze(-1)
+            tac, rgb, ft, grip, gf, label, _, timestep_mask = batch_to_device(batch, device)
+            logits = model(tac, rgb, ft, grip, gf, timestep_mask=timestep_mask).squeeze(-1)
             loss = criterion(logits, label.float())
 
             optimizer.zero_grad(set_to_none=True)

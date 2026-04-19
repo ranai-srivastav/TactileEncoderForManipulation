@@ -20,6 +20,8 @@ cd /ocean/projects/cis260031p/mlee12/TactileEncoderForManipulation
 
 # To resume from W&B, add:
 #   --resume_wandb_artifact entity/project/artifact-name:latest
+# For fast smoke tests, add:
+#   --debug_max_episodes_per_object 1
 python VanillaTransformer/transformer-train.py \
   --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
   --split object \
