@@ -1,15 +1,13 @@
 #!/bin/bash
 # Example launch script for the vanilla transformer.
-# Edit paths / resources / arguments as needed.
-
-set -euo pipefail
-
 #SBATCH --job-name=vanilla-transformer
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
 #SBATCH --time=8:00:00
 #SBATCH --account=cis260031p
 #SBATCH --output=logs/%x_%j.out
+
+set -euo pipefail
 
 mkdir -p logs
 
