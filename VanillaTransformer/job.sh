@@ -6,7 +6,7 @@ set -euo pipefail
 
 #SBATCH --job-name=vanilla-transformer
 #SBATCH --partition=GPU-shared
-#SBATCH --gres=gpu:v100-32:1
+#SBATCH --gpus=v100-32:1
 #SBATCH --time=8:00:00
 #SBATCH --account=cis260031p
 #SBATCH --output=logs/%x_%j.out
