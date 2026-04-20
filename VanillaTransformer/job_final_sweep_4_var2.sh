@@ -1,0 +1,50 @@
+#!/bin/bash
+# T + FT + GF
+#SBATCH --job-name=vanilla-final-sweep-4
+#SBATCH --partition=GPU-shared
+#SBATCH --gpus=v100-32:1
+#SBATCH --time=8:00:00
+#SBATCH --account=cis260031p
+#SBATCH --output=logs/%x_%j.out
+
+set -euo pipefail
+
+mkdir -p logs
+
+module load anaconda3
+conda activate /ocean/projects/cis260031p/shared/temu_conda
+
+cd /ocean/projects/cis260031p/afadia/TEMURepoVanillaTransformerFinal2/
+
+export WANDB_DIR="${PWD}/wandb"
+export WANDB_DATA_DIR="${PWD}/wandb_data"
+export WANDB_CACHE_DIR="${PWD}/wandb_cache"
+export WANDB_ARTIFACT_DIR="${PWD}/wandb_artifacts"
+mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR" "$WANDB_ARTIFACT_DIR" trained_models
+
+python VanillaTransformer/transformer-train.py \
+  --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
+  --split random \
+  --batch_size 16 \
+  --num_workers 4 \
+  --FRGB 2 \
+  --FTactile 8 \
+  --FFT 8 \
+  --FGripper 1 \
+  --L 0 \
+  --seed 42 \
+  --hidden_dim 768 \
+  --depth 4 \
+  --num_heads 8 \
+  --mlp_ratio 4.0 \
+  --dropout 0.25 \
+  --modalities T FT GF \
+  --lr 1e-4 \
+  --weight_decay 0.01 \
+  --sigma 0.5 \
+  --epochs 128 \
+  --model_save_path trained_models/vanilla_final_sweep_4.2_best.pt \
+  --wandb_checkpoint_interval 1 \
+  --wandb_project TEMU \
+  --wandb_run vanilla-final-sweep-4-2 \
+  --wandb_entity mrsd-smores
