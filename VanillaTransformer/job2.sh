@@ -45,12 +45,12 @@ python VanillaTransformer/transformer-train.py \
   --num_heads 8 \
   --mlp_ratio 4.0 \
   --dropout 0.1 \
-  --modalities T V FT GF G \
+  --modalities T V FT \
   --lr 1e-4 \
   --weight_decay 0.01 \
   --epochs 32 \
   --model_save_path trained_models/vanilla_transformer_best.pt \
   --wandb_checkpoint_interval 1 \
   --wandb_project TEMU \
-  --wandb_run vanilla-transformer-sweep1 \
+  --wandb_run vanilla-transformer-sweep2 \
   --wandb_entity mrsd-smores

@@ -43,12 +43,13 @@ class VanillaTransformer(nn.Module):
     7. Classify from the CLS token
     """
 
-    MODALITY_KEYS = ("V", "T", "FT", "G")
+    MODALITY_KEYS = ("V", "T", "FT", "G", "GF")
     MODALITY_NAMES = {
         "V": "rgb",
         "T": "tactile",
         "FT": "ft",
         "G": "gripper",
+        "GF": "gripper_force",
     }
 
     def __init__(
@@ -85,6 +86,11 @@ class VanillaTransformer(nn.Module):
         )
         self.gripper_proj = nn.Sequential(
             nn.Linear(gripper_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.gf_proj = nn.Sequential(
+            nn.Linear(1, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout),
         )
@@ -174,6 +180,9 @@ class VanillaTransformer(nn.Module):
         x = self.gripper_proj(gripper)
         return x.reshape(b, t * fgripper, -1)
 
+    def encode_gripper_force(self, gripper_force: torch.Tensor) -> torch.Tensor:
+        return self.gf_proj(gripper_force).unsqueeze(1)
+
     def _token_mask_for_rate(
         self,
         timestep_mask: torch.Tensor | None,
@@ -183,7 +192,7 @@ class VanillaTransformer(nn.Module):
             return None
         return timestep_mask.repeat_interleave(samples_per_second, dim=1)
 
-    def encode_modalities(self, tactile, rgb, ft, gripper, timestep_mask=None) -> dict[str, torch.Tensor]:
+    def encode_modalities(self, tactile, rgb, ft, gripper, gripper_force=None, timestep_mask=None) -> dict[str, torch.Tensor]:
         outputs = {}
         b, t = tactile.shape[:2]
         device = tactile.device
@@ -216,10 +225,18 @@ class VanillaTransformer(nn.Module):
             outputs["gripper_positions"] = gripper_positions
             outputs["gripper_mask"] = self._token_mask_for_rate(timestep_mask, gripper.shape[2])
 
+        if "GF" in self.modalities:
+            if gripper_force is None:
+                raise ValueError("GF modality requires gripper_force input.")
+            gf_tokens = self.encode_gripper_force(gripper_force)
+            outputs["gripper_force_tokens"] = gf_tokens + self.modality_embeddings["GF"]
+            outputs["gripper_force_positions"] = torch.tensor([-1.0], device=device)
+            outputs["gripper_force_mask"] = torch.ones(b, 1, device=device, dtype=torch.bool)
+
         return outputs
 
     def build_sequence(self, encoded: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor | None]:
-        token_keys = ("rgb_tokens", "tactile_tokens", "ft_tokens", "gripper_tokens")
+        token_keys = ("rgb_tokens", "tactile_tokens", "ft_tokens", "gripper_tokens", "gripper_force_tokens")
         active_tokens = [encoded[k] for k in token_keys if k in encoded]
         if not active_tokens:
             raise ValueError("No active modalities to build a sequence from.")
@@ -232,18 +249,21 @@ class VanillaTransformer(nn.Module):
             "tactile_tokens": 0.01,
             "ft_tokens": 0.02,
             "gripper_tokens": 0.03,
+            "gripper_force_tokens": 0.00,
         }
         position_keys = {
             "rgb_tokens": "rgb_positions",
             "tactile_tokens": "tactile_positions",
             "ft_tokens": "ft_positions",
             "gripper_tokens": "gripper_positions",
+            "gripper_force_tokens": "gripper_force_positions",
         }
         mask_keys = {
             "rgb_tokens": "rgb_mask",
             "tactile_tokens": "tactile_mask",
             "ft_tokens": "ft_mask",
             "gripper_tokens": "gripper_mask",
+            "gripper_force_tokens": "gripper_force_mask",
         }
         masks = []
         for key in token_keys:
@@ -278,7 +298,14 @@ class VanillaTransformer(nn.Module):
         timestep_mask=None,
         return_debug: bool = False,
     ):
-        encoded = self.encode_modalities(tactile, rgb, ft, gripper, timestep_mask=timestep_mask)
+        encoded = self.encode_modalities(
+            tactile,
+            rgb,
+            ft,
+            gripper,
+            gripper_force=gripper_force,
+            timestep_mask=timestep_mask,
+        )
         sequence, padding_mask = self.build_sequence(encoded)
         hidden = self.transformer(sequence, src_key_padding_mask=padding_mask)
         cls = self.norm(hidden[:, 0])

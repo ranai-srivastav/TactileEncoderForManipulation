@@ -75,7 +75,7 @@ def parse_args():
     p.add_argument("--num_heads", type=int, default=8)
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--modalities", nargs="+", default=["V", "T", "FT", "G"])
+    p.add_argument("--modalities", nargs="+", default=["V", "T", "FT", "G", "GF"])
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=20)
