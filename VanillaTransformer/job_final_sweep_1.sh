@@ -14,7 +14,7 @@ mkdir -p logs
 module load anaconda3
 conda activate /ocean/projects/cis260031p/shared/temu_conda
 
-cd /ocean/projects/cis260031p/afadia/TEMURepoVanillaTransformerFinal/
+cd /ocean/projects/cis260031p/afadia/TEMURepoVanillaTransformerFinal2/
 
 export WANDB_DIR="${PWD}/wandb"
 export WANDB_DATA_DIR="${PWD}/wandb_data"
