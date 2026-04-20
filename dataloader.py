@@ -209,7 +209,13 @@ def _load_image(path: Optional[Path], transform=None) -> torch.Tensor:
     return t(Image.open(path).convert('RGB'))
 
 
-def _build_sample(sample_dir: Path, rgb_transform=None) -> Optional[dict]:
+def _build_sample(
+    sample_dir: Path,
+    rgb_transform=None,
+    active_modalities: Optional[set] = None,
+    image_cache_dtype: torch.dtype = torch.float32,
+) -> Optional[dict]:
+    active_modalities = active_modalities or {'V', 'T', 'FT', 'G', 'GF'}
     meta   = _parse_folder_name(sample_dir.name)
     stages = _read_stages(sample_dir / 'stages.csv')
     labels = _read_labels(sample_dir / 'label.csv')
@@ -258,8 +264,10 @@ def _build_sample(sample_dir: Path, rgb_transform=None) -> Optional[dict]:
         rgb_by_sec.setdefault(ts, []).append(p)
 
     # GelSight baseline: first frame of the first second (always ImageNet transform)
-    baseline_paths = gel_by_sec.get(t_grasp, [])
-    baseline = _load_image(baseline_paths[0] if baseline_paths else None, IMG_TRANSFORM)
+    baseline = None
+    if 'T' in active_modalities:
+        baseline_paths = gel_by_sec.get(t_grasp, [])
+        baseline = _load_image(baseline_paths[0] if baseline_paths else None, IMG_TRANSFORM)
 
     ft_seq      = []
     gr_seq      = []
@@ -268,50 +276,54 @@ def _build_sample(sample_dir: Path, rgb_transform=None) -> Optional[dict]:
 
     for sec in seconds:
         # F/T: all rows with this integer timestamp
-        ft_mask   = ft_ts == sec
-        ft_bucket = ft_val[ft_mask]                             # (k, 6)
-        ft_row = _sample_bucket(ft_bucket, n_cols=FT_READING_DIM, f=FFT)  # (FFT*6,) or None
-        if ft_row is None:
-            print(f"[WARN] {sample_dir.name}: only {len(ft_bucket)} F/T rows "
-                  f"in second {sec}, need FFT={FFT}. Skipping sample.")
-            return None
-        ft_seq.append(ft_row.reshape(FFT, FT_READING_DIM))
+        if 'FT' in active_modalities:
+            ft_mask   = ft_ts == sec
+            ft_bucket = ft_val[ft_mask]                             # (k, 6)
+            ft_row = _sample_bucket(ft_bucket, n_cols=FT_READING_DIM, f=FFT)  # (FFT*6,) or None
+            if ft_row is None:
+                print(f"[WARN] {sample_dir.name}: only {len(ft_bucket)} F/T rows "
+                      f"in second {sec}, need FFT={FFT}. Skipping sample.")
+                return None
+            ft_seq.append(ft_row.reshape(FFT, FT_READING_DIM))
 
         # Gripper
-        gr_mask   = gr_ts == sec
-        gr_bucket = gr_val[gr_mask]                             # (k, 2)
-        gr_row = _sample_bucket(gr_bucket, n_cols=GRIPPER_READING_DIM, f=FGripper)  # (FGripper*2,) or None
-        if gr_row is None:
-            print(f"[WARN] {sample_dir.name}: only {len(gr_bucket)} gripper rows "
-                  f"in second {sec}, need FGripper={FGripper}. Skipping sample.")
-            return None
-        gr_seq.append(gr_row.reshape(FGripper, GRIPPER_READING_DIM))
+        if 'G' in active_modalities:
+            gr_mask   = gr_ts == sec
+            gr_bucket = gr_val[gr_mask]                             # (k, 2)
+            gr_row = _sample_bucket(gr_bucket, n_cols=GRIPPER_READING_DIM, f=FGripper)  # (FGripper*2,) or None
+            if gr_row is None:
+                print(f"[WARN] {sample_dir.name}: only {len(gr_bucket)} gripper rows "
+                      f"in second {sec}, need FGripper={FGripper}. Skipping sample.")
+                return None
+            gr_seq.append(gr_row.reshape(FGripper, GRIPPER_READING_DIM))
 
         # GelSight: FTactile frames from this second, subtract baseline
-        gel_paths = _sample_image_bucket(gel_by_sec.get(sec, []), f=FTactile)
-        if gel_paths is None:
-            print(f"[WARN] {sample_dir.name}: only {len(gel_by_sec.get(sec, []))} GelSight frames "
-                  f"in second {sec}, need FTactile={FTactile}. Skipping sample.")
-            return None
-        gel_frames = torch.stack([_load_image(p, IMG_TRANSFORM) - baseline for p in gel_paths])
-        tactile_seq.append(gel_frames)                          # (FTactile, 3, H, W)
+        if 'T' in active_modalities:
+            gel_paths = _sample_image_bucket(gel_by_sec.get(sec, []), f=FTactile)
+            if gel_paths is None:
+                print(f"[WARN] {sample_dir.name}: only {len(gel_by_sec.get(sec, []))} GelSight frames "
+                      f"in second {sec}, need FTactile={FTactile}. Skipping sample.")
+                return None
+            gel_frames = torch.stack([_load_image(p, IMG_TRANSFORM) - baseline for p in gel_paths])
+            tactile_seq.append(gel_frames.to(image_cache_dtype))  # (FTactile, 3, H, W)
 
         # RGB: FRGB frames from this second
-        rgb_paths = _sample_image_bucket(rgb_by_sec.get(sec, []), f=FRGB)
-        if rgb_paths is None:
-            print(f"[WARN] {sample_dir.name}: only {len(rgb_by_sec.get(sec, []))} RGB frames "
-                  f"in second {sec}, need FRGB={FRGB}. Skipping sample.")
-            return None
-        rgb_t = rgb_transform if rgb_transform is not None else IMG_TRANSFORM
-        rgb_frames = torch.stack([_load_image(p, rgb_t) for p in rgb_paths])
-        rgb_seq.append(rgb_frames)                              # (FRGB, 3, H, W)
+        if 'V' in active_modalities:
+            rgb_paths = _sample_image_bucket(rgb_by_sec.get(sec, []), f=FRGB)
+            if rgb_paths is None:
+                print(f"[WARN] {sample_dir.name}: only {len(rgb_by_sec.get(sec, []))} RGB frames "
+                      f"in second {sec}, need FRGB={FRGB}. Skipping sample.")
+                return None
+            rgb_t = rgb_transform if rgb_transform is not None else IMG_TRANSFORM
+            rgb_frames = torch.stack([_load_image(p, rgb_t) for p in rgb_paths])
+            rgb_seq.append(rgb_frames.to(image_cache_dtype))    # (FRGB, 3, H, W)
 
     return {
-        'tactile':       torch.stack(tactile_seq),                               # (T, FTactile, 3, H, W)
-        'rgb':           torch.stack(rgb_seq),                                   # (T, FRGB, 3, H, W)
-        'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32),    # (T, FFT, 6)
-        'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32),    # (T, FGripper, 2)
-        'gripper_force': torch.tensor([meta['force']], dtype=torch.float32),     # (1,)
+        'tactile':       torch.stack(tactile_seq) if 'T' in active_modalities else torch.empty(len(seconds), 0, 3, *IMAGE_SIZE, dtype=image_cache_dtype),
+        'rgb':           torch.stack(rgb_seq) if 'V' in active_modalities else torch.empty(len(seconds), 0, 3, *IMAGE_SIZE, dtype=image_cache_dtype),
+        'ft':            torch.tensor(np.stack(ft_seq), dtype=torch.float32) if 'FT' in active_modalities else torch.empty(len(seconds), 0, FT_READING_DIM),
+        'gripper':       torch.tensor(np.stack(gr_seq), dtype=torch.float32) if 'G' in active_modalities else torch.empty(len(seconds), 0, GRIPPER_READING_DIM),
+        'gripper_force': torch.tensor([meta['force']], dtype=torch.float32) if 'GF' in active_modalities else torch.zeros(1, dtype=torch.float32),
         'label':         torch.tensor(LABEL_MAP[shake_str],            dtype=torch.long),
         'pose_label':    torch.tensor(LABEL_MAP[pose_str],             dtype=torch.long),
         'grasp_label':   LABEL_MAP.get(grasp_str, -1),   # -1 = unknown; not in __getitem__
@@ -370,7 +382,9 @@ class PoseItDataset(Dataset):
                  root_dir: Optional[str] = None,
                  sample_dirs: Optional[List[str]] = None,
                  sensor_stats: Optional[dict] = None,
-                 rgb_preprocess: str = 'imagenet'):
+                 rgb_preprocess: str = 'imagenet',
+                 active_modalities: Optional[List[str]] = None,
+                 image_cache_dtype: torch.dtype = torch.float32):
         """
         Args:
             rgb_preprocess: 'imagenet' (default) or 'clip'. Use 'clip' for CLIP+T3 model.
@@ -385,13 +399,20 @@ class PoseItDataset(Dataset):
             rgb_transform = get_clip_preprocess()
 
         self.sensor_stats = sensor_stats  # ft/gr/gf mean & std for standardization
+        self.active_modalities = set(active_modalities or ['V', 'T', 'FT', 'G', 'GF'])
+        self.image_cache_dtype = image_cache_dtype
         self.samples = []
         skipped = 0
         for d in tqdm(dirs, desc="Loading dataset", unit="episode"):
             if not d.is_dir():
                 continue
             try:
-                s = _build_sample(d, rgb_transform=rgb_transform)
+                s = _build_sample(
+                    d,
+                    rgb_transform=rgb_transform,
+                    active_modalities=self.active_modalities,
+                    image_cache_dtype=self.image_cache_dtype,
+                )
                 if s is not None:
                     self.samples.append(s)
                 else:
@@ -402,7 +423,8 @@ class PoseItDataset(Dataset):
 
         print(f"Loaded {len(self.samples)} samples ({skipped} skipped)  "
               f"[L={L}, FRGB={FRGB}, FTactile={FTactile}, FFT={FFT}, "
-              f"FGripper={FGripper}, phase='{phase}', rgb_preprocess='{rgb_preprocess}']")
+              f"FGripper={FGripper}, phase='{phase}', rgb_preprocess='{rgb_preprocess}', "
+              f"active_modalities={sorted(self.active_modalities)}, image_cache_dtype={image_cache_dtype}]")
 
     def __len__(self) -> int:
         return len(self.samples)

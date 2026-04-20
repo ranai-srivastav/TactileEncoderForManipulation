@@ -155,14 +155,14 @@ class VanillaTransformer(nn.Module):
 
     def encode_rgb(self, rgb: torch.Tensor) -> torch.Tensor:
         b, t, f, c, h, w = rgb.shape
-        x = rgb.reshape(b * t * f, c, h, w)
+        x = rgb.reshape(b * t * f, c, h, w).float()
         x = self.rgb_encoder(x)
         x = x + self.rgb_adapter(x)
         return x.reshape(b, t * f, -1)
 
     def encode_tactile(self, tactile: torch.Tensor) -> torch.Tensor:
         b, t, f, c, h, w = tactile.shape
-        x = tactile.reshape(b * t * f, c, h, w)
+        x = tactile.reshape(b * t * f, c, h, w).float()
         x = self.tactile_encoder(x)
         x = self.tactile_proj(x)
         x = x + self.tactile_adapter(x)

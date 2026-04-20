@@ -77,6 +77,7 @@ def parse_args():
     p.add_argument("--mlp_ratio", type=float, default=4.0)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--modalities", nargs="+", default=["V", "T", "FT", "G", "GF"])
+    p.add_argument("--image_cache_dtype", default="float16", choices=["float16", "float32"])
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--sigma", type=float, default=0.5)
@@ -477,7 +478,16 @@ def main():
         max_episodes=args.debug_max_episodes,
         max_episodes_per_object=args.debug_max_episodes_per_object,
     )
-    dataset = PoseItDataset(root_dir=args.root_dir) if sample_dirs is None else PoseItDataset(sample_dirs=sample_dirs)
+    image_cache_dtype = torch.float16 if args.image_cache_dtype == "float16" else torch.float32
+    dataset_kwargs = {
+        "active_modalities": args.modalities,
+        "image_cache_dtype": image_cache_dtype,
+    }
+    dataset = (
+        PoseItDataset(root_dir=args.root_dir, **dataset_kwargs)
+        if sample_dirs is None
+        else PoseItDataset(sample_dirs=sample_dirs, **dataset_kwargs)
+    )
     if len(dataset) == 0:
         raise ValueError(f"No samples found in {args.root_dir}")
 
