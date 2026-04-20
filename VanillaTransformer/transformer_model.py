@@ -268,9 +268,17 @@ class VanillaTransformer(nn.Module):
         masks = []
         for key in token_keys:
             if key in encoded:
-                pieces.append(encoded[key])
+                tokens = encoded[key]
+                pieces.append(tokens)
                 positions.append(encoded[position_keys[key]] + offsets[key])
-                masks.append(encoded.get(mask_keys[key]))
+                mask = encoded.get(mask_keys[key])
+                if mask is None and any(k.endswith("_mask") for k in encoded):
+                    mask = torch.ones(
+                        tokens.shape[:2],
+                        device=tokens.device,
+                        dtype=torch.bool,
+                    )
+                masks.append(mask)
 
         sequence = torch.cat(pieces, dim=1)
         all_positions = torch.cat(positions, dim=0)
