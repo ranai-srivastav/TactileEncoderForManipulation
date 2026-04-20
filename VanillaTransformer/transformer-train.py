@@ -23,6 +23,7 @@ sys.path.insert(0, ROOT)
 
 import dataloader as _dl
 from dataloader import PoseItDataset, split_by_object, split_by_pose, uniform_random_split
+from sampler import DRSSampler
 from transformer_model import VanillaTransformer
 
 
@@ -78,6 +79,8 @@ def parse_args():
     p.add_argument("--modalities", nargs="+", default=["V", "T", "FT", "G", "GF"])
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--sigma", type=float, default=0.5)
+    p.add_argument("--disable_drs", action="store_true")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--model_save_path", default="trained_models/best_vanilla_transformer.pt")
     p.add_argument("--resume_path", default=None)
@@ -164,6 +167,21 @@ def optimizer_to_device(optimizer, device):
                 state[key] = value.to(device)
 
 
+def get_drs_sampler_state(train_loader):
+    sampler = getattr(train_loader, "batch_sampler", None)
+    if sampler is not None and hasattr(sampler, "rng"):
+        return sampler.rng.bit_generator.state
+    return None
+
+
+def set_drs_sampler_state(train_loader, state):
+    if state is None:
+        return
+    sampler = getattr(train_loader, "batch_sampler", None)
+    if sampler is not None and hasattr(sampler, "rng"):
+        sampler.rng.bit_generator.state = state
+
+
 def make_split(dataset, args):
     if args.split == "object":
         objects = sorted(set(s["object"] for s in dataset.samples))
@@ -200,6 +218,23 @@ def make_loader(subset, batch_size, num_workers, shuffle=False, generator=None):
         shuffle=shuffle,
         generator=generator,
         worker_init_fn=seed_worker if generator is not None else None,
+        collate_fn=pad_collate,
+    )
+
+
+def make_drs_loader(dataset, train_set, batch_size, num_workers, sigma, seed=None):
+    sampler = DRSSampler(
+        dataset=dataset,
+        sigma=sigma,
+        batch_size=batch_size,
+        indices=train_set.indices,
+        seed=seed,
+    )
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        num_workers=num_workers,
+        worker_init_fn=seed_worker,
         collate_fn=pad_collate,
     )
 
@@ -318,7 +353,7 @@ def wandb_confusion_matrix(metrics):
     )
 
 
-def save_checkpoint(pathname, model, optimizer, epoch, best_val_f1, args, train_generator):
+def save_checkpoint(pathname, model, optimizer, epoch, best_val_f1, args, train_generator, train_loader):
     torch.save({
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -326,6 +361,7 @@ def save_checkpoint(pathname, model, optimizer, epoch, best_val_f1, args, train_
         "best_val_f1": best_val_f1,
         "args": vars(args),
         "rng_state": get_rng_state(train_generator),
+        "drs_sampler_state": get_drs_sampler_state(train_loader),
     }, pathname)
 
 
@@ -497,13 +533,30 @@ def main():
     if args.seed is not None:
         train_generator.manual_seed(args.seed)
 
-    train_loader = make_loader(
-        train_set,
-        args.batch_size,
-        args.num_workers,
-        shuffle=True,
-        generator=train_generator,
-    )
+    if not args.disable_drs and not args.overfit:
+        train_loader = make_drs_loader(
+            dataset,
+            train_set,
+            args.batch_size,
+            args.num_workers,
+            args.sigma,
+            seed=args.seed,
+        )
+        train_eval_loader = make_loader(train_set, args.batch_size, args.num_workers)
+        print(f"DRS enabled with sigma={args.sigma}")
+    else:
+        train_loader = make_loader(
+            train_set,
+            args.batch_size,
+            args.num_workers,
+            shuffle=True,
+            generator=train_generator,
+        )
+        train_eval_loader = train_loader
+        if args.overfit and not args.disable_drs:
+            print("Overfit mode: DRS disabled")
+        elif args.disable_drs:
+            print("DRS disabled")
     val_loader = make_loader(val_set, args.batch_size, args.num_workers)
     test_loader = make_loader(test_set, args.batch_size, args.num_workers)
 
@@ -538,6 +591,7 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         optimizer_to_device(optimizer, device)
         set_rng_state(ckpt.get("rng_state"), train_generator)
+        set_drs_sampler_state(train_loader, ckpt.get("drs_sampler_state"))
         start_epoch = ckpt["epoch"] + 1
         best_val_f1 = ckpt.get("best_val_f1", -1.0)
         print(f"Resumed from {resume_path} at epoch {start_epoch}")
@@ -560,7 +614,7 @@ def main():
             train_count += len(label)
 
         avg_train_loss = train_loss_sum / max(train_count, 1)
-        train_metrics = evaluate(model, train_loader, criterion, device)
+        train_metrics = evaluate(model, train_eval_loader, criterion, device)
         val_metrics = evaluate(model, val_loader, criterion, device)
         test_metrics = evaluate(model, test_loader, criterion, device)
         print(
@@ -603,10 +657,10 @@ def main():
             })
         if val_metrics["f1"] > best_val_f1:
             best_val_f1 = val_metrics["f1"]
-            save_checkpoint(args.model_save_path, model, optimizer, epoch, best_val_f1, args, train_generator)
+            save_checkpoint(args.model_save_path, model, optimizer, epoch, best_val_f1, args, train_generator, train_loader)
             if use_wandb:
                 log_wandb_checkpoint(args.model_save_path, "best", epoch, best_val_f1, args)
-        save_checkpoint(latest_path, model, optimizer, epoch, best_val_f1, args, train_generator)
+        save_checkpoint(latest_path, model, optimizer, epoch, best_val_f1, args, train_generator, train_loader)
         should_log_latest = (
             args.wandb_checkpoint_interval > 0
             and (epoch + 1) % args.wandb_checkpoint_interval == 0

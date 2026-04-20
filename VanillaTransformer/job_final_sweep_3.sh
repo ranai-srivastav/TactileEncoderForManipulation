@@ -1,6 +1,6 @@
 #!/bin/bash
-# Example launch script for the vanilla transformer.
-#SBATCH --job-name=vanilla-transformer
+# V + FT + GF
+#SBATCH --job-name=vanilla-final-sweep-3
 #SBATCH --partition=GPU-shared
 #SBATCH --gpus=v100-32:1
 #SBATCH --time=8:00:00
@@ -14,7 +14,7 @@ mkdir -p logs
 module load anaconda3
 conda activate /ocean/projects/cis260031p/shared/temu_conda
 
-cd /ocean/projects/cis260031p/afadia/TEMURepoVanillaTransformerAblate/
+cd /ocean/projects/cis260031p/afadia/TEMURepoVanillaTransformerFinal/
 
 export WANDB_DIR="${PWD}/wandb"
 export WANDB_DATA_DIR="${PWD}/wandb_data"
@@ -22,16 +22,9 @@ export WANDB_CACHE_DIR="${PWD}/wandb_cache"
 export WANDB_ARTIFACT_DIR="${PWD}/wandb_artifacts"
 mkdir -p "$WANDB_DIR" "$WANDB_DATA_DIR" "$WANDB_CACHE_DIR" "$WANDB_ARTIFACT_DIR" trained_models
 
-# To resume from W&B, add:
-#   --resume_wandb_artifact entity/project/artifact-name:latest
-# For fast smoke tests, add:
-#   --debug_max_episodes_per_object 1
-# Increase this to upload latest checkpoints less often:
-#   --wandb_checkpoint_interval 5
 python VanillaTransformer/transformer-train.py \
   --root_dir /ocean/projects/cis260031p/shared/dataset/Gelsight \
-  --split object \
-  --n_test_objects 3 \
+  --split random \
   --batch_size 16 \
   --num_workers 4 \
   --FRGB 2 \
@@ -45,13 +38,13 @@ python VanillaTransformer/transformer-train.py \
   --num_heads 8 \
   --mlp_ratio 4.0 \
   --dropout 0.1 \
-  --modalities T V FT GF G \
+  --modalities V FT GF \
   --lr 1e-4 \
   --weight_decay 0.01 \
   --sigma 0.5 \
   --epochs 32 \
-  --model_save_path trained_models/vanilla_transformer_best.pt \
+  --model_save_path trained_models/vanilla_final_sweep_3_best.pt \
   --wandb_checkpoint_interval 1 \
   --wandb_project TEMU \
-  --wandb_run vanilla-transformer-sweep1 \
+  --wandb_run vanilla-final-sweep-3 \
   --wandb_entity mrsd-smores
