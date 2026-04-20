@@ -144,8 +144,8 @@ def parse_args():
     p.add_argument('--F1',          type=int,   default=1)
     p.add_argument('--F2',          type=int,   default=1)
     p.add_argument('--num_workers',  type=int,   default=4)
-    p.add_argument('--modalities',   nargs='+',  default=['V', 'T', 'FT', 'G', 'GF'],
-                   help='Active modalities: V T FT G GF')
+    p.add_argument('--modality_set', type=str, default='V,T,FT,G,GF',
+                   help='Comma-separated active modalities, e.g. "T,V,FT,GF,G"')
     p.add_argument('--L',            type=int,   default=20,
                    help='Max seconds per episode (clips longer sequences)')
     p.add_argument('--subsample',    type=float, default=1.0,
@@ -262,6 +262,8 @@ def main():
             torch.cuda.manual_seed_all(args.seed)
         print(f"Seed set to {args.seed}")
 
+    args.modalities = [m.strip() for m in args.modality_set.split(',')]
+
     # Validate modality keys early
     valid_mods = {'V', 'T', 'FT', 'G', 'GF'}
     bad_mods = set(args.modalities) - valid_mods
@@ -288,6 +290,7 @@ def main():
         wandb.define_metric("test/*",  step_metric="iter")
         wandb.define_metric("overfit/*", step_metric="iter")
         wandb.define_metric("lr",      step_metric="iter")
+        args.model_save_path = f"trained_models/{wandb.run.name}/best_mbt_model.pt"
     elif args.wandb_project is not None:
         print("[WARN] wandb not installed — W&B logging disabled.")
 

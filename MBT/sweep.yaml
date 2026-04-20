@@ -1,0 +1,53 @@
+program: MBT/mbt_train.py
+method: grid
+project: TEMU
+entity: mrsd-smores
+
+parameters:
+  # --- Ablation axes ---
+  num_bottlenecks:
+    values: [4, 8, 16]
+
+  # fusion_layer is Lf (where fusion starts); num fusion layers = 12 - Lf
+  # table "fusion layers = 8" -> Lf = 4; "fusion layers = 4" -> Lf = 8
+  fusion_layer:
+    values: [2, 4, 8]
+
+  modality_set:
+    values:
+      - "T,V,FT,GF,G"
+      - "T,V,FT"
+      - "V,FT,GF"
+      - "T,FT,GF"
+
+  # --- Fixed (from job.sh) ---
+  root_dir:
+    value: /ocean/projects/cis260031p/shared/dataset/Gelsight
+  split:
+    value: random
+  batch_size:
+    value: 4
+  grad_accum:
+    value: 8
+  lr:
+    value: 1e-4
+  weight_decay:
+    value: 0.01
+  dropout:
+    value: 0.1
+  adapter_dim:
+    value: 128
+  n_iters:
+    value: 1500
+  anneal_iter:
+    value: 1000
+  L:
+    value: 9
+  F1:
+    value: 1
+  F2:
+    value: 1
+  sigma:
+    value: 0.5
+  n_test_objects:
+    value: 4
