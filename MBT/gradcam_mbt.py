@@ -19,18 +19,21 @@ Outputs saved to --vis_dir:
     curves.png        — mean ± std insertion confidence curves
     metrics.json      — {tac_ins_auc, rgb_ins_auc, n_samples}
 
-Target layers:
-    RGB      → model.norms['V']  (pretrained vit_rgb.norm, LayerNorm over 768-d)
-    Tactile  → model.norms['T']  (nn.LayerNorm(768), applied after tac_to_fusion projection)
+Target layers (--saliency_layer):
+    fusion     → norms['T'] / norms['V']  (post-fusion, matches original PFS setup; RGB maps often diffuse)
+    unimodal   → last T3 block norm2 / last RGB UnimodalBlock norm2  (pre-heavy-fusion; sharper maps for posters)
 
-Both produce activations of shape (B, 1 + F*196, 768).
-We pick the patches for a single frame and reshape to (B, 768, 14, 14) for GradCAM.
+CAM backends (--cam_method): gradcam | eigengradcam | layercam  (pytorch-grad-cam).
+EigenGradCAM often gives stronger visual contrast on ViTs for qualitative figures.
+
+Token layout is always (B, 1 + F*196, D); reshape picks one frame → (B, D, 14, 14).  D=768 (RGB, fused T) or 1024 (unimodal T).
 """
 
 import argparse
 import json
 import os
 import sys
+from typing import Tuple, Type
 
 import cv2
 import matplotlib.pyplot as plt
@@ -38,7 +41,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam import EigenGradCAM, GradCAM, LayerCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
 # Repo root is one level up from MBT/
@@ -56,6 +59,42 @@ _IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 NUM_PATCHES = 14   # ViT-Base/16 with 224×224 input → 14×14 patch grid
 PATCHES_PER_FRAME = NUM_PATCHES * NUM_PATCHES   # 196
+
+_CAM_CLASSES = {
+    'gradcam': GradCAM,
+    'eigengradcam': EigenGradCAM,
+    'layercam': LayerCAM,
+}
+
+
+def resolve_target_layers(
+    model: MBTGraspStability, saliency_layer: str
+) -> Tuple[nn.Module, nn.Module]:
+    """
+    Returns (tactile_target, rgb_target) nn.Modules for pytorch-grad-cam.
+
+    saliency_layer:
+        fusion    — post-fusion LayerNorms before per-modality heads (R3-comparable PFS).
+        unimodal  — last block inside each stream before cross-modal fusion (poster-friendly).
+    """
+    if saliency_layer == 'fusion':
+        return model.norms['T'], model.norms['V']
+    if saliency_layer == 'unimodal':
+        if not list(model.tac_unimodal) or not list(model.rgb_unimodal):
+            raise ValueError(
+                'saliency_layer=unimodal requires non-empty tac_unimodal / rgb_unimodal '
+                '(check fusion_layer > 0).')
+        # timm ViT Block: norm2 is the pre-MLP LayerNorm on patch tokens
+        return model.tac_unimodal[-1].norm2, model.rgb_unimodal[-1].norm2
+    raise ValueError("saliency_layer must be 'fusion' or 'unimodal', got {!r}".format(saliency_layer))
+
+
+def _cam_class(name: str) -> Type:
+    key = name.lower().replace('-', '')
+    if key not in _CAM_CLASSES:
+        raise ValueError(
+            "cam_method must be one of {}, got {!r}".format(sorted(_CAM_CLASSES.keys()), name))
+    return _CAM_CLASSES[key]
 
 
 # ---------------------------------------------------------------------------
@@ -156,15 +195,16 @@ def _conf(logit: torch.Tensor, target_class: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# GradCAM heatmap for one frame
+# Class-activation heatmap for one frame (GradCAM family)
 # ---------------------------------------------------------------------------
 
-def gradcam_heatmap(
+def cam_heatmap(
     wrapper: MBTFrameWrapper,
     frame_tensor: torch.Tensor,   # (1, 3, H, W) float32 on device
     target_layer: nn.Module,
     reshape_transform,
     target_class: int,
+    cam_class: Type,
 ) -> np.ndarray:
     """Returns (H, W) float32 heatmap in [0, 1]."""
     sign = 1.0 if target_class == 1 else -1.0
@@ -175,7 +215,7 @@ def gradcam_heatmap(
     # pytorch-grad-cam needs requires_grad on the input tensor
     frame_tensor = frame_tensor.requires_grad_(True)
 
-    with GradCAM(
+    with cam_class(
         model=wrapper,
         target_layers=[target_layer],
         reshape_transform=reshape_transform,
@@ -257,7 +297,7 @@ def insertion_auc_single(
 # Visualisation helpers (ported from mlee/gradcam)
 # ---------------------------------------------------------------------------
 
-def save_overlay_grid(vis_items: list, gradcam_mode: str, save_path: str):
+def save_overlay_grid(vis_items: list, gradcam_mode: str, save_path: str, viz_caption: str):
     n = len(vis_items)
     if gradcam_mode == 'both':
         ncols = 4
@@ -279,13 +319,13 @@ def save_overlay_grid(vis_items: list, gradcam_mode: str, save_path: str):
             axes[row, 0].set_title(f"Tactile [{item['idx']}] {label_str}", fontsize=8)
             axes[row, 0].axis('off')
             axes[row, 1].imshow(tac_overlay)
-            axes[row, 1].set_title(f"Tac GradCAM  AUC={item['tac_ins']:.3f}", fontsize=8)
+            axes[row, 1].set_title(f"Tac {viz_caption}  ins={item['tac_ins']:.3f}", fontsize=8)
             axes[row, 1].axis('off')
             axes[row, 2].imshow(item['rgb_np'])
             axes[row, 2].set_title(f"RGB [{item['idx']}] {label_str}", fontsize=8)
             axes[row, 2].axis('off')
             axes[row, 3].imshow(rgb_overlay)
-            axes[row, 3].set_title(f"RGB GradCAM  AUC={item['rgb_ins']:.3f}", fontsize=8)
+            axes[row, 3].set_title(f"RGB {viz_caption}  ins={item['rgb_ins']:.3f}", fontsize=8)
             axes[row, 3].axis('off')
 
         elif gradcam_mode == 'tactile':
@@ -294,7 +334,7 @@ def save_overlay_grid(vis_items: list, gradcam_mode: str, save_path: str):
             axes[row, 0].set_title(f"Tactile [{item['idx']}] {label_str}", fontsize=8)
             axes[row, 0].axis('off')
             axes[row, 1].imshow(overlay)
-            axes[row, 1].set_title(f"Tac GradCAM  AUC={item['tac_ins']:.3f}", fontsize=8)
+            axes[row, 1].set_title(f"Tac {viz_caption}  ins={item['tac_ins']:.3f}", fontsize=8)
             axes[row, 1].axis('off')
 
         else:  # rgb
@@ -303,7 +343,7 @@ def save_overlay_grid(vis_items: list, gradcam_mode: str, save_path: str):
             axes[row, 0].set_title(f"RGB [{item['idx']}] {label_str}", fontsize=8)
             axes[row, 0].axis('off')
             axes[row, 1].imshow(overlay)
-            axes[row, 1].set_title(f"RGB GradCAM  AUC={item['rgb_ins']:.3f}", fontsize=8)
+            axes[row, 1].set_title(f"RGB {viz_caption}  ins={item['rgb_ins']:.3f}", fontsize=8)
             axes[row, 1].axis('off')
 
     plt.tight_layout()
@@ -327,7 +367,7 @@ def save_curves_plot(curves_by_label: dict, steps: int, save_path: str):
 
     ax.set_xlabel('Fraction of pixels revealed')
     ax.set_ylabel('Model confidence (target class)')
-    ax.set_title('Insertion AUC curves (MBT — mean ± std)')
+    ax.set_title('Insertion AUC curves (MBT, mean ± std)')
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -350,6 +390,8 @@ def evaluate_gradcam(
     n_vis: int,
     vis_dir: str,
     device: str,
+    saliency_layer: str,
+    cam_method: str,
 ):
     """
     gradcam_mode: 'rgb' | 'tactile' | 'both'
@@ -360,10 +402,11 @@ def evaluate_gradcam(
     do_tac = gradcam_mode in ('tactile', 'both')
     do_rgb = gradcam_mode in ('rgb', 'both')
 
-    # Target LayerNorms — these receive the post-fusion CLS + patch tokens.
-    # They have requires_grad=True by default (they are not frozen backbone layers).
-    tac_target = model.norms['T'] if do_tac else None
-    rgb_target = model.norms['V'] if do_rgb else None
+    tac_full, rgb_full = resolve_target_layers(model, saliency_layer)
+    tac_target = tac_full if do_tac else None
+    rgb_target = rgb_full if do_rgb else None
+    cam_cls = _cam_class(cam_method)
+    viz_caption = '{} @ {}'.format(cam_method, saliency_layer)
 
     rng = np.random.default_rng(42)
     chosen = rng.choice(indices, size=min(n_samples, len(indices)), replace=False)
@@ -419,7 +462,7 @@ def evaluate_gradcam(
                 wrapper = MBTFrameWrapper(model, tac, rgb, ft, grip, gf, t_orig, 'tactile')
                 wrapper.eval()
 
-                hm = gradcam_heatmap(wrapper, frame_t, tac_target, reshape_fn, target_class)
+                hm = cam_heatmap(wrapper, frame_t, tac_target, reshape_fn, target_class, cam_cls)
                 auc, curve = insertion_auc_single(
                     model, tac, rgb, ft, grip, gf,
                     t_orig, hm, frame_np, 'tactile', steps, target_class)
@@ -436,7 +479,7 @@ def evaluate_gradcam(
                 wrapper = MBTFrameWrapper(model, tac, rgb, ft, grip, gf, t_orig, 'rgb')
                 wrapper.eval()
 
-                hm = gradcam_heatmap(wrapper, frame_t, rgb_target, reshape_fn, target_class)
+                hm = cam_heatmap(wrapper, frame_t, rgb_target, reshape_fn, target_class, cam_cls)
                 auc, curve = insertion_auc_single(
                     model, tac, rgb, ft, grip, gf,
                     t_orig, hm, frame_np, 'rgb', steps, target_class)
@@ -466,12 +509,14 @@ def evaluate_gradcam(
     if do_tac: results['tac_ins_auc'] = float(np.mean(tac_ins_list))
     if do_rgb: results['rgb_ins_auc'] = float(np.mean(rgb_ins_list))
     results['n_samples'] = len(chosen)
+    results['saliency_layer'] = saliency_layer
+    results['cam_method'] = cam_method
 
     if vis_dir and vis_items:
         os.makedirs(vis_dir, exist_ok=True)
 
         save_overlay_grid(vis_items, gradcam_mode,
-                          os.path.join(vis_dir, 'gradcam_grid.png'))
+                          os.path.join(vis_dir, 'gradcam_grid.png'), viz_caption)
 
         curves_dict = {}
         if tac_curves_all: curves_dict['Tactile'] = tac_curves_all
@@ -529,13 +574,21 @@ def parse_args():
                    help='Number of samples to include in overlay grid')
     p.add_argument('--vis_dir',          type=str, default='mbt_pfs_vis',
                    help='Output directory for visualisations (empty string to skip)')
+    p.add_argument('--saliency_layer',   type=str, default='fusion',
+                   choices=['fusion', 'unimodal'],
+                   help='fusion = post-fusion norms (R3-comparable PFS); '
+                        'unimodal = last pre-fusion block (sharper qualitative maps).')
+    p.add_argument('--cam_method',       type=str, default='gradcam',
+                   choices=['gradcam', 'eigengradcam', 'layercam'],
+                   help='pytorch-grad-cam backend. eigengradcam often pops more on ViTs.')
     return p.parse_args()
 
 
 def main():
     args   = parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}  gradcam_mode: {args.gradcam_mode}  steps: {args.steps}")
+    print(f"Device: {device}  mode: {args.gradcam_mode}  steps: {args.steps}  "
+          f"cam={args.cam_method}  layer={args.saliency_layer}")
 
     # Set global dataloader params before constructing dataset
     _dl.L  = args.L
@@ -575,6 +628,8 @@ def main():
         n_vis=args.n_vis,
         vis_dir=args.vis_dir or None,
         device=device,
+        saliency_layer=args.saliency_layer,
+        cam_method=args.cam_method,
     )
 
     print(f"\n{'='*55}")
