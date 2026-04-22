@@ -49,5 +49,5 @@ parameters:
     value: 1
   sigma:
     value: 0.5
-  n_test_objects:
-    value: 4
+  seed:
+    value: 42  
