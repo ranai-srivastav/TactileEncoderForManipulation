@@ -135,6 +135,8 @@ def parse_args():
     p.add_argument('--F1',          type=int,   default=1)
     p.add_argument('--F2',          type=int,   default=1)
     p.add_argument('--num_workers',  type=int,   default=4)
+    p.add_argument('--modality_set', type=str, default='V,T,FT,G,GF',
+                   help='Comma-separated active modalities, e.g. "T,V,FT,GF,G"')
     p.add_argument('--modalities',   nargs='+',  default=['V', 'T', 'FT', 'G', 'GF'],
                    help='Active modalities: V T FT G GF')
     p.add_argument('--L',            type=int,   default=20,
@@ -255,6 +257,8 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
         print(f"Seed set to {args.seed}")
+    
+    args.modalities = [m.strip() for m in args.modality_set.split(',')]
 
     # Validate modality keys early
     valid_mods = {'V', 'T', 'FT', 'G', 'GF'}
@@ -281,6 +285,8 @@ def main():
         wandb.define_metric("val/*", step_metric="iter")
         wandb.define_metric("lr", step_metric="iter")
         wandb.define_metric("ogm/*", step_metric="iter")
+        args.model_save_path = f"trained_models/{wandb.run.name}/best_mbt_model.pt"  # add this
+        os.makedirs(os.path.dirname(args.model_save_path), exist_ok=True)
     elif args.wandb_project is not None:
         print("[WARN] wandb not installed — W&B logging disabled.")
 
@@ -419,12 +425,11 @@ def main():
                 scaler.unscale_(optimizer)
                 
                 # OGM monitoring + modulation
-                if iteration % 10 == 0 or iteration == args.n_iters - 1:
-                    scores = compute_confidence_scores(logits_per_mod, label)
-                    rhos   = compute_discrepancy_ratios(scores)
-                    if args.ogm == 1:
-                        coeffs = compute_ogm_coefficients(rhos, args.ogm_alpha)
-                        model.apply_ogm(coeffs)
+                scores = compute_confidence_scores(logits_per_mod, label)
+                rhos   = compute_discrepancy_ratios(scores)
+                if args.ogm == 1:
+                    coeffs = compute_ogm_coefficients(rhos, args.ogm_alpha)
+                    model.apply_ogm(coeffs)
                         
                 scaler.step(optimizer)
                 scaler.update()
